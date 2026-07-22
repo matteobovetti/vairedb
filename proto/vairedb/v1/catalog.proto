@@ -1,0 +1,113 @@
+syntax = "proto3";
+
+package vairedb.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// ---------------------------------------------------------------------------
+// Catalog metadata messages — serialized and stored in the coordinator's redb
+// metadata catalog. These are NOT gRPC services; they define the wire format
+// for values persisted in the `tables`, `shards`, and `nodes` redb tables.
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// TableMeta — stored in redb table `tables`, keyed by table_name.
+// ---------------------------------------------------------------------------
+
+message TableMeta {
+  string table_name = 1;
+
+  // Column definitions in declaration order.
+  repeated ColumnDef columns = 2;
+
+  // Sharding configuration.
+  ShardStrategy shard_strategy = 3;
+  string shard_key = 4;
+  uint32 shard_count = 5;
+
+  // Number of copies per shard (including the primary).
+  uint32 replication_factor = 6;
+
+  google.protobuf.Timestamp created_at = 7;
+
+  // Pseudonymization map: column name -> anonymization_secret id. Values in
+  // these columns are HMAC-SHA256 hashed in the coordinator before any write
+  // reaches a core node. Empty when the table has no anonymized columns.
+  map<string, string> anonymized_columns = 8;
+}
+
+// ---------------------------------------------------------------------------
+// AnonymizationSecret — stored in redb table `anonymization_secret`, keyed by
+// its id. Holds the pepper (a single global HMAC key) used to pseudonymize the
+// columns that reference it. The secret_key never leaves the coordinator.
+// ---------------------------------------------------------------------------
+
+message AnonymizationSecret {
+  string id = 1;
+  // Always "HMAC-SHA256" — the only supported algorithm.
+  string algo = 2;
+  // The secret pepper used as the HMAC key.
+  string secret_key = 3;
+}
+
+message ColumnDef {
+  string name = 1;
+  // DuckDB type name (e.g. "INTEGER", "VARCHAR", "DECIMAL(10,2)").
+  string data_type = 2;
+  bool nullable = 3;
+  // Optional default expression (e.g. "nextval('seq')").
+  string default_expr = 4;
+}
+
+// ---------------------------------------------------------------------------
+// ShardMeta — stored in redb table `shards`,
+// keyed by "<table_name>:<shard_id>".
+// ---------------------------------------------------------------------------
+
+message ShardMeta {
+  string shard_id = 1;
+  string table_name = 2;
+
+  // The node_id of the primary owner.
+  string primary_node_id = 3;
+
+  // node_ids of replica holders (does NOT include the primary).
+  repeated string replica_node_ids = 4;
+
+  // For hash sharding: the hash bucket index [0, shard_count).
+  uint32 hash_bucket = 5;
+
+  // For range sharding: inclusive lower and exclusive upper bounds.
+  // Empty strings when using hash sharding.
+  string range_lower = 6;
+  string range_upper = 7;
+}
+
+// ---------------------------------------------------------------------------
+// NodeMeta — stored in redb table `nodes`, keyed by node_id.
+// ---------------------------------------------------------------------------
+
+message NodeMeta {
+  string node_id = 1;
+
+  // gRPC endpoint for WriteService and Arrow Flight (e.g. "10.0.1.5:50051").
+  string advertised_address = 2;
+
+  NodeState state = 3;
+
+  google.protobuf.Timestamp last_heartbeat = 4;
+  google.protobuf.Timestamp registered_at = 5;
+}
+
+enum NodeState {
+  NODE_STATE_UNSPECIFIED = 0;
+  NODE_STATE_ALIVE = 1;
+  NODE_STATE_SUSPECT = 2;
+  NODE_STATE_DEAD = 3;
+}
+
+enum ShardStrategy {
+  SHARD_STRATEGY_UNSPECIFIED = 0;
+  SHARD_STRATEGY_HASH = 1;
+  SHARD_STRATEGY_RANGE = 2;
+}

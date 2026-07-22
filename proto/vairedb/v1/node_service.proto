@@ -1,0 +1,100 @@
+syntax = "proto3";
+
+package vairedb.v1;
+
+import "google/protobuf/timestamp.proto";
+
+// ---------------------------------------------------------------------------
+// NodeService — runs on the coordinator.
+//
+// Core nodes call this service to register themselves, send periodic
+// heartbeats, and report local failures (Ballista executor, DuckDB).
+// ---------------------------------------------------------------------------
+
+service NodeService {
+  // A core node calls Register once on startup to join the cluster.
+  rpc Register(RegisterRequest) returns (RegisterResponse);
+
+  // Bidirectional heartbeat stream. The core node sends periodic pings;
+  // the coordinator responds with acks (and can piggyback control signals).
+  rpc Heartbeat(stream HeartbeatRequest) returns (stream HeartbeatResponse);
+
+  // A core node reports a local failure (DuckDB crash, executor error).
+  rpc ReportFailure(ReportFailureRequest) returns (ReportFailureResponse);
+}
+
+// ---------------------------------------------------------------------------
+// Register
+// ---------------------------------------------------------------------------
+
+message RegisterRequest {
+  // Unique node identifier (stable across restarts).
+  string node_id = 1;
+
+  // Address the coordinator should use to reach this core node's
+  // WriteService and Ballista executor (e.g. "10.0.1.5:50051").
+  string advertised_address = 2;
+
+  // Shards currently held by this core node.
+  repeated ShardInfo shards = 3;
+}
+
+message ShardInfo {
+  string shard_id = 1;
+  bool is_primary = 2;
+}
+
+message RegisterResponse {
+  bool accepted = 1;
+  string message = 2;
+}
+
+// ---------------------------------------------------------------------------
+// Heartbeat
+// ---------------------------------------------------------------------------
+
+message HeartbeatRequest {
+  string node_id = 1;
+  google.protobuf.Timestamp timestamp = 2;
+  NodeStatus status = 3;
+}
+
+enum NodeStatus {
+  NODE_STATUS_UNSPECIFIED = 0;
+  NODE_STATUS_HEALTHY = 1;
+  NODE_STATUS_DEGRADED = 2;
+}
+
+message HeartbeatResponse {
+  google.protobuf.Timestamp timestamp = 1;
+  // The coordinator can signal the node to take action.
+  HeartbeatAction action = 2;
+}
+
+enum HeartbeatAction {
+  HEARTBEAT_ACTION_UNSPECIFIED = 0;
+  HEARTBEAT_ACTION_NONE = 1;
+  HEARTBEAT_ACTION_DRAIN = 2;
+}
+
+// ---------------------------------------------------------------------------
+// ReportFailure
+// ---------------------------------------------------------------------------
+
+message ReportFailureRequest {
+  string node_id = 1;
+  FailureType failure_type = 2;
+  string detail = 3;
+  // Shards affected by the failure (empty = whole node).
+  repeated string affected_shard_ids = 4;
+}
+
+enum FailureType {
+  FAILURE_TYPE_UNSPECIFIED = 0;
+  FAILURE_TYPE_DUCKDB = 1;
+  FAILURE_TYPE_BALLISTA_EXECUTOR = 2;
+}
+
+message ReportFailureResponse {
+  bool acknowledged = 1;
+}

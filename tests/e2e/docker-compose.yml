@@ -1,0 +1,83 @@
+services:
+  coordinator:
+    image: vairedb-coordinator
+    container_name: vairedb-e2e-coordinator
+    ports:
+      - "5432:5432"
+      - "50040:50040"
+      - "50050:50050"
+    volumes:
+      - ./config/coordinator.yml:/app/config/coordinator/config.yml:ro
+    healthcheck:
+      test:
+        ["CMD-SHELL", "timeout 2 bash -c '</dev/tcp/127.0.0.1/5432' || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 5s
+    networks:
+      - vairedb-e2e
+
+  core-1:
+    image: vairedb-core
+    container_name: vairedb-e2e-core-1
+    depends_on:
+      coordinator:
+        condition: service_healthy
+    volumes:
+      - ./config/core-1.yml:/app/config/core/config.yml:ro
+      # - ./data/core/1/:/app/data/core
+    networks:
+      - vairedb-e2e
+
+  core-2:
+    image: vairedb-core
+    container_name: vairedb-e2e-core-2
+    depends_on:
+      coordinator:
+        condition: service_healthy
+    volumes:
+      - ./config/core-2.yml:/app/config/core/config.yml:ro
+      # - ./data/core/2/:/app/data/core
+    networks:
+      - vairedb-e2e
+
+  core-3:
+    image: vairedb-core
+    container_name: vairedb-e2e-core-3
+    depends_on:
+      coordinator:
+        condition: service_healthy
+    volumes:
+      - ./config/core-3.yml:/app/config/core/config.yml:ro
+      # - ./data/core/3/:/app/data/core
+    networks:
+      - vairedb-e2e
+
+  core-4:
+    image: vairedb-core
+    container_name: vairedb-e2e-core-4
+    depends_on:
+      coordinator:
+        condition: service_healthy
+    volumes:
+      - ./config/core-4.yml:/app/config/core/config.yml:ro
+      # - ./data/core/4/:/app/data/core
+    networks:
+      - vairedb-e2e
+
+  core-5:
+    image: vairedb-core
+    container_name: vairedb-e2e-core-5
+    depends_on:
+      coordinator:
+        condition: service_healthy
+    volumes:
+      - ./config/core-5.yml:/app/config/core/config.yml:ro
+      # - ./data/core/5/:/app/data/core
+    networks:
+      - vairedb-e2e
+
+networks:
+  vairedb-e2e:
+    driver: bridge

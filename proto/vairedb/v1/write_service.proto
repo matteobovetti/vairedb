@@ -1,0 +1,93 @@
+syntax = "proto3";
+
+package vairedb.v1;
+
+import "vairedb/v1/error.proto";
+
+// ---------------------------------------------------------------------------
+// WriteService — runs on each core node.
+//
+// The coordinator fans out shard-local DML statements to primary and replica
+// core nodes via this service, then waits for quorum acknowledgment
+// (floor(N/2)+1) before responding to the client.
+// ---------------------------------------------------------------------------
+
+service WriteService {
+  // Execute one or more shard-local DML statements on the core node.
+  // Typically a single statement per call; batching is supported for
+  // multi-shard writes targeting the same core node.
+  rpc ExecuteWrite(ExecuteWriteRequest) returns (ExecuteWriteResponse);
+}
+
+// ---------------------------------------------------------------------------
+// ExecuteWrite
+// ---------------------------------------------------------------------------
+
+message ExecuteWriteRequest {
+  // Globally unique ID for the write operation, assigned by the coordinator.
+  // Used for idempotency: a core node that has already applied a write_id
+  // returns the previous result instead of re-executing.
+  string write_id = 1;
+
+  // One or more shard-local DML statements to execute.
+  repeated WriteStatement statements = 2;
+}
+
+message WriteStatement {
+  // Shard-local SQL statement (e.g. "INSERT INTO orders_shard0 VALUES (...)").
+  // May contain positional placeholders ($1..$N) bound from `params`.
+  string sql = 1;
+
+  // Target shard identifier (e.g. "orders_shard0").
+  string shard_id = 2;
+
+  // The type of DML operation.
+  WriteOperation operation = 3;
+
+  // Typed bind parameters, positional ($1..$N). Empty for a fully-rendered SQL
+  // statement. When present, the core node binds them as prepared-statement
+  // parameters rather than substituting them into the SQL text.
+  repeated WriteParam params = 4;
+}
+
+// A single typed bind parameter. Exactly one variant is set; an unset oneof
+// (or `is_null = true`) means SQL NULL. Numeric/date/timestamp values are
+// carried as `string_val` and cast by DuckDB on bind.
+message WriteParam {
+  oneof value {
+    bool is_null = 1;
+    bool bool_val = 2;
+    int64 int_val = 3;
+    double double_val = 4;
+    string string_val = 5;
+    bytes bytes_val = 6;
+  }
+}
+
+enum WriteOperation {
+  WRITE_OPERATION_UNSPECIFIED = 0;
+  WRITE_OPERATION_INSERT = 1;
+  WRITE_OPERATION_UPDATE = 2;
+  WRITE_OPERATION_DELETE = 3;
+}
+
+message ExecuteWriteResponse {
+  // Per-statement results, in the same order as the request.
+  repeated WriteResult results = 1;
+}
+
+message WriteResult {
+  // Whether this statement succeeded.
+  bool success = 1;
+
+  // Number of rows affected by the statement.
+  int64 rows_affected = 2;
+
+  // Non-empty only when success is false.
+  ErrorDetail error = 3;
+}
+
+message ErrorDetail {
+  VdbErrorCode code = 1;
+  string message = 2;
+}

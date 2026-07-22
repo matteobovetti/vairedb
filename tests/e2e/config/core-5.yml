@@ -1,0 +1,10 @@
+log_level: info
+node_id: "core-5"
+data_dir: data/core
+grpc_listen_addr: "0.0.0.0:50041"
+advertised_address: "core-5:50041"
+coordinator_addr: "http://coordinator:50040"
+heartbeat_interval_secs: 2
+write_queue_capacity: 1024
+ballista_scheduler_addr: "http://coordinator:50050"
+ballista_concurrent_tasks: 4

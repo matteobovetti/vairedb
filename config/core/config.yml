@@ -1,0 +1,30 @@
+# VaireDB Core Node Configuration
+
+# Log level: trace, debug, info, warn, error
+log_level: info
+
+# Unique node identifier
+node_id: "core-node-1"
+
+# Directory for DuckDB database files
+data_dir: data/core
+
+# gRPC listen address for WriteService
+grpc_listen_addr: "0.0.0.0:50041"
+
+# Address advertised to the coordinator for routing (defaults to grpc_listen_addr if unset)
+# advertised_address: "core-node-1.internal:50041"
+
+# Coordinator gRPC address for registration and heartbeat
+coordinator_addr: "http://0.0.0.0:50040"
+
+# Heartbeat interval in seconds
+heartbeat_interval_secs: 5
+
+# Maximum number of pending write operations in the queue
+write_queue_capacity: 1024
+
+# Ballista executor configuration (read path)
+# Address of the Ballista scheduler on the coordinator node
+ballista_scheduler_addr: "http://0.0.0.0:50050"
+ballista_concurrent_tasks: 4

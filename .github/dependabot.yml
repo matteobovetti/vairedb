@@ -1,0 +1,27 @@
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    target-branch: main
+    labels: [auto-dependencies]
+    ignore:
+      # arrow, datafusion, ballista and duckdb are bumped manually
+      - dependency-name: "arrow*"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "datafusion*"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "ballista*"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "sqlparser"
+        update-types: ["version-update:semver-major"]
+      - dependency-name: "duckdb"
+        update-types: ["version-update:semver-major"]
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: weekly
+    open-pull-requests-limit: 10
+    labels: [auto-dependencies]

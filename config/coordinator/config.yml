@@ -1,0 +1,26 @@
+# VaireDB Coordinator Node Configuration
+
+# Log level: trace, debug, info, warn, error
+log_level: info
+
+# Directory for the embedded metadata store (redb)
+metadata_dir: data/coordinator
+
+# gRPC listen address for inter-node communication
+grpc_listen_addr: "0.0.0.0:50040"
+
+# PostgreSQL wire protocol listen address for client connections
+pg_listen_addr: "0.0.0.0:5432"
+
+# Seconds before a node is considered unresponsive
+heartbeat_timeout_secs: 15
+
+# Default replication factor for new tables
+default_replication_factor: 3
+
+# Tail replication retry configuration (exponential backoff)
+tail_retry_initial_ms: 100
+tail_retry_max_ms: 5000
+
+# Ballista scheduler listen address for executor connections (read path)
+ballista_scheduler_listen_addr: "0.0.0.0:50050"

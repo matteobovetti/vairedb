@@ -1,0 +1,78 @@
+[workspace]
+members = [
+    "crates/vairedb-common",
+    "crates/vairedb-coordinator",
+    "crates/vairedb-core",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+rust-version = "1.95"
+repository = "https://github.com/matteobovetti/vairedb"
+homepage = "https://vairedb.io"
+license = "MIT"
+version = "0.1.0"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1.52", features = ["full"] }
+
+# gRPC & Protobuf
+tonic = "0.13"
+prost = "0.13"
+prost-types = "0.13"
+tonic-build = "0.13"
+
+# Arrow
+arrow = "58"
+arrow-flight = "58"
+
+# DataFusion & Ballista
+datafusion = "53"
+datafusion-proto = "53"
+ballista-core = "53"
+ballista-scheduler = "53"
+ballista-executor = "53"
+
+# DuckDB
+duckdb = { version = "1.10503.1", features = ["bundled"] }
+
+# SQL parser
+sqlparser = { version = "0.58", features = ["visitor"] }
+
+# Metadata store
+redb = "4.1.0"
+
+# PostgreSQL wire protocol
+pgwire = "0.40"
+
+# PostgreSQL system catalog (pg_catalog) emulation for client compatibility
+datafusion-pg-catalog = "0.17"
+
+# Arrow <-> PostgreSQL type mapping and typed parameter binding (sibling of datafusion-pg-catalog)
+arrow-pg = { version = "0.14", features = ["datafusion"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# CLI
+clap = { version = "4.6.1", features = ["derive"] }
+
+# Utilities
+uuid = { version = "1", features = ["v4"] }
+thiserror = "2"
+xxhash-rust = { version = "0.8", features = ["xxh3"] }
+
+# Cryptographic hashing for column pseudonymization (HMAC-SHA256)
+hmac = "0.13"
+sha2 = "0.11"
+
+# Internal crates
+vairedb-common = { path = "crates/vairedb-common" }

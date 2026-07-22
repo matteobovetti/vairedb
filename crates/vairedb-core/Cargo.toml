@@ -1,0 +1,38 @@
+[package]
+name = "vairedb-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+vairedb-common = { workspace = true }
+tokio = { workspace = true }
+tonic = { workspace = true }
+prost-types = { workspace = true }
+duckdb = { workspace = true }
+datafusion = { workspace = true }
+datafusion-proto = { workspace = true }
+ballista-executor = { workspace = true }
+ballista-core = { workspace = true }
+arrow = { workspace = true }
+arrow-flight = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+clap = { workspace = true }
+thiserror = { workspace = true }
+uuid = { workspace = true }
+tempfile = "3"
+async-trait = "0.1"
+futures = "0.3"
+tokio-stream = { version = "0.1", features = ["net"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tonic = { workspace = true }
+prost-types = { workspace = true }
+duckdb = { workspace = true }
+vairedb-common = { workspace = true }
+tokio-stream = { version = "0.1", features = ["net"] }
+socket2 = "0.5"

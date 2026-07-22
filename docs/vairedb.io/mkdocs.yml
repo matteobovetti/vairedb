@@ -1,0 +1,117 @@
+site_name: VaireDB
+site_url: https://vairedb.io/
+site_description: >-
+  VaireDB is a distributed SQL database that combines PostgreSQL wire
+  compatibility with DuckDB's columnar vectorized execution engine for
+  high-throughput analytical workloads across a horizontally scalable cluster.
+site_author: VaireDB
+repo_url: https://github.com/matteobovetti/vairedb
+repo_name: matteobovetti/vairedb
+copyright: Copyright &copy; VaireDB contributors
+
+theme:
+  name: material
+  language: en
+  icon:
+    repo: fontawesome/brands/github
+    logo: material/database
+  favicon: material/database
+  palette:
+    - media: "(prefers-color-scheme)"
+      toggle:
+        icon: material/brightness-auto
+        name: Switch to light mode
+    - media: "(prefers-color-scheme: light)"
+      scheme: default
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-7
+        name: Switch to dark mode
+    - media: "(prefers-color-scheme: dark)"
+      scheme: slate
+      primary: indigo
+      accent: indigo
+      toggle:
+        icon: material/brightness-4
+        name: Switch to system preference
+  features:
+    - navigation.instant
+    - navigation.tracking
+    - navigation.tabs
+    - navigation.sections
+    - navigation.top
+    - navigation.indexes
+    - navigation.footer
+    - toc.follow
+    - search.suggest
+    - search.highlight
+    - content.code.copy
+    - content.code.annotate
+    - content.tabs.link
+
+nav:
+  - Home: index.md
+  - Getting Started:
+      - getting-started/index.md
+      - Installation: getting-started/installation.md
+      - Quick Start (Docker Compose): getting-started/quickstart.md
+      - Configuration: getting-started/configuration.md
+  - Concepts:
+      - concepts/index.md
+      - Design Goals: concepts/design-goals.md
+      - System Architecture: concepts/system-architecture.md
+      - Coordinator Node: concepts/coordinator-node.md
+      - Core Node: concepts/core-node.md
+      - Data Distribution: concepts/data-distribution.md
+      - Query Processing: concepts/query-processing.md
+      - Cluster Coordination: concepts/cluster-coordination.md
+      - Communication Layer: concepts/communication-layer.md
+      - Transactions & Consistency: concepts/transactions-consistency.md
+      - Fault Tolerance: concepts/fault-tolerance.md
+  - SQL Guide:
+      - sql/index.md
+      - Connecting: sql/connecting.md
+      - Tables & Schema: sql/tables.md
+      - Querying Data: sql/querying.md
+      - Column Pseudonymization: sql/pseudonymization.md
+      - Worked Example: sql/examples.md
+  - Reference:
+      - reference/index.md
+      - Configuration Reference: reference/configuration.md
+      - Glossary: reference/glossary.md
+      - External Links: reference/links.md
+  - Roadmap: roadmap.md
+
+markdown_extensions:
+  - abbr
+  - admonition
+  - attr_list
+  - def_list
+  - footnotes
+  - md_in_html
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.details
+  - pymdownx.superfences:
+      custom_fences:
+        - name: mermaid
+          class: mermaid
+          format: !!python/name:pymdownx.superfences.fence_code_format
+  - pymdownx.highlight:
+      anchor_linenums: true
+      line_spans: __span
+      pygments_lang_class: true
+  - pymdownx.inlinehilite
+  - pymdownx.snippets
+  - pymdownx.tabbed:
+      alternate_style: true
+  - pymdownx.tasklist:
+      custom_checkbox: true
+  - pymdownx.emoji:
+      emoji_index: !!python/name:material.extensions.emoji.twemoji
+      emoji_generator: !!python/name:material.extensions.emoji.to_svg
+
+plugins:
+  - search
