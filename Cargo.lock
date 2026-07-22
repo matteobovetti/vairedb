@@ -5771,7 +5771,7 @@ name = "vairedb-common"
 version = "0.1.0"
 dependencies = [
  "prost 0.13.5",
- "prost-types 0.13.5",
+ "prost-types 0.14.3",
  "serde",
  "serde_json",
  "serde_yaml",
@@ -5796,7 +5796,7 @@ dependencies = [
  "hmac",
  "pgwire",
  "prost 0.13.5",
- "prost-types 0.13.5",
+ "prost-types 0.14.3",
  "redb",
  "serde",
  "serde_json",
@@ -5827,7 +5827,7 @@ dependencies = [
  "datafusion-proto",
  "duckdb",
  "futures",
- "prost-types 0.13.5",
+ "prost-types 0.14.3",
  "serde",
  "socket2 0.5.10",
  "tempfile",
