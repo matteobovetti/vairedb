@@ -5770,7 +5770,7 @@ dependencies = [
 name = "vairedb-common"
 version = "0.1.0"
 dependencies = [
- "prost 0.13.5",
+ "prost 0.14.3",
  "prost-types 0.13.5",
  "serde",
  "serde_json",
@@ -5795,7 +5795,7 @@ dependencies = [
  "futures",
  "hmac",
  "pgwire",
- "prost 0.13.5",
+ "prost 0.14.3",
  "prost-types 0.13.5",
  "redb",
  "serde",
