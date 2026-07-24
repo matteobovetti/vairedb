@@ -71,31 +71,31 @@ VaireDB follows a coordinator/worker topology:
 - **Coordinator** handles client connections, SQL parsing, query planning, metadata management, and dispatching work to core nodes.
 - **Core Nodes** store data in DuckDB, execute shard-local queries, and replicate writes.
 
-For full details, see the [Architecture Documentation](docs/spec/ARCHITECTURE.md).
+For full details, see the [Architecture Documentation](docs/specs/ARCHITECTURE.md).
 
 ### Documentation
 
 All documentation lives under `docs/`, split into architecture references, feature designs, and testing notes.
 
-**Architecture** (`docs/spec/`):
+**Architecture** (`docs/specs/`):
 
 | Document | Description |
 |----------|-------------|
 | [Architecture Index](docs/specs/ARCHITECTURE.md) | Top-level index with references to all architecture sections |
-| [Overview](docs/spec/overview.md) | What VaireDB is and its high-level value proposition |
-| [Design Goals](docs/spec/design-goals.md) | Goals and non-goals for v0.1 |
-| [System Architecture](docs/spec/system-architecture.md) | High-level topology and node types |
-| [Core Node](docs/spec/core-node.md) | Embedded DuckDB engine, storage, and query execution |
-| [Coordinator Node](docs/spec/coordinator-node.md) | Query routing, distributed planning, and metadata catalog |
-| [Data Distribution](docs/spec/data-distribution.md) | Sharding strategy and replication |
-| [Cluster Coordination](docs/spec/cluster-coordination.md) | Node discovery, leader election, and failure detection |
-| [Communication Layer](docs/spec/communication-layer.md) | Protocols, wire formats, and client interface |
-| [Distributed Query Processing](docs/spec/distributed-query-processing.md) | Query lifecycle and optimization |
-| [Transactions & Consistency](docs/spec/transactions-consistency.md) | Consistency model and distributed transactions |
-| [Fault Tolerance](docs/spec/fault-tolerance.md) | WAL, snapshotting, node recovery, and quorum |
-| [Roadmap](docs/spec/roadmap.md) | Roadmap to reach v1.0 |
-| [Glossary](docs/spec/glossary.md) | Term definitions |
-| [Links](docs/spec/links.md) | External references |
+| [Overview](docs/specs/overview.md) | What VaireDB is and its high-level value proposition |
+| [Design Goals](docs/specs/design-goals.md) | Goals and non-goals for v0.1 |
+| [System Architecture](docs/specs/system-architecture.md) | High-level topology and node types |
+| [Core Node](docs/specs/core-node.md) | Embedded DuckDB engine, storage, and query execution |
+| [Coordinator Node](docs/specs/coordinator-node.md) | Query routing, distributed planning, and metadata catalog |
+| [Data Distribution](docs/specs/data-distribution.md) | Sharding strategy and replication |
+| [Cluster Coordination](docs/specs/cluster-coordination.md) | Node discovery, leader election, and failure detection |
+| [Communication Layer](docs/specs/communication-layer.md) | Protocols, wire formats, and client interface |
+| [Distributed Query Processing](docs/specs/distributed-query-processing.md) | Query lifecycle and optimization |
+| [Transactions & Consistency](docs/specs/transactions-consistency.md) | Consistency model and distributed transactions |
+| [Fault Tolerance](docs/specs/fault-tolerance.md) | WAL, snapshotting, node recovery, and quorum |
+| [Roadmap](docs/specs/roadmap.md) | Roadmap to reach v1.0 |
+| [Glossary](docs/specs/glossary.md) | Term definitions |
+| [Links](docs/specs/links.md) | External references |
 
 **Features** (`docs/features/`):
 
