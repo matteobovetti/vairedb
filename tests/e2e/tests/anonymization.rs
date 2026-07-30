@@ -65,7 +65,10 @@ async fn test_anonymized_insert_stores_digest_not_plaintext() {
         .unwrap();
     assert_eq!(rows.len(), 1);
     let stored = rows[0][0].as_deref().unwrap();
-    assert_eq!(stored, expected, "stored value must be the HMAC-SHA256 digest");
+    assert_eq!(
+        stored, expected,
+        "stored value must be the HMAC-SHA256 digest"
+    );
     assert_ne!(stored, email, "plaintext must never be stored");
     assert_eq!(stored.len(), 64);
 
@@ -126,7 +129,10 @@ async fn test_anonymized_update_stores_digest() {
     let rows = simple_query_rows(&client, &format!("SELECT name FROM {tbl} WHERE id = 1"))
         .await
         .unwrap();
-    assert_eq!(rows[0][0].as_deref(), Some(hmac_sha256_hex(secret_key, "Bob").as_str()));
+    assert_eq!(
+        rows[0][0].as_deref(),
+        Some(hmac_sha256_hex(secret_key, "Bob").as_str())
+    );
 
     drop_table(&client, &tbl).await;
 }
@@ -150,7 +156,9 @@ async fn test_secret_key_not_exposed_via_catalog() {
     // The secret id and algo are visible; the key must not be.
     let rows = simple_query_rows(
         &client,
-        &format!("SELECT id, algo FROM vairedb_catalog.anonymization_secret WHERE id = '{secret_id}'"),
+        &format!(
+            "SELECT id, algo FROM vairedb_catalog.anonymization_secret WHERE id = '{secret_id}'"
+        ),
     )
     .await
     .unwrap();

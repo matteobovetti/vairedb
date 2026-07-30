@@ -148,9 +148,12 @@ async fn test_delete_null_bound_param_shard_key_rejected() {
         &format!("(id INTEGER NOT NULL, v VARCHAR) {CREATE_OPTS}"),
     )
     .await;
-    execute(&client, &format!("INSERT INTO {tbl} (id, v) VALUES (1, 'a')"))
-        .await
-        .unwrap();
+    execute(
+        &client,
+        &format!("INSERT INTO {tbl} (id, v) VALUES (1, 'a')"),
+    )
+    .await
+    .unwrap();
 
     let id: Option<i32> = None;
     let err = client

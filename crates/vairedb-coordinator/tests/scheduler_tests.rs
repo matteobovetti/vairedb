@@ -151,6 +151,38 @@ fn parse_data_type_case_insensitive() {
     assert_eq!(parse_data_type("Double Precision"), DataType::Float64);
 }
 
+fn list_of(element: DataType) -> DataType {
+    DataType::List(Arc::new(Field::new("item", element, true)))
+}
+
+#[test]
+fn parse_data_type_array_element_types() {
+    assert_eq!(parse_data_type("INTEGER[]"), list_of(DataType::Int32));
+    assert_eq!(parse_data_type("BIGINT[]"), list_of(DataType::Int64));
+    assert_eq!(parse_data_type("TEXT[]"), list_of(DataType::Utf8));
+    assert_eq!(parse_data_type("BOOLEAN[]"), list_of(DataType::Boolean));
+}
+
+#[test]
+fn parse_data_type_array_case_insensitive_and_sized() {
+    assert_eq!(parse_data_type("integer[]"), list_of(DataType::Int32));
+    // A fixed-size array (e.g. INTEGER[3]) is still modeled as a variable List.
+    assert_eq!(parse_data_type("INTEGER[3]"), list_of(DataType::Int32));
+}
+
+#[test]
+fn parse_data_type_nested_array() {
+    assert_eq!(
+        parse_data_type("INTEGER[][]"),
+        list_of(list_of(DataType::Int32))
+    );
+}
+
+#[test]
+fn parse_data_type_unknown_element_array_falls_back_to_utf8_list() {
+    assert_eq!(parse_data_type("GEOMETRY[]"), list_of(DataType::Utf8));
+}
+
 // =============================================================================
 // SchedulerTableProvider tests
 // =============================================================================

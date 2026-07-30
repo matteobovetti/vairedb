@@ -25,7 +25,7 @@ use pgwire::api::copy::CopyHandler;
 use pgwire::api::portal::{Format, Portal};
 use pgwire::api::query::{ExtendedQueryHandler, SimpleQueryHandler};
 use pgwire::api::results::{
-    DescribePortalResponse, DescribeResponse, DescribeStatementResponse, Response, Tag,
+    DescribePortalResponse, DescribeResponse, DescribeStatementResponse, Response,
 };
 use pgwire::api::stmt::{QueryParser, StoredStatement};
 use pgwire::api::store::PortalStore;
@@ -115,6 +115,38 @@ impl PgWireServerHandlers for VaireDbHandlers {
 
     fn cancel_handler(&self) -> Arc<impl CancelHandler> {
         Arc::new(NoopHandler)
+    }
+}
+
+/// Build the error returned for a statement the coordinator does not implement
+/// (transaction control, SET/SHOW, TRUNCATE, CREATE VIEW, EXPLAIN, etc.). These
+/// used to fall through to a fake `OK`, silently misleading clients; now they
+/// fail with `FeatureNotSupported` (SQLSTATE `0A000`) naming the command.
+fn unsupported_statement_error(stmt: &sqlparser::ast::Statement) -> PgWireError {
+    make_vdb_error(
+        VdbErrorCode::FeatureNotSupported,
+        format!(
+            "{} is not supported by VaireDB",
+            unsupported_statement_label(stmt)
+        ),
+    )
+}
+
+/// Human-readable command name for an unsupported statement, used in the error
+/// message so the client learns which command was rejected.
+fn unsupported_statement_label(stmt: &sqlparser::ast::Statement) -> &'static str {
+    use sqlparser::ast::Statement;
+    match stmt {
+        Statement::StartTransaction { .. } => "transaction control (BEGIN)",
+        Statement::Commit { .. } => "transaction control (COMMIT)",
+        Statement::Rollback { .. } => "transaction control (ROLLBACK)",
+        Statement::Savepoint { .. } | Statement::ReleaseSavepoint { .. } => "SAVEPOINT",
+        Statement::Set(_) => "SET",
+        Statement::ShowVariable { .. } => "SHOW",
+        Statement::Truncate { .. } => "TRUNCATE",
+        Statement::CreateView { .. } => "CREATE VIEW",
+        Statement::Explain { .. } | Statement::ExplainTable { .. } => "EXPLAIN",
+        _ => "this statement",
     }
 }
 
@@ -283,7 +315,7 @@ impl VaireDbQueryHandler {
             QueryType::CreateTable => self.handle_create_table(stmt).await,
             QueryType::DropTable => self.handle_drop_table(stmt).await,
             QueryType::AlterTable => self.handle_alter_table(stmt).await,
-            _ => Ok(Response::Execution(Tag::new("OK"))),
+            QueryType::Other => Err(unsupported_statement_error(stmt)),
         }
     }
 
@@ -302,7 +334,7 @@ impl VaireDbQueryHandler {
             QueryType::CreateTable => self.handle_create_table(stmt).await,
             QueryType::DropTable => self.handle_drop_table(stmt).await,
             QueryType::AlterTable => self.handle_alter_table(stmt).await,
-            _ => Ok(Response::Execution(Tag::new("OK"))),
+            QueryType::Select | QueryType::Other => Err(unsupported_statement_error(stmt)),
         }
     }
 
@@ -371,9 +403,22 @@ impl VaireDbQueryHandler {
     /// introspection queries and the distributed context otherwise, and encode
     /// the result as text (the only format the simple protocol uses).
     async fn handle_select(&self, stmt: &sqlparser::ast::Statement) -> PgWireResult<Response> {
+        // Translate PG TO_CHAR format strings to strftime specifiers so DataFusion's
+        // native to_char formats correctly on the read path.
+        let mut stmt_read = stmt.clone();
+        sql_compat::transform_to_char_format_for_read(&mut stmt_read);
+
+        let is_catalog = self.is_catalog_query(stmt);
+        // User schemas are flat qualifiers: collapse `schema.tbl` to the bare
+        // registered name. Skip catalog queries so `pg_catalog.*` etc. keep their
+        // qualifier for the local catalog context.
+        if !is_catalog {
+            sql_compat::collapse_schema_qualified_relations(&mut stmt_read);
+        }
+        let stmt = &stmt_read;
         let sql = sql_compat::statement_to_sql(stmt);
 
-        let ctx = if self.is_catalog_query(stmt) {
+        let ctx = if is_catalog {
             &self.local_ctx
         } else {
             &self.session_ctx

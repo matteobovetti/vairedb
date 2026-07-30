@@ -188,9 +188,7 @@ async fn test_timestamp_round_trip() {
     let tbl = create_table(
         &client,
         "tr_ts",
-        &format!(
-            "(id INTEGER NOT NULL, ts TIMESTAMP NOT NULL, d DATE NOT NULL) {CREATE_OPTS}"
-        ),
+        &format!("(id INTEGER NOT NULL, ts TIMESTAMP NOT NULL, d DATE NOT NULL) {CREATE_OPTS}"),
     )
     .await;
 

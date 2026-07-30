@@ -4,7 +4,6 @@
 
 | Status | Description |
 |--------|-------------|
-| WIP | Review & Fix ignored bugs inside e2e tests. |
 | WIP | Publish Web Site and Web Docs when the repo is publicly available. |
 
 ## Roadmap to v0.2
