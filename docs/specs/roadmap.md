@@ -1,11 +1,5 @@
 # Roadmap
 
-## Roadmap to v0.1
-
-| Status | Description |
-|--------|-------------|
-| WIP | Publish Web Site and Web Docs when the repo is publicly available. |
-
 ## Roadmap to v0.2
 
 | Status | Description |

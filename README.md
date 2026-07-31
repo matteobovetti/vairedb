@@ -36,12 +36,30 @@ each running an embedded DuckDB instance optimized for OLAP queries.
 
 ### Use Cases
 
-- Analytical/Read optimized database positioned close to microservices' 
-  transactional databases, serving the query (read) side of a CQRS architecture.
-- A denormalized, read-optimized view of data shared across a microservices ecosystem.
-- Deployable both as a wide data fabric spanning the whole ecosystem and as a 
-  micro-fabric local to each bounded context.
-- A compliance datastore supporting data take-out (export), deletion, and anonymization.
+- **CQRS read side** — an analytical database positioned close to
+  microservices' transactional databases, serving the query (read) side of a
+  CQRS architecture. Transactional systems keep handling writes in their own
+  stores, while VaireDB absorbs the heavy read and aggregation traffic that
+  would otherwise contend with operational workloads — keeping write paths fast
+  and read paths scalable.
+
+- **Shared read model** — a denormalized, read-optimized view of data shared
+  across a microservices ecosystem. Instead of each service repeatedly joining
+  and reshaping data from many sources, VaireDB holds a consolidated,
+  query-friendly representation that teams can reuse, reducing duplicated effort
+  and keeping cross-service reporting consistent.
+
+- **Data fabric or micro-fabric** — deployable both as a wide data fabric
+  spanning the whole ecosystem and as a micro-fabric local to each bounded
+  context. The same engine scales from a single bounded context to an
+  organization-wide layer, so you can start small within one domain and grow
+  toward a shared analytical backbone without changing technology.
+
+- **Compliance datastore** — supporting data take-out (export), deletion, and
+  anonymization. By centralizing a queryable copy of data, VaireDB makes it
+  easier to satisfy regulatory obligations such as subject-access exports,
+  right-to-be-forgotten deletions, and anonymization, without hunting through
+  every individual service store.
 
 ## Architecture
 
@@ -73,7 +91,11 @@ VaireDB follows a coordinator/worker topology:
 
 For full details, see the [Architecture Documentation](docs/specs/ARCHITECTURE.md).
 
-### Documentation
+### Project Documentation
+
+[VaireDB Documentation](https://matteobovetti.github.io/vairedb/)
+
+### System Design Documentation
 
 All documentation lives under `docs/`, split into architecture references, feature designs, and testing notes.
 

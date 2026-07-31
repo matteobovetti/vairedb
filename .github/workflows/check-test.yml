@@ -1,4 +1,4 @@
-name: check-test
+name: Cargo Check and Test
 
 on:
   push:

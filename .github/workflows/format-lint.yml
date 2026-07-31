@@ -1,4 +1,4 @@
-name: format-lint
+name: Cargo Format and Lint
 
 on:
   push:
