@@ -5829,7 +5829,7 @@ dependencies = [
  "futures",
  "prost-types 0.13.5",
  "serde",
- "socket2 0.5.10",
+ "socket2 0.6.3",
  "tempfile",
  "thiserror",
  "tokio",
