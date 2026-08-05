@@ -39,6 +39,6 @@
   - [Snapshotting](fault-tolerance.md#snapshotting-planned)
   - [Node Recovery](fault-tolerance.md#node-recovery)
   - [Quorum and Availability](fault-tolerance.md#quorum-and-availability)
-- [Roadmap](roadmap.md) — Roadmap for v0.1 and v0.2
+- [Roadmap](roadmap.md) — Roadmap for next releases
 - [Glossary](glossary.md) — Term definitions
 - [Links](links.md) — External references

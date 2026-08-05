@@ -7,8 +7,7 @@
 | TODO | Feature **Compliance** - Defining a DAG (Directed Acyclic Graph) of connected tables, the feature creates a vectorized representation of data takeout or deletion that needs to be performed. |
 | TODO | Extend the SQL support on top of DuckDB. |
 | TODO | VaireDB CLI with massive data import SQL command and psql client. |
-| TODO | Microbenshmark core piace of the code base. |
-| TODO | Performance tests (distributed). |
+| TODO | Security: TLS, users, groups. |
 
 ## Roadmap to v0.3
 
@@ -27,6 +26,8 @@
 | Status | Description |
 |--------|-------------|
 | TODO | Coordinator HA. |
+| TODO | Performance tests (distributed). |
+| TODO | Microbenshmark core piace of the code base. |
 
 ## Bank of ideas
 | Status | Description |
