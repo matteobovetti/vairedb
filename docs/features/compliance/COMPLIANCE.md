@@ -119,10 +119,80 @@ The anonymized column MUST be a string/varchar large enough to hold the digest, 
 
 The only supported algorithm is [HMAC-SHA256](https://it.wikipedia.org/wiki/HMAC). Weaker hashes (SHA1, MD5) are intentionally not offered, as they are cryptographically broken.
 
-## Data Take Out
-
-TBDesigned
-
 ## Data Deletion
 
-TBDesigned
+### Overview
+
+Data Deletion (DDR) - Delete or anonymize all user data, is a distributed operation that deletes or anonymizes all user data across the VaireDB cluster.
+
+With this feature we store a yaml based graph of connected tables, defining the data deletion or anonymization logic.
+
+### Request Pipeline State Machine
+
+Considering an ID is inserted in a request tables (see below how compliance tables are structured), below the state machine of every pipeline:
+
+- `pending`: The deletion or anonymization operation has been requested but not yet started.
+- `distributed`: The deletion or anonymization operation is distributed (from coordinator) across the VaireDB's core nodes. Every core node will execute the operation on its own data.
+- `executing`: The deletion or anonymization operation is currently being executed on a core node. Every command is executed asynchronously on every shard (primary and replica).
+- `completed`: The deletion or anonymization operation has been completed successfully inside the core node and the result has been propagated to the coordinator.
+- `failed`: The deletion or anonymization operation has failed inside the core node and the result has not been propagated to the coordinator.
+
+### Data Deletion Tables
+
+The data deletion tables store the compliance requests and their state. They are used to track the progress of data deletion or anonymization operations across the VaireDB cluster.
+
+- `vairedb_catalog.compliance_requests`: Stores the compliance requests submitted by the coordinator and tracked by the pipeline state.
+- `vairedb_catalog.compliance_requests_pipelines`: Stores the pipeline definition in YAML format.
+- `vairedb_catalog.compliance_requests_pipeline_state`: Stores the state of the pipeline execution for each request.
+
+```sql
+CREATE TABLE vairedb_catalog.compliance_requests (
+    request_id UUID PRIMARY KEY,
+    request_type VARCHAR(255) NOT NULL, -- `data_deletion` or `data_take_out`
+    request_closed BOOLEAN NOT NULL, -- `true` if the request has been closed, `false` otherwise
+    request_closed_at TIMESTAMP WITH TIME ZONE, -- the timestamp when the request was closed
+    pipeline_to_execute VARCHAR(255) NOT NULL, -- the pipeline to execute for this request
+);
+
+CREATE TABLE vairedb_catalog.compliance_requests_pipelines (
+    pipeline_id UUID PRIMARY KEY,
+    pipeline_definition TEXT NOT NULL, -- the pipeline definition in YAML format
+);
+
+CREATE TABLE vairedb_catalog.compliance_requests_pipeline_state (
+    request_id UUID NOT NULL, -- the ID of the request
+    pipeline_state VARCHAR(255) NOT NULL, -- the state of the pipeline execution
+    pipeline_execution_id UUID NOT NULL, -- the ID of the pipeline execution
+    pipeline_execution_started_at TIMESTAMP WITH TIME ZONE NOT NULL, -- the timestamp when the pipeline execution started
+    pipeline_execution_ended_at TIMESTAMP WITH TIME ZONE, -- the timestamp when the pipeline execution ended
+    PRIMARY KEY (request_id, pipeline_execution_id),
+    FOREIGN KEY (request_id) REFERENCES vairedb_catalog.compliance_requests(request_id)
+);
+```
+
+### Data Deletion Graph
+
+```yaml
+pipeline-name: string
+graph-edges:
+  [
+   { "from": "sql-1", "to": "sql-3" },
+   { "from": "sql-2", "to": "sql-3" }
+  ]
+graph-nodes:
+  sql-1:
+    command: "DELETE FROM my_table WHERE id IN (1,2,3)"
+  sql-2:
+    command: "DELETE FROM my_other_table WHERE id IN (SELECT id FROM my_table WHERE id IN (1,2,3))"
+  sql-3:
+    command: "DELETE FROM my_final_table WHERE id IN (SELECT id FROM my_table WHERE id IN (1,2,3))"
+```
+
+### Operations details
+
+`command` is the point where the user defines the SQL command to be executed. Inside this commmand we can define a deletetion of the rows/data or apply an anonymization function on top of the underling data.
+The anonymization process is indipendent from the pseudonymization process described above [here](COMPLIANCE.md#data-pseudonymization).
+
+## Data Take Out
+
+I have some doubts that this feature need to handled inside VaireDB. Potencially can be done outside VaireDB using a custom data extraction tool.

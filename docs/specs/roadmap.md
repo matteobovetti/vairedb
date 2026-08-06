@@ -4,8 +4,9 @@
 
 | Status | Description |
 |--------|-------------|
-| TODO | Feature **Compliance** - Defining a DAG (Directed Acyclic Graph) of connected tables, the feature creates a vectorized representation of data takeout or deletion that needs to be performed. |
-| TODO | Extend the SQL support on top of DuckDB. |
+| WIP | Implement duckdb vs. pgsql command gap. |
+| WIP | Feature **Compliance - Data Deletion (DDR) - Delete or anonymize all user data** |
+| VALIDATE | Feature **Compliance - Data Takeout (SAR) - Subject Access Request: Provide all user data** |
 | TODO | VaireDB CLI with massive data import SQL command and psql client. |
 | TODO | Security: TLS, users, groups. |
 
