@@ -18,9 +18,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: jlumbroso/free-disk-space@main
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: mozilla-actions/sccache-action@v0.0.11
       - run: sudo apt-get install -y protobuf-compiler
       - run: cargo check --all
   test:
@@ -29,8 +29,8 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: jlumbroso/free-disk-space@main
-      - uses: dtolnay/rust-toolchain@1.95.0
+      - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
-      - uses: mozilla-actions/sccache-action@v0.0.10
+      - uses: mozilla-actions/sccache-action@v0.0.11
       - run: sudo apt-get install -y protobuf-compiler
       - run: cargo test --all
