@@ -302,7 +302,7 @@ dependencies = [
  "futures",
  "once_cell",
  "paste",
- "prost 0.14.3",
+ "prost",
  "prost-types",
  "tonic",
  "tonic-prost",
@@ -932,7 +932,7 @@ dependencies = [
  "md-5 0.11.0",
  "object_store",
  "parking_lot",
- "prost 0.14.3",
+ "prost",
  "prost-types",
  "rand 0.10.1",
  "rustc_version",
@@ -1002,7 +1002,7 @@ dependencies = [
  "log",
  "object_store",
  "parking_lot",
- "prost 0.14.3",
+ "prost",
  "prost-types",
  "rand 0.10.1",
  "serde",
@@ -2238,7 +2238,7 @@ dependencies = [
  "datafusion-physical-plan",
  "datafusion-proto-common",
  "object_store",
- "prost 0.14.3",
+ "prost",
  "rand 0.9.4",
 ]
 
@@ -2250,7 +2250,7 @@ checksum = "16e614c7c53a9c304c6a850b821010bb492e57300311835f1180613f9d2c63d9"
 dependencies = [
  "arrow",
  "datafusion-common",
- "prost 0.14.3",
+ "prost",
 ]
 
 [[package]]
@@ -2317,7 +2317,7 @@ dependencies = [
  "itertools",
  "object_store",
  "pbjson-types",
- "prost 0.14.3",
+ "prost",
  "substrait",
  "tokio",
  "url",
@@ -3725,7 +3725,7 @@ checksum = "af22d08a625a2213a78dbb0ffa253318c5c79ce3133d32d296655a7bdfb02095"
 dependencies = [
  "heck",
  "itertools",
- "prost 0.14.3",
+ "prost",
  "prost-types",
 ]
 
@@ -3739,7 +3739,7 @@ dependencies = [
  "chrono",
  "pbjson",
  "pbjson-build",
- "prost 0.14.3",
+ "prost",
  "prost-build",
  "serde",
 ]
@@ -3959,22 +3959,12 @@ dependencies = [
 
 [[package]]
 name = "prost"
-version = "0.13.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2796faa41db3ec313a31f7624d9286acf277b52de526150b7e69f3debf891ee5"
-dependencies = [
- "bytes",
- "prost-derive 0.13.5",
-]
-
-[[package]]
-name = "prost"
 version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "d2ea70524a2f82d518bce41317d0fae74151505651af45faf1ffbd6fd33f0568"
 dependencies = [
  "bytes",
- "prost-derive 0.14.3",
+ "prost-derive",
 ]
 
 [[package]]
@@ -3989,26 +3979,13 @@ dependencies = [
  "multimap",
  "petgraph",
  "prettyplease",
- "prost 0.14.3",
+ "prost",
  "prost-types",
  "pulldown-cmark",
  "pulldown-cmark-to-cmark",
  "regex",
  "syn 2.0.117",
  "tempfile",
-]
-
-[[package]]
-name = "prost-derive"
-version = "0.13.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "8a56d757972c98b346a9b766e3f02746cde6dd1cd1d1d563472929fdd74bec4d"
-dependencies = [
- "anyhow",
- "itertools",
- "proc-macro2",
- "quote",
- "syn 2.0.117",
 ]
 
 [[package]]
@@ -4030,7 +4007,7 @@ version = "0.14.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8991c4cbdb8bc5b11f0b074ffe286c30e523de90fee5ba8132f1399f23cb3dd7"
 dependencies = [
- "prost 0.14.3",
+ "prost",
 ]
 
 [[package]]
@@ -5007,7 +4984,7 @@ dependencies = [
  "pbjson-build",
  "pbjson-types",
  "prettyplease",
- "prost 0.14.3",
+ "prost",
  "prost-build",
  "prost-types",
  "regress",
@@ -5376,7 +5353,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "50849f68853be452acf590cde0b146665b8d507b3b8af17261df47e02c209ea0"
 dependencies = [
  "bytes",
- "prost 0.14.3",
+ "prost",
  "tonic",
 ]
 
@@ -5699,13 +5676,14 @@ dependencies = [
 name = "vairedb-common"
 version = "0.1.0"
 dependencies = [
- "prost 0.14.3",
- "prost-types 0.14.3",
+ "prost",
+ "prost-types",
  "serde",
  "serde_json",
  "serde_yaml",
  "tonic",
- "tonic-build",
+ "tonic-prost",
+ "tonic-prost-build",
 ]
 
 [[package]]
@@ -5724,8 +5702,8 @@ dependencies = [
  "futures",
  "hmac",
  "pgwire",
- "prost 0.14.3",
- "prost-types 0.14.3",
+ "prost",
+ "prost-types",
  "redb",
  "serde",
  "serde_json",
