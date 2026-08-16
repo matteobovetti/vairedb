@@ -304,7 +304,7 @@ dependencies = [
  "paste",
  "prost 0.14.3",
  "prost-types 0.14.3",
- "tonic 0.14.6",
+ "tonic",
  "tonic-prost",
 ]
 
@@ -939,7 +939,7 @@ dependencies = [
  "serde",
  "tokio",
  "tokio-stream",
- "tonic 0.14.6",
+ "tonic",
  "tonic-build 0.14.6",
  "tonic-prost",
  "tonic-prost-build",
@@ -974,7 +974,7 @@ dependencies = [
  "tokio",
  "tokio-stream",
  "tokio-util",
- "tonic 0.14.6",
+ "tonic",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -1008,7 +1008,7 @@ dependencies = [
  "serde",
  "tokio",
  "tokio-stream",
- "tonic 0.14.6",
+ "tonic",
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
@@ -5369,35 +5369,6 @@ dependencies = [
 
 [[package]]
 name = "tonic"
-version = "0.13.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7e581ba15a835f4d9ea06c55ab1bd4dce26fc53752c69a04aac00703bfb49ba9"
-dependencies = [
- "async-trait",
- "axum",
- "base64",
- "bytes",
- "h2",
- "http 1.4.0",
- "http-body 1.0.1",
- "http-body-util",
- "hyper",
- "hyper-timeout",
- "hyper-util",
- "percent-encoding",
- "pin-project",
- "prost 0.13.5",
- "socket2 0.5.10",
- "tokio",
- "tokio-stream",
- "tower",
- "tower-layer",
- "tower-service",
- "tracing",
-]
-
-[[package]]
-name = "tonic"
 version = "0.14.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ac2a5518c70fa84342385732db33fb3f44bc4cc748936eb5833d2df34d6445ef"
@@ -5459,7 +5430,7 @@ checksum = "50849f68853be452acf590cde0b146665b8d507b3b8af17261df47e02c209ea0"
 dependencies = [
  "bytes",
  "prost 0.14.3",
- "tonic 0.14.6",
+ "tonic",
 ]
 
 [[package]]
@@ -5786,7 +5757,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
- "tonic 0.13.1",
+ "tonic",
  "tonic-build 0.13.1",
 ]
 
@@ -5816,7 +5787,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-stream",
- "tonic 0.13.1",
+ "tonic",
  "tracing",
  "tracing-subscriber",
  "uuid",
@@ -5845,7 +5816,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tokio-stream",
- "tonic 0.13.1",
+ "tonic",
  "tracing",
  "tracing-subscriber",
  "uuid",
