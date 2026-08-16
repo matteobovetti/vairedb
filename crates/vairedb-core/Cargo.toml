@@ -35,4 +35,4 @@ prost-types = { workspace = true }
 duckdb = { workspace = true }
 vairedb-common = { workspace = true }
 tokio-stream = { version = "0.1", features = ["net"] }
-socket2 = { version = "0.5", features = ["all"] }
+socket2 = { version = "0.6", features = ["all"] }
