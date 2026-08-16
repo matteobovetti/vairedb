@@ -2,25 +2,27 @@ mod common;
 use common::*;
 
 // Identifier handling on the write/DDL path (sql_compat::rewrite_to_shard_local).
-// The per-shard rewrite appends `_shard{n}` to the LAST identifier part of a
-// relation without accounting for quote style or schema qualification, so:
-//   * a quoted name `"MyTable"` becomes the relation `"MyTable"_shard0` (suffix
-//     OUTSIDE the quotes) — reads fail, and because the catalog stores the name
-//     with literal quote characters, DROP TABLE can never match it to clean up;
-//   * a schema-qualified `schema.tbl` fails the DDL broadcast outright.
+// A logical table name is canonicalized to a single bare identifier (quoted names
+// kept verbatim, unquoted names lowercased, a `schema.` qualifier dropped) and
+// used consistently as the catalog key, the physical shard-name input, and the
+// DataFusion registration key. So both the write path (rewrite_to_shard_local)
+// and the read/DROP path (util::shard_table_name) emit the identical bare physical
+// relation `{canonical}_shard{n}`, which round-trips and drops cleanly:
+//   * a quoted name `"MyTable"` maps to physical `MyTable_shard0` (suffix inside);
+//   * a schema-qualified `schema.tbl` maps to physical `tbl_shard0`.
 //
-// CRITICAL: these failures leave UNCLEANABLE catalog/shard state that poisons the
-// shared persistent cluster (DROP cannot remove the malformed entries). Running
-// them in the default suite would break every subsequent `make e2e-test`, the
-// exact rerun-safety hazard fixed previously. They are therefore #[ignore]'d:
-// they assert the CORRECT behavior (so they convert to passing tests once the
-// rewrite is fixed) but never run in CI. Recovering a cluster polluted by an
-// --ignored run requires recreating the coordinator and restarting the cores
-// (the catalog redb lives in the coordinator container; cores re-register only
-// at startup) — see the README/Makefile e2e targets.
+// These were previously #[ignore]'d because the buggy rewrite left uncleanable
+// catalog/shard state that poisoned the shared cluster. Now fixed, they run in the
+// default suite as regression guards: DROP removes every shard table, so reruns
+// stay safe. `test_plain_identifier_write_roundtrip` is the lowercase control.
+//
+// KNOWN LIMITATION (see `test_schema_qualified_name_collision`): because a
+// schema-qualified name collapses to only its LAST part, two tables that differ
+// only by schema (`schema_a.t` vs `schema_b.t`) collide on one catalog key and
+// one set of physical shards. That xfail documents the correct (independent
+// tables) behavior; closing it requires modeling the schema as a real namespace.
 
 #[tokio::test]
-#[ignore = "known bug: quoted table identifier gets the shard suffix appended outside the quotes; reads fail and the entry cannot be dropped (pollutes the shared cluster)"]
 async fn test_quoted_table_identifier() {
     let client = ready_client().await;
     let tbl = format!("\"{}\"", unique_table_name("Ident_Quoted"));
@@ -56,7 +58,6 @@ async fn test_quoted_table_identifier() {
 }
 
 #[tokio::test]
-#[ignore = "known bug: schema-qualified table name fails the per-shard DDL broadcast; only the last identifier part is suffixed"]
 async fn test_schema_qualified_write() {
     let client = ready_client().await;
     let tbl = format!("ident_schema.{}", unique_table_name("sch_tbl"));
@@ -84,6 +85,68 @@ async fn test_schema_qualified_write() {
     assert_eq!(rows[0][0].as_deref(), Some("2"));
 
     drop_table(&client, &tbl).await;
+}
+
+// Two tables that differ ONLY by schema must be INDEPENDENT: a row written to
+// `schema_a.<t>` must not be visible through `schema_b.<t>`. Today the write/DDL
+// path canonicalizes a schema-qualified name to only its last part, so both
+// names collapse to one catalog key and one set of physical shards — the second
+// CREATE collides with the first and the two names alias the same data. Closing
+// this requires modeling the schema qualifier as a real namespace.
+#[tokio::test]
+#[ignore = "known bug: schema-qualified names collapse to their last part, so schema_a.t and schema_b.t collide on one catalog key and one physical table instead of being independent"]
+async fn test_schema_qualified_name_collision() {
+    let client = ready_client().await;
+    let base = unique_table_name("sch_collide");
+    let tbl_a = format!("ident_schema_a.{base}");
+    let tbl_b = format!("ident_schema_b.{base}");
+
+    execute(&client, &format!("DROP TABLE IF EXISTS {tbl_a}"))
+        .await
+        .unwrap();
+    execute(&client, &format!("DROP TABLE IF EXISTS {tbl_b}"))
+        .await
+        .unwrap();
+
+    execute(
+        &client,
+        &format!("CREATE TABLE {tbl_a} (id INTEGER NOT NULL, v VARCHAR) {CREATE_OPTS}"),
+    )
+    .await
+    .unwrap();
+    // Correct behavior: a table in a different schema is a distinct relation, so
+    // this CREATE succeeds instead of colliding with tbl_a.
+    execute(
+        &client,
+        &format!("CREATE TABLE {tbl_b} (id INTEGER NOT NULL, v VARCHAR) {CREATE_OPTS}"),
+    )
+    .await
+    .unwrap();
+
+    execute(
+        &client,
+        &format!("INSERT INTO {tbl_a} (id, v) VALUES (1,'a')"),
+    )
+    .await
+    .unwrap();
+
+    // Correct behavior: the row is only in schema_a's table; schema_b is empty.
+    let rows_b = simple_query_rows(&client, &format!("SELECT COUNT(*) FROM {tbl_b}"))
+        .await
+        .unwrap();
+    assert_eq!(
+        rows_b[0][0].as_deref(),
+        Some("0"),
+        "a row written to {tbl_a} must not be visible through {tbl_b}"
+    );
+
+    let rows_a = simple_query_rows(&client, &format!("SELECT COUNT(*) FROM {tbl_a}"))
+        .await
+        .unwrap();
+    assert_eq!(rows_a[0][0].as_deref(), Some("1"));
+
+    drop_table(&client, &tbl_a).await;
+    drop_table(&client, &tbl_b).await;
 }
 
 // Control: an unquoted lowercase identifier (the convention used everywhere else)

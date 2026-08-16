@@ -1,6 +1,7 @@
 use vairedb_coordinator::sql_compat::{
-    extract_insert_row_shard_keys, extract_shard_key_value, parse_sql, rewrite_to_shard_local,
-    split_insert_by_rows, statement_to_sql, transform_to_duckdb,
+    collapse_schema_qualified_relations, extract_insert_row_shard_keys, extract_shard_key_value,
+    parse_sql, rewrite_to_shard_local, split_insert_by_rows, statement_to_sql,
+    transform_to_char_format_for_read, transform_to_duckdb,
 };
 
 #[test]
@@ -64,6 +65,80 @@ fn test_shard_rewrite_create_table() {
     rewrite_to_shard_local(&mut stmts[0], "shard0");
     let result = statement_to_sql(&stmts[0]);
     assert!(result.contains("orders_shard0"));
+}
+
+// A quoted identifier must land the shard suffix INSIDE the quotes and emit a
+// BARE physical name (no quote characters) so it matches shard_table_name and
+// the storage node's unquoted `FROM {name}` splice.
+#[test]
+fn test_shard_rewrite_quoted_identifier_is_bare() {
+    let sql = "INSERT INTO \"MyTable\" (id) VALUES (1)";
+    let mut stmts = parse_sql(sql).unwrap();
+    rewrite_to_shard_local(&mut stmts[0], "shard0");
+    let result = statement_to_sql(&stmts[0]);
+    assert!(result.contains("MyTable_shard0"), "got: {result}");
+    assert!(
+        !result.contains('"'),
+        "physical name must be bare (no quotes), got: {result}"
+    );
+}
+
+// A schema-qualified relation collapses to the bare last part plus the suffix,
+// dropping the schema qualifier.
+#[test]
+fn test_shard_rewrite_schema_qualified_drops_schema() {
+    let sql = "SELECT id FROM ident_schema.orders WHERE id = 1";
+    let mut stmts = parse_sql(sql).unwrap();
+    rewrite_to_shard_local(&mut stmts[0], "shard2");
+    let result = statement_to_sql(&stmts[0]);
+    assert!(result.contains("orders_shard2"), "got: {result}");
+    assert!(
+        !result.contains("ident_schema"),
+        "schema qualifier must be dropped, got: {result}"
+    );
+}
+
+// An unquoted mixed-case name is folded to lowercase (PG identifier semantics).
+#[test]
+fn test_shard_rewrite_unquoted_mixedcase_lowercased() {
+    let sql = "INSERT INTO Orders (id) VALUES (1)";
+    let mut stmts = parse_sql(sql).unwrap();
+    rewrite_to_shard_local(&mut stmts[0], "shard0");
+    let result = statement_to_sql(&stmts[0]);
+    assert!(result.contains("orders_shard0"), "got: {result}");
+    assert!(!result.contains("Orders_shard0"), "got: {result}");
+}
+
+// The read-path collapse rewrites `schema.tbl` to the bare `tbl`, preserving a
+// quoted last part's case and quoting.
+#[test]
+fn test_collapse_schema_qualified_relation() {
+    let sql = "SELECT id FROM ident_schema.orders WHERE id = 1";
+    let mut stmts = parse_sql(sql).unwrap();
+    collapse_schema_qualified_relations(&mut stmts[0]);
+    let result = statement_to_sql(&stmts[0]);
+    assert!(!result.contains("ident_schema"), "got: {result}");
+    assert!(result.contains("orders"), "got: {result}");
+}
+
+#[test]
+fn test_collapse_leaves_single_part_relation_untouched() {
+    let sql = "SELECT id FROM orders WHERE id = 1";
+    let mut stmts = parse_sql(sql).unwrap();
+    let before = statement_to_sql(&stmts[0]);
+    collapse_schema_qualified_relations(&mut stmts[0]);
+    let after = statement_to_sql(&stmts[0]);
+    assert_eq!(before, after);
+}
+
+#[test]
+fn test_collapse_preserves_quoted_last_part() {
+    let sql = "SELECT id FROM ident_schema.\"MyTable\"";
+    let mut stmts = parse_sql(sql).unwrap();
+    collapse_schema_qualified_relations(&mut stmts[0]);
+    let result = statement_to_sql(&stmts[0]);
+    assert!(!result.contains("ident_schema"), "got: {result}");
+    assert!(result.contains("\"MyTable\""), "got: {result}");
 }
 
 #[test]
@@ -312,6 +387,69 @@ fn test_transform_does_not_alter_select() {
     assert_eq!(before, after);
 }
 
+// --- Write path: TO_CHAR format-string translation (PG template -> strftime) ---
+
+#[test]
+fn test_transform_to_char_translates_date_format() {
+    let sql = "UPDATE t SET col = TO_CHAR(ts, 'YYYY-MM-DD') WHERE id = 1";
+    let mut stmts = parse_sql(sql).unwrap();
+    transform_to_duckdb(&mut stmts[0]);
+    let result = statement_to_sql(&stmts[0]);
+    assert!(result.contains("STRFTIME"), "got: {result}");
+    assert!(result.contains("%Y-%m-%d"), "got: {result}");
+    assert!(!result.contains("YYYY"), "got: {result}");
+}
+
+#[test]
+fn test_transform_to_char_translates_datetime_format() {
+    let sql = "INSERT INTO logs (v) VALUES (TO_CHAR(NOW(), 'YYYY-MM-DD HH24:MI:SS'))";
+    let mut stmts = parse_sql(sql).unwrap();
+    transform_to_duckdb(&mut stmts[0]);
+    let result = statement_to_sql(&stmts[0]);
+    assert!(result.contains("STRFTIME"), "got: {result}");
+    assert!(result.contains("%Y-%m-%d %H:%M:%S"), "got: {result}");
+}
+
+// --- Read path: keep to_char, translate only the format string ---
+
+#[test]
+fn test_read_transform_keeps_to_char_and_translates_format() {
+    let sql = "SELECT TO_CHAR(ts, 'YYYY-MM-DD') FROM logs";
+    let mut stmts = parse_sql(sql).unwrap();
+    transform_to_char_format_for_read(&mut stmts[0]);
+    let result = statement_to_sql(&stmts[0]);
+    assert!(
+        result.to_uppercase().contains("TO_CHAR"),
+        "read path must keep to_char, got: {result}"
+    );
+    assert!(!result.contains("STRFTIME"), "got: {result}");
+    assert!(result.contains("%Y-%m-%d"), "got: {result}");
+    assert!(!result.contains("YYYY"), "got: {result}");
+}
+
+#[test]
+fn test_read_transform_reaches_projection_and_where() {
+    let sql =
+        "SELECT TO_CHAR(a, 'YYYY') FROM t WHERE TO_CHAR(b, 'MM') = '01' ORDER BY TO_CHAR(c, 'DD')";
+    let mut stmts = parse_sql(sql).unwrap();
+    transform_to_char_format_for_read(&mut stmts[0]);
+    let result = statement_to_sql(&stmts[0]);
+    assert!(result.contains("%Y"), "projection not translated: {result}");
+    assert!(result.contains("%m"), "WHERE not translated: {result}");
+    assert!(result.contains("%d"), "ORDER BY not translated: {result}");
+    assert!(!result.contains("'YYYY'") && !result.contains("'MM'") && !result.contains("'DD'"));
+}
+
+#[test]
+fn test_read_transform_ignores_non_to_char() {
+    let sql = "SELECT EXTRACT(YEAR FROM ts), name || '!' FROM logs WHERE id = 1";
+    let mut stmts = parse_sql(sql).unwrap();
+    let before = statement_to_sql(&stmts[0]);
+    transform_to_char_format_for_read(&mut stmts[0]);
+    let after = statement_to_sql(&stmts[0]);
+    assert_eq!(before, after);
+}
+
 // --- Additional extract_shard_key_value edge cases ---
 
 #[test]
@@ -387,6 +525,17 @@ fn test_transform_alter_table_preserves_other_types() {
     transform_to_duckdb(&mut stmts[0]);
     let result = statement_to_sql(&stmts[0]);
     assert!(result.contains("VARCHAR"));
+}
+
+// PostgreSQL array syntax (`INTEGER[]`) is valid DuckDB ARRAY/LIST syntax, so the
+// transform must leave it intact — DuckDB accepts the column DDL verbatim.
+#[test]
+fn test_transform_preserves_array_column_type() {
+    let sql = "CREATE TABLE t (id INTEGER, tags INTEGER[])";
+    let mut stmts = parse_sql(sql).unwrap();
+    transform_to_duckdb(&mut stmts[0]);
+    let result = statement_to_sql(&stmts[0]);
+    assert!(result.contains("INTEGER[]"), "got: {result}");
 }
 
 #[test]

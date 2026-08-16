@@ -497,11 +497,10 @@ async fn test_create_table_cleans_up_on_node_failure() {
 }
 
 // ALTER TABLE must not change the catalog if the change cannot be applied to the
-// cluster. handle_alter_table mutates the catalog (put_table with the new column)
-// BEFORE broadcasting the DDL, then returns an error if any node is unreachable —
-// leaving the catalog claiming a column that some shards never got.
+// cluster. handle_alter_table broadcasts the shard-local DDL first and persists
+// the new column with put_table only once every node was reached, so a node
+// failure during broadcast aborts the command with the catalog unchanged.
 #[tokio::test]
-#[ignore = "known gap: ALTER mutates the catalog before broadcasting; a node failure during broadcast leaves the catalog reporting a column the cluster does not have"]
 async fn test_alter_table_atomic_across_nodes() {
     let client = ready_client().await;
     let tbl = create_table(
@@ -528,9 +527,9 @@ async fn test_alter_table_atomic_across_nodes() {
 
     restore_node(&client, node).await;
 
-    // CORRECT BEHAVIOR (currently broken): a failed ALTER must not have changed
-    // the catalog. Today the column was persisted before the broadcast, so it is
-    // present here and the assertion fails — the intended xfail under --ignored.
+    // A failed ALTER must not have changed the catalog: the new column is
+    // persisted only after a fully successful broadcast, so with a node
+    // unreachable it must be absent here.
     let rows = simple_query_rows(
         &client,
         &format!(
@@ -546,5 +545,22 @@ async fn test_alter_table_atomic_across_nodes() {
         "a failed ALTER must not leave the new column in the catalog"
     );
 
-    drop_table(&client, &tbl).await;
+    // Bounded-retry the cleanup DROP: a node reports ALIVE (heartbeat) before its
+    // WriteService gRPC endpoint is bound, and the coordinator may briefly hold a
+    // stale cached channel to the restarted node, so the first DDL after recovery
+    // can still hit "broadcast failed". Retrying until it succeeds also leaves
+    // core-1's write path warm for the next test in this single-threaded run.
+    let drop_sql = format!("DROP TABLE {tbl}");
+    let deadline = tokio::time::Instant::now() + NODE_DOWN_WAIT;
+    loop {
+        match execute(&client, &drop_sql).await {
+            Ok(_) => break,
+            Err(e) => {
+                if tokio::time::Instant::now() >= deadline {
+                    panic!("DROP did not succeed after recovery within {NODE_DOWN_WAIT:?}: {e}");
+                }
+                tokio::time::sleep(RETRY_INTERVAL).await;
+            }
+        }
+    }
 }

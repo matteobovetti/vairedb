@@ -46,11 +46,15 @@ DuckDB instance optimized for OLAP queries.
 
 ## Key characteristics
 
-- **PostgreSQL-compatible SQL** via the DataFusion parser with automatic dialect translation to DuckDB.
-- **Horizontal scalability** through hash sharding across core nodes (range sharding planned).
+- **PostgreSQL-compatible SQL** via DataFusion parser with automatic dialect 
+  translation to DuckDB.
+- **Horizontal scalability** through hash sharding across core nodes (range 
+  sharding planned).
 - **Analytical performance** powered by DuckDB's columnar vectorized engine.
 - **Fault tolerance** with configurable replication factor and quorum-based writes.
-- **Operational simplicity** — self-contained Rust binaries configured with a single YAML file.
+- **Column pseudonymization** for compliance: declared columns are HMAC-SHA256 
+  hashed in the coordinator so plaintext never reaches storage.
+- **Operational simplicity** as self-contained Rust binaries with YAML configuration.
 
 ## When to use VaireDB
 

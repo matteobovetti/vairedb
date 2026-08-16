@@ -1,9 +1,10 @@
 //! DDL (CREATE/DROP/ALTER TABLE) handling for the coordinator's pgwire handler.
 //!
 //! Updates the metadata catalog and broadcasts shard-local DDL to every replica
-//! of every shard. CREATE TABLE assigns shards round-robin and rolls back on
-//! partial failure; DROP and ALTER broadcast best-effort and fail the command
-//! only if a node could not be reached. After any successful DDL the local and
+//! of every shard. CREATE TABLE writes the catalog first, then rolls it back on
+//! partial broadcast failure; DROP and ALTER broadcast best-effort first and
+//! mutate the catalog only once every node was reached, so a failed command
+//! leaves the catalog unchanged. After any successful DDL the local and
 //! distributed DataFusion catalog views are refreshed.
 
 use std::collections::HashMap;
@@ -41,7 +42,12 @@ impl VaireDbQueryHandler {
             ));
         };
 
-        let table_name = create.name.to_string();
+        let table_name = query_router::canonical_table_name(&create.name).ok_or_else(|| {
+            make_vdb_error(
+                VdbErrorCode::SqlSyntaxError,
+                "could not determine table name",
+            )
+        })?;
 
         if create.if_not_exists {
             if let Ok(Some(_)) = self.catalog.get_table(&table_name) {
@@ -274,10 +280,12 @@ impl VaireDbQueryHandler {
         Ok(Response::Execution(Tag::new("DROP TABLE")))
     }
 
-    /// Alter a table: apply each operation to the cached metadata, persist it,
-    /// then broadcast the rewritten shard-local ALTER to every replica
-    /// best-effort. Returns `TableNotFound` when the relation is absent without
-    /// `IF EXISTS`, or a `NodeCommunicationError` if any node was unreachable.
+    /// Alter a table: apply each operation to the cached metadata, broadcast the
+    /// rewritten shard-local ALTER to every replica best-effort, and persist the
+    /// updated metadata only once every node was reached. Returns `TableNotFound`
+    /// when the relation is absent without `IF EXISTS`, or a
+    /// `NodeCommunicationError` if any node was unreachable — in which case the
+    /// catalog is left unchanged.
     pub(super) async fn handle_alter_table(&self, stmt: &Statement) -> PgWireResult<Response> {
         let (table_name, operations, if_exists) = match stmt {
             Statement::AlterTable {
@@ -285,7 +293,15 @@ impl VaireDbQueryHandler {
                 operations,
                 if_exists,
                 ..
-            } => (name.to_string(), operations, *if_exists),
+            } => {
+                let table_name = query_router::canonical_table_name(name).ok_or_else(|| {
+                    make_vdb_error(
+                        VdbErrorCode::SqlSyntaxError,
+                        "could not determine table name",
+                    )
+                })?;
+                (table_name, operations, *if_exists)
+            }
             _ => {
                 return Err(make_vdb_error(
                     VdbErrorCode::SqlSyntaxError,
@@ -314,10 +330,6 @@ impl VaireDbQueryHandler {
             apply_alter_operation(&mut table_meta, op)?;
         }
 
-        self.catalog
-            .put_table(&table_meta)
-            .map_err(|e| enrich_coordinator_error(&e, &alter_ctx, &self.catalog))?;
-
         let shards = self
             .catalog
             .get_shards_for_table(&table_name)
@@ -338,6 +350,13 @@ impl VaireDbQueryHandler {
             )
             .await;
         fail_if_unreachable("ALTER TABLE", failed)?;
+
+        // Persist the schema change only after the broadcast reached every node,
+        // so a partial failure never leaves the catalog claiming a column the
+        // cluster does not have.
+        self.catalog
+            .put_table(&table_meta)
+            .map_err(|e| enrich_coordinator_error(&e, &alter_ctx, &self.catalog))?;
 
         self.deregister_table_after_ddl(&table_name);
         self.refresh_catalog_after_ddl("ALTER TABLE");
@@ -388,7 +407,8 @@ impl VaireDbQueryHandler {
     /// Drop the table from the local DataFusion session so a later re-create or
     /// schema change re-registers it fresh. Logged, never fatal.
     fn deregister_table_after_ddl(&self, table_name: &str) {
-        if let Err(e) = self.session_ctx.deregister_table(table_name) {
+        let table_ref = datafusion::common::TableReference::bare(table_name.to_string());
+        if let Err(e) = self.session_ctx.deregister_table(table_ref) {
             tracing::warn!(
                 "failed to deregister table '{}' from DataFusion session: {}",
                 table_name,

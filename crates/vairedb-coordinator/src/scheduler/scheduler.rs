@@ -189,7 +189,11 @@ pub fn refresh_ballista_catalog_tables(
     let tables = catalog.list_tables()?;
 
     for table_meta in &tables {
-        if ctx.table_exist(&table_meta.table_name).unwrap_or(false) {
+        // Register/look up under a bare TableReference so the canonical logical
+        // name is used verbatim — passing a &str would re-run identifier
+        // normalization and lowercase quoted names, breaking resolution.
+        let table_ref = datafusion::common::TableReference::bare(table_meta.table_name.clone());
+        if ctx.table_exist(table_ref.clone()).unwrap_or(false) {
             continue;
         }
         let fields: Vec<Field> = table_meta
@@ -211,13 +215,12 @@ pub fn refresh_ballista_catalog_tables(
             schema,
         });
 
-        ctx.register_table(&table_meta.table_name, provider)
-            .map_err(|e| {
-                CoordinatorError::Internal(format!(
-                    "failed to register table '{}' in query engine: {}",
-                    table_meta.table_name, e
-                ))
-            })?;
+        ctx.register_table(table_ref, provider).map_err(|e| {
+            CoordinatorError::Internal(format!(
+                "failed to register table '{}' in query engine: {}",
+                table_meta.table_name, e
+            ))
+        })?;
     }
 
     Ok(())
@@ -225,9 +228,22 @@ pub fn refresh_ballista_catalog_tables(
 
 /// Map a SQL/DuckDB column type name to its Arrow `DataType`. Matching is
 /// case-insensitive; unrecognized types fall back to `Utf8`.
+///
+/// A trailing `[]` (optionally sized, e.g. `INTEGER[3]`) marks a PostgreSQL/DuckDB
+/// array column; it is modeled as an Arrow `List` of the element type (recursing
+/// for nested arrays like `INTEGER[][]`), so the advertised schema — and thus the
+/// pgwire array type OID — reflects the column's real shape rather than `Utf8`.
 pub fn parse_data_type(type_str: &str) -> DataType {
     use datafusion::arrow::datatypes::TimeUnit;
-    let upper = type_str.to_uppercase();
+    let upper = type_str.trim().to_uppercase();
+
+    if upper.ends_with(']')
+        && let Some(open) = upper.rfind('[')
+    {
+        let element = parse_data_type(&upper[..open]);
+        return DataType::List(Arc::new(Field::new("item", element, true)));
+    }
+
     match upper.as_str() {
         "INTEGER" | "INT" | "INT4" => DataType::Int32,
         "BIGINT" | "INT8" => DataType::Int64,

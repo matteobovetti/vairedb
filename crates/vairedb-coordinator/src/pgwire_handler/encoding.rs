@@ -51,7 +51,12 @@ pub(super) async fn encode_dataframe_response(
             let mut encoder = DataRowEncoder::new(Arc::clone(&field_info));
             for (col_idx, field) in field_info.iter().enumerate() {
                 let col = batch.column(col_idx);
-                if field.format() == FieldFormat::Text {
+                let is_list = matches!(
+                    col.data_type(),
+                    datafusion::arrow::datatypes::DataType::List(_)
+                        | datafusion::arrow::datatypes::DataType::LargeList(_)
+                );
+                if field.format() == FieldFormat::Text && !is_list {
                     // Postgres trims trailing fractional zeros on temporal
                     // values (e.g. `00:00:00`, not `00:00:00.000000`), but
                     // arrow-pg's encoder always emits `%.6f`. Render text
@@ -64,8 +69,10 @@ pub(super) async fn encode_dataframe_response(
                     };
                     result.map_err(encode_error)?;
                 } else {
-                    // Binary cells go through arrow-pg, which owns the
-                    // correct binary codec per Arrow/pg type.
+                    // Binary cells, and array cells in either format, go through
+                    // arrow-pg: it owns the correct binary codec and renders text
+                    // arrays as PostgreSQL array literals (`{1,2,3}`). Hand-rolling
+                    // the text here would re-quote the braces into `"{1,2,3}"`.
                     encode_value(
                         &mut encoder,
                         col,
