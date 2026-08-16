@@ -1,4 +1,4 @@
-.PHONY: build build-release check test fmt lint clean run-coordinator run-core doc \
+.PHONY: build build-release check test fmt lint audit clean run-coordinator run-core doc \
        build-common check-common test-common \
        build-coordinator check-coordinator test-coordinator \
        build-core check-core test-core \
@@ -37,6 +37,10 @@ fmt-check:
 # Run clippy lints
 lint:
 	cargo clippy --all -- -D warnings
+
+# Run security audit against the advisory database
+audit:
+	cargo deny check advisories
 
 # Build a single crate (debug)
 build-common:

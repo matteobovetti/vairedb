@@ -93,13 +93,26 @@ fn test_extract_table_name_other_returns_none() {
     assert_eq!(extract_table_name(&stmts[0]), None);
 }
 
+// A schema-qualified name canonicalizes to just its last (bare) part: the
+// coordinator namespace is flat, so the `myschema.` qualifier is dropped.
 #[test]
 fn test_extract_table_name_schema_qualified() {
     let stmts = sql_compat::parse_sql("INSERT INTO myschema.orders (id) VALUES (1)").unwrap();
-    assert_eq!(
-        extract_table_name(&stmts[0]),
-        Some("myschema.orders".to_string())
-    );
+    assert_eq!(extract_table_name(&stmts[0]), Some("orders".to_string()));
+}
+
+// A quoted identifier keeps its case verbatim (no quote characters in the key).
+#[test]
+fn test_extract_table_name_quoted_preserves_case() {
+    let stmts = sql_compat::parse_sql("INSERT INTO \"MyTable\" (id) VALUES (1)").unwrap();
+    assert_eq!(extract_table_name(&stmts[0]), Some("MyTable".to_string()));
+}
+
+// An unquoted mixed-case name folds to lowercase (PG identifier semantics).
+#[test]
+fn test_extract_table_name_unquoted_mixedcase_lowercased() {
+    let stmts = sql_compat::parse_sql("INSERT INTO Orders (id) VALUES (1)").unwrap();
+    assert_eq!(extract_table_name(&stmts[0]), Some("orders".to_string()));
 }
 
 #[test]
@@ -133,7 +146,7 @@ fn test_extract_select_table_name_schema_qualified() {
     let stmts = sql_compat::parse_sql("SELECT * FROM myschema.orders").unwrap();
     assert_eq!(
         extract_select_table_name(&stmts[0]),
-        Some("myschema.orders".to_string())
+        Some("orders".to_string())
     );
 }
 
@@ -170,8 +183,5 @@ fn test_extract_table_name_alter_table() {
 #[test]
 fn test_extract_table_name_alter_table_schema_qualified() {
     let stmts = sql_compat::parse_sql("ALTER TABLE myschema.orders ADD COLUMN x INT").unwrap();
-    assert_eq!(
-        extract_table_name(&stmts[0]),
-        Some("myschema.orders".to_string())
-    );
+    assert_eq!(extract_table_name(&stmts[0]), Some("orders".to_string()));
 }

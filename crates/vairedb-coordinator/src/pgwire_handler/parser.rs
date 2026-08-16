@@ -107,11 +107,20 @@ impl QueryParser for VaireQueryParser {
 
         let query_type = query_router::classify_statement(&stmt);
         let is_catalog = references_catalog_schema(&stmt, &self.catalog_table_names);
-        let rendered = sql_compat::statement_to_sql(&stmt);
 
         let plan = match query_type {
             // The read path executes this plan, so planning must succeed.
             QueryType::Select => {
+                // Translate PG TO_CHAR format strings to strftime specifiers so the
+                // cached plan formats via DataFusion's native to_char correctly.
+                let mut stmt = stmt.clone();
+                sql_compat::transform_to_char_format_for_read(&mut stmt);
+                // Collapse `schema.tbl` to the bare registered name for user
+                // queries; leave catalog references (pg_catalog.*, etc.) qualified.
+                if !is_catalog {
+                    sql_compat::collapse_schema_qualified_relations(&mut stmt);
+                }
+                let rendered = sql_compat::statement_to_sql(&stmt);
                 let ctx = if is_catalog {
                     &self.local_ctx
                 } else {
@@ -135,7 +144,7 @@ impl QueryParser for VaireQueryParser {
             QueryType::Insert | QueryType::Update | QueryType::Delete => self
                 .session_ctx
                 .state()
-                .create_logical_plan(&rendered)
+                .create_logical_plan(&sql_compat::statement_to_sql(&stmt))
                 .await
                 .ok(),
             _ => None,

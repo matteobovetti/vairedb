@@ -4,10 +4,13 @@ use tokio_postgres::Client;
 
 // PostgreSQL -> DuckDB/DataFusion dialect gaps.
 //
-// Two execution backends apply DIFFERENT (or no) dialect translation:
-//   * Writes/DDL go through `sql_compat::transform_to_duckdb`, which rewrites only
-//     TO_CHAR->STRFTIME (top-level expr only), BYTEA->BLOB, JSONB->JSON.
-//   * SELECTs get NO translation at all and are planned by DataFusion.
+// Two execution backends apply DIFFERENT dialect translation:
+//   * Writes/DDL go through `sql_compat::transform_to_duckdb`, which rewrites
+//     TO_CHAR->STRFTIME (incl. PG format string -> strftime specifiers),
+//     BYTEA->BLOB, JSONB->JSON.
+//   * SELECTs are planned by DataFusion and get a narrower transform
+//     (`transform_to_char_format_for_read`) that keeps the native `to_char` but
+//     translates its PG format string to strftime specifiers.
 //
 // Tests assert the PostgreSQL-correct result. Cases that already work through
 // DataFusion/DuckDB pass and guard against regressions; genuine gaps are #[ignore]'d
@@ -128,11 +131,11 @@ async fn test_string_concat_operator() {
     drop_table(&client, &tbl).await;
 }
 
-// TO_CHAR in a projection list. The write-path transform only rewrites top-level
-// exprs in VALUES/assignments, and the read path applies NO transform, so a PG
-// TO_CHAR with a PG format string ('YYYY-MM-DD') reaches DataFusion untranslated.
+// TO_CHAR in a projection list. The read path keeps DataFusion's native `to_char`
+// but translates the PG format string ('YYYY-MM-DD') to strftime specifiers
+// ('%Y-%m-%d') via `transform_to_char_format_for_read`, so the projection formats
+// correctly instead of emitting the template literally.
 #[tokio::test]
-#[ignore = "known gap: TO_CHAR in a SELECT projection is not translated to DuckDB STRFTIME (read path applies no dialect transform; PG format string is incompatible)"]
 async fn test_to_char_in_projection() {
     let client = ready_client().await;
     let tbl = unique_table_name("dg_tochar");
@@ -154,7 +157,7 @@ async fn test_to_char_in_projection() {
 // SERIAL is a PostgreSQL pseudo-type (auto-increment). It is not mapped to a DuckDB
 // sequence/identity type, so the per-shard CREATE fails at DuckDB.
 #[tokio::test]
-#[ignore = "known gap: SERIAL is not mapped to a DuckDB sequence/identity column"]
+#[ignore = "known gap: SERIAL is not mapped to a DuckDB sequence/identity column. Take a look to https://duckdb.org/docs/current/sql/statements/create_sequence."]
 async fn test_serial_column() {
     let client = ready_client().await;
     let tbl = create_table(
@@ -206,11 +209,10 @@ async fn test_timestamptz_column() {
     drop_table(&client, &tbl).await;
 }
 
-// PostgreSQL array column type (INTEGER[]). DuckDB supports list types, but the
-// PG `[]` array syntax is not translated and the DataFusion schema mapping does
-// not model it.
+// PostgreSQL array column type (INTEGER[]). DuckDB stores this as a LIST; the PG
+// `[]` DDL syntax passes through to DuckDB unchanged, and the catalog type string
+// is modeled as an Arrow `List` so the column reads back as a PG array (`{1,2,3}`).
 #[tokio::test]
-#[ignore = "known gap: PostgreSQL array column type (INTEGER[]) is not translated to a DuckDB LIST type"]
 async fn test_array_column() {
     let client = ready_client().await;
     let tbl = create_table(
@@ -226,10 +228,15 @@ async fn test_array_column() {
     .await
     .unwrap();
 
-    let rows = simple_query_rows(&client, &format!("SELECT id FROM {tbl}"))
+    let rows = simple_query_rows(&client, &format!("SELECT tags FROM {tbl}"))
         .await
         .unwrap();
     assert_eq!(rows.len(), 1, "the array row should read back");
+    assert_eq!(
+        rows[0][0].as_deref(),
+        Some("{1,2,3}"),
+        "INTEGER[] should read back in PostgreSQL array text form"
+    );
 
     drop_table(&client, &tbl).await;
 }

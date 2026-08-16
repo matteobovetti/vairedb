@@ -36,12 +36,30 @@ each running an embedded DuckDB instance optimized for OLAP queries.
 
 ### Use Cases
 
-- Analytical/Read optimized database positioned close to microservices' 
-  transactional databases, serving the query (read) side of a CQRS architecture.
-- A denormalized, read-optimized view of data shared across a microservices ecosystem.
-- Deployable both as a wide data fabric spanning the whole ecosystem and as a 
-  micro-fabric local to each bounded context.
-- A compliance datastore supporting data take-out (export), deletion, and anonymization.
+- **CQRS read side** — an analytical database positioned close to
+  microservices' transactional databases, serving the query (read) side of a
+  CQRS architecture. Transactional systems keep handling writes in their own
+  stores, while VaireDB absorbs the heavy read and aggregation traffic that
+  would otherwise contend with operational workloads — keeping write paths fast
+  and read paths scalable.
+
+- **Shared read model** — a denormalized, read-optimized view of data shared
+  across a microservices ecosystem. Instead of each service repeatedly joining
+  and reshaping data from many sources, VaireDB holds a consolidated,
+  query-friendly representation that teams can reuse, reducing duplicated effort
+  and keeping cross-service reporting consistent.
+
+- **Data fabric or micro-fabric** — deployable both as a wide data fabric
+  spanning the whole ecosystem and as a micro-fabric local to each bounded
+  context. The same engine scales from a single bounded context to an
+  organization-wide layer, so you can start small within one domain and grow
+  toward a shared analytical backbone without changing technology.
+
+- **Compliance datastore** — supporting data take-out (export), deletion, and
+  anonymization. By centralizing a queryable copy of data, VaireDB makes it
+  easier to satisfy regulatory obligations such as subject-access exports,
+  right-to-be-forgotten deletions, and anonymization, without hunting through
+  every individual service store.
 
 ## Architecture
 
@@ -71,31 +89,35 @@ VaireDB follows a coordinator/worker topology:
 - **Coordinator** handles client connections, SQL parsing, query planning, metadata management, and dispatching work to core nodes.
 - **Core Nodes** store data in DuckDB, execute shard-local queries, and replicate writes.
 
-For full details, see the [Architecture Documentation](docs/architecture/ARCHITECTURE.md).
+For full details, see the [Architecture Documentation](docs/specs/ARCHITECTURE.md).
 
-### Documentation
+### Project Documentation
+
+[VaireDB Documentation](https://matteobovetti.github.io/vairedb/)
+
+### System Design Documentation
 
 All documentation lives under `docs/`, split into architecture references, feature designs, and testing notes.
 
-**Architecture** (`docs/architecture/`):
+**Architecture** (`docs/specs/`):
 
 | Document | Description |
 |----------|-------------|
-| [Architecture Index](docs/architecture/ARCHITECTURE.md) | Top-level index with references to all architecture sections |
-| [Overview](docs/architecture/overview.md) | What VaireDB is and its high-level value proposition |
-| [Design Goals](docs/architecture/design-goals.md) | Goals and non-goals for v0.1 |
-| [System Architecture](docs/architecture/system-architecture.md) | High-level topology and node types |
-| [Core Node](docs/architecture/core-node.md) | Embedded DuckDB engine, storage, and query execution |
-| [Coordinator Node](docs/architecture/coordinator-node.md) | Query routing, distributed planning, and metadata catalog |
-| [Data Distribution](docs/architecture/data-distribution.md) | Sharding strategy and replication |
-| [Cluster Coordination](docs/architecture/cluster-coordination.md) | Node discovery, leader election, and failure detection |
-| [Communication Layer](docs/architecture/communication-layer.md) | Protocols, wire formats, and client interface |
-| [Distributed Query Processing](docs/architecture/distributed-query-processing.md) | Query lifecycle and optimization |
-| [Transactions & Consistency](docs/architecture/transactions-consistency.md) | Consistency model and distributed transactions |
-| [Fault Tolerance](docs/architecture/fault-tolerance.md) | WAL, snapshotting, node recovery, and quorum |
-| [Roadmap](docs/architecture/roadmap.md) | Roadmap to reach v1.0 |
-| [Glossary](docs/architecture/glossary.md) | Term definitions |
-| [Links](docs/architecture/links.md) | External references |
+| [Architecture Index](docs/specs/ARCHITECTURE.md) | Top-level index with references to all architecture sections |
+| [Overview](docs/specs/overview.md) | What VaireDB is and its high-level value proposition |
+| [Design Goals](docs/specs/design-goals.md) | Goals and non-goals for v0.1 |
+| [System Architecture](docs/specs/system-architecture.md) | High-level topology and node types |
+| [Core Node](docs/specs/core-node.md) | Embedded DuckDB engine, storage, and query execution |
+| [Coordinator Node](docs/specs/coordinator-node.md) | Query routing, distributed planning, and metadata catalog |
+| [Data Distribution](docs/specs/data-distribution.md) | Sharding strategy and replication |
+| [Cluster Coordination](docs/specs/cluster-coordination.md) | Node discovery, leader election, and failure detection |
+| [Communication Layer](docs/specs/communication-layer.md) | Protocols, wire formats, and client interface |
+| [Distributed Query Processing](docs/specs/distributed-query-processing.md) | Query lifecycle and optimization |
+| [Transactions & Consistency](docs/specs/transactions-consistency.md) | Consistency model and distributed transactions |
+| [Fault Tolerance](docs/specs/fault-tolerance.md) | WAL, snapshotting, node recovery, and quorum |
+| [Roadmap](docs/specs/roadmap.md) | Roadmap to reach v1.0 |
+| [Glossary](docs/specs/glossary.md) | Term definitions |
+| [Links](docs/specs/links.md) | External references |
 
 **Features** (`docs/features/`):
 
