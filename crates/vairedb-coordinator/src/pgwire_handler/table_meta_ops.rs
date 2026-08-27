@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 
-use sqlparser::ast::{
+use crate::sqlparser::ast::{
     AlterColumnOperation, AlterTableOperation, BinaryOperator, CharacterLength, ColumnOption,
     CreateTable, CreateTableOptions, DataType, Expr, SqlOption, Value,
 };
@@ -228,7 +228,7 @@ fn character_length_holds_digest(len: Option<&CharacterLength>) -> bool {
 
 /// Build a catalog [`ColumnDef`] from a parsed column definition. A column is
 /// nullable unless it carries a `NOT NULL` constraint.
-fn column_def_from_ast(col: &sqlparser::ast::ColumnDef) -> ColumnDef {
+fn column_def_from_ast(col: &crate::sqlparser::ast::ColumnDef) -> ColumnDef {
     let nullable = !col
         .options
         .iter()
@@ -411,7 +411,7 @@ mod tests {
     use super::*;
     use crate::catalog::ShardStrategy;
     use crate::sql_compat;
-    use sqlparser::ast::Statement;
+    use crate::sqlparser::ast::Statement;
 
     // --- value_to_u32 tests ---
 
@@ -646,7 +646,7 @@ mod tests {
     fn parse_alter_ops(sql: &str) -> Vec<AlterTableOperation> {
         let stmts = sql_compat::parse_sql(sql).unwrap();
         match &stmts[0] {
-            Statement::AlterTable { operations, .. } => operations.clone(),
+            Statement::AlterTable(alter) => alter.operations.clone(),
             _ => panic!("expected ALTER TABLE statement"),
         }
     }

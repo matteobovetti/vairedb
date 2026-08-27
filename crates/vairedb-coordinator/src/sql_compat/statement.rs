@@ -6,10 +6,10 @@
 use std::collections::HashMap;
 use std::ops::ControlFlow;
 
-use datafusion::scalar::ScalarValue;
-use sqlparser::ast::{
+use crate::sqlparser::ast::{
     AssignmentTarget, Expr, ObjectName, SetExpr, Statement, Value, visit_expressions_mut,
 };
+use datafusion::scalar::ScalarValue;
 
 use super::routing_value::{RoutedValue, expr_routing_value};
 
@@ -109,11 +109,12 @@ pub fn validate_insert_shard_key(
 /// Returns `true` if an UPDATE assigns a new value to the shard-key column.
 /// v0.1 does not support relocating a row to a different shard.
 pub fn update_targets_shard_key(stmt: &Statement, shard_key: &str) -> bool {
-    let Statement::Update { assignments, .. } = stmt else {
+    let Statement::Update(update) = stmt else {
         return false;
     };
 
-    assignments
+    update
+        .assignments
         .iter()
         .any(|assignment| match &assignment.target {
             AssignmentTarget::ColumnName(name) => object_name_matches(name, shard_key),
@@ -154,11 +155,11 @@ pub fn split_insert_by_rows(stmt: &Statement, row_indices: &[usize]) -> Option<S
     }
 
     let mut new_insert = insert.clone();
-    let new_values = sqlparser::ast::Values {
-        explicit_row: values.explicit_row,
+    let new_values = crate::sqlparser::ast::Values {
         rows: selected_rows,
+        ..values.clone()
     };
-    let new_source = sqlparser::ast::Query {
+    let new_source = crate::sqlparser::ast::Query {
         body: Box::new(SetExpr::Values(new_values)),
         ..source.as_ref().clone()
     };

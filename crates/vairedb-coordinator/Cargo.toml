@@ -15,7 +15,6 @@ redb = { workspace = true }
 pgwire = { workspace = true }
 datafusion-pg-catalog = { workspace = true }
 arrow-pg = { workspace = true }
-sqlparser = { workspace = true }
 arrow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
@@ -40,5 +39,4 @@ tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "tim
 tokio-stream = "0.1"
 tonic = { workspace = true }
 vairedb-common = { workspace = true }
-sqlparser = { workspace = true }
 prost-types = { workspace = true }

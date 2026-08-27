@@ -9,7 +9,16 @@ publish = false
 [dependencies]
 futures = "0.3"
 tokio = { version = "1", features = ["full"] }
-tokio-postgres = "0.7"
+# `with-chrono-0_4` supplies the ToSql/FromSql impls needed to bind and read
+# DATE / TIME / TIMESTAMP / TIMESTAMPTZ parameters over the extended protocol —
+# required by the data-type suite (tests/data_types_round_trips.rs).
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 hmac = "0.12"
 sha2 = "0.10"
+# Client-side representations for PostgreSQL types tokio-postgres has no native
+# codec for. Used only by the data-type suite to send NUMERIC / INTERVAL /
+# temporal bind parameters with their real PostgreSQL OIDs.
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+rust_decimal = { version = "1", features = ["db-postgres"] }
+pg_interval = "0.5"

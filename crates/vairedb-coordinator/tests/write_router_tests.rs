@@ -417,7 +417,7 @@ fn test_compute_shard_index_empty_value() {
 /// Group VALUES-row indices by target shard exactly as handle_insert_with_split
 /// does, so the split logic can be asserted without a live cluster.
 fn group_rows_by_shard(
-    stmt: &sqlparser::ast::Statement,
+    stmt: &vairedb_coordinator::sqlparser::ast::Statement,
     shard_key: &str,
     shard_count: usize,
 ) -> std::collections::HashMap<usize, Vec<usize>> {

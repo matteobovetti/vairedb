@@ -51,7 +51,7 @@ pub enum CoordinatorError {
     CatalogCommit(#[from] redb::CommitError),
 
     #[error("sql parse error: {0}")]
-    SqlParse(#[from] sqlparser::parser::ParserError),
+    SqlParse(#[from] crate::sqlparser::parser::ParserError),
 
     #[error("table not found: {0}")]
     TableNotFound(String),

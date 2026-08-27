@@ -8,6 +8,16 @@
 //! tracks node liveness via heartbeats. The submodules here implement those
 //! responsibilities.
 
+/// The one and only `sqlparser` in the tree, re-exported from datafusion.
+///
+/// The coordinator deliberately has no direct `sqlparser` dependency: the AST it
+/// parses, rewrites, and hands to DataFusion's planner must be *the same type*
+/// DataFusion uses, and `datafusion_pg_catalog::sql::PostgresCompatibilityParser`
+/// (the single parser, see [`sql_compat::parse_sql`]) already produces it. Taking
+/// the crate from this re-export makes a version split structurally impossible and
+/// means a DataFusion bump needs no change here.
+pub use datafusion::sql::sqlparser;
+
 pub mod anonymization;
 pub mod catalog;
 pub mod channel_pool;

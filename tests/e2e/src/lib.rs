@@ -177,6 +177,54 @@ pub async fn execute_expect_err(client: &Client, sql: &str) -> tokio_postgres::e
         .unwrap_or_else(|| panic!("error was not a DbError: {err}"))
 }
 
+/// `FeatureNotSupported` — the statement parsed but is not one of the routed
+/// kinds, so classification rejected it (`unsupported_statement_error`).
+pub const SQLSTATE_FEATURE_NOT_SUPPORTED: &str = "0A000";
+
+/// `SyntaxError` — the statement does not parse under the coordinator's single
+/// parser (`datafusion_pg_catalog`'s PostgreSQL-compatibility parser, which
+/// tokenizes with sqlparser's `PostgreSqlDialect`). This is where most
+/// DuckDB-only syntax fails.
+pub const SQLSTATE_SYNTAX_ERROR: &str = "42601";
+
+/// Assert `sql` is rejected by classification: SQLSTATE `0A000` with the
+/// `[VDB-1004]` FeatureNotSupported marker and a message naming the command.
+/// Use this for statements the command gap doc pins to the classification
+/// rejection point; use [`assert_rejected`] when the doc only says "likely".
+pub async fn assert_unsupported(client: &Client, sql: &str) {
+    let err = execute_expect_err(client, sql).await;
+    assert_eq!(
+        err.code().code(),
+        SQLSTATE_FEATURE_NOT_SUPPORTED,
+        "`{sql}` should carry SQLSTATE {SQLSTATE_FEATURE_NOT_SUPPORTED} (got {}: {})",
+        err.code().code(),
+        err.message()
+    );
+    assert!(
+        err.message().contains("[VDB-1004]"),
+        "`{sql}` message should carry the FeatureNotSupported VDB code: {}",
+        err.message()
+    );
+}
+
+/// Assert `sql` is rejected *somehow* and return the error for further
+/// inspection. The weaker sibling of [`assert_unsupported`], for statements that
+/// may fail at either rejection point (parse `42601` or classification `0A000`)
+/// or inside DuckDB. What it pins is the property that matters to a client: an
+/// unimplemented statement fails loudly instead of returning a fake `OK` while
+/// doing nothing.
+pub async fn assert_rejected(client: &Client, sql: &str) -> tokio_postgres::error::DbError {
+    execute_expect_err(client, sql).await
+}
+
+/// `SELECT COUNT(*)` on a table, as an integer.
+pub async fn row_count(client: &Client, tbl: &str) -> i64 {
+    let rows = simple_query_rows(client, &format!("SELECT COUNT(*) FROM {tbl}"))
+        .await
+        .unwrap_or_else(|e| panic!("COUNT(*) on {tbl} failed: {e}"));
+    rows[0][0].as_deref().unwrap().parse().unwrap()
+}
+
 static TABLE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Per-process seed mixed into every generated table name. Because the counter

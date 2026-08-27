@@ -4,14 +4,14 @@
 
 | Status | Description |
 |--------|-------------|
-| WIP | DuckDB Statement command gap. Analyze and implement missing commands, rethinking it in a distributed way. |
-| PLANNED | DuckDB query sintax gap. Analyze and implement missing commands, rethinking it in a distributed way. |
-| PLANNED | DuckDB query data types gap. Analyze and implement missing types. |
-| PLANNED | DuckDB query Expressions gap. Analyze and implement missing expressions. |
-| PLANNED | DuckDB query Functions gap. Analyze and implement missing functions. |
-| PLANNED | DuckDB query Constraints gap. Analyze and implement missing constraints. |
-| PLANNED | DuckDB query Indexes gap. Analyze and implement missing indexes. |
-| PLANNED | Sort Keys for earch shareds. |
+| IN PROGRESS | Integrate https://github.com/datafusion-contrib/datafusion-postgres/blob/master/datafusion-pg-functions |
+| PLANNED | Data type gap re-evaluation and implementation following the prioritization made [here](gap-analysis-data-type.md). Take in consideration https://github.com/datafusion-contrib/datafusion-postgres/blob/master/arrow-pg/src/datatypes.rs|
+| PLANNED | Double check the integration with [datafusion-postgres](https://github.com/datafusion-contrib/datafusion-postgres/tree/master/datafusion-postgres). Command statement gap implementation following the prioritization made [here](gap-analysis-command.md). |
+| PLANNED | Overall gap re-evaluation after introduction of datafusion-functions. DECISION to take: Aggregate functions gap implementation following the prioritization made [here](gap-analysis-aggregate-function.md). Window functions gap implementation following the prioritization made [here](gap-analysis-window-function.md). Close the GAP with Datafusion [Scalar, Special](https://datafusion.apache.org/user-guide/sql/scalar_functions.html). |
+| PLANNED | Operators and literals gap implementation following the prioritization made [here](gap-analysis-operator-literal.md). |
+| PLANNED | Implement distributed indexing? |
+| PLANNED | Implement schema in the catalog? |
+| PLANNED | Update docs to reflect command/type/expressions/indexes/constraints/functions gaps vs. implemented features. Users need to know which features are supported and which are not. |
 | TODO | VaireDB CLI with massive data import SQL command and psql client. |
 | TODO | Security: TLS, users, groups. |
 

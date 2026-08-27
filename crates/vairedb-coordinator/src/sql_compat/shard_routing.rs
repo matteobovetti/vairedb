@@ -2,8 +2,8 @@
 //! a single owning shard, a reject (NULL key), or a legitimate broadcast. This is
 //! the single source of truth for that route/reject/broadcast decision.
 
+use crate::sqlparser::ast::{Expr, SetExpr, Statement};
 use datafusion::scalar::ScalarValue;
-use sqlparser::ast::{Expr, SetExpr, Statement};
 
 use super::routing_value::{RoutedValue, expr_routing_value};
 
@@ -43,10 +43,12 @@ pub fn route_target(stmt: &Statement, shard_key: &str, params: &[ScalarValue]) -
             }
             ShardRouting::Broadcast
         }
-        Statement::Update {
-            selection: Some(where_clause),
-            ..
-        } => routing_from_equality(extract_equality_from_where(where_clause, shard_key, params)),
+        Statement::Update(update) => match &update.selection {
+            Some(where_clause) => {
+                routing_from_equality(extract_equality_from_where(where_clause, shard_key, params))
+            }
+            None => ShardRouting::Broadcast,
+        },
         Statement::Delete(delete) => match &delete.selection {
             Some(where_clause) => {
                 routing_from_equality(extract_equality_from_where(where_clause, shard_key, params))
@@ -89,7 +91,7 @@ fn extract_equality_from_where(
 ) -> Option<RoutedValue> {
     match expr {
         Expr::BinaryOp { left, op, right } => {
-            if matches!(op, sqlparser::ast::BinaryOperator::Eq) {
+            if matches!(op, crate::sqlparser::ast::BinaryOperator::Eq) {
                 if let Expr::Identifier(ident) = left.as_ref()
                     && ident.value == key_column
                 {
@@ -101,7 +103,7 @@ fn extract_equality_from_where(
                     return Some(expr_routing_value(left, params));
                 }
             }
-            if matches!(op, sqlparser::ast::BinaryOperator::And) {
+            if matches!(op, crate::sqlparser::ast::BinaryOperator::And) {
                 if let Some(val) = extract_equality_from_where(left, key_column, params) {
                     return Some(val);
                 }

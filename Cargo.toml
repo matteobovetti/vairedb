@@ -39,8 +39,10 @@ ballista-executor = "53"
 # DuckDB
 duckdb = { version = "1.10503.1", features = ["bundled"] }
 
-# SQL parser
-sqlparser = { version = "0.58", features = ["visitor"] }
+# SQL parser: intentionally NOT a direct dependency. The AST is taken from
+# datafusion's own re-export (`datafusion::sql::sqlparser`, re-exported again as
+# `vairedb_coordinator::sqlparser`) so there can only ever be one sqlparser
+# version in the tree — see crates/vairedb-coordinator/src/lib.rs.
 
 # Metadata store
 redb = "4.1.0"

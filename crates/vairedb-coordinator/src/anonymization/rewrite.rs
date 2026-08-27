@@ -4,7 +4,7 @@
 
 use std::collections::HashMap;
 
-use sqlparser::ast::{AssignmentTarget, Expr, SetExpr, Statement, Value};
+use crate::sqlparser::ast::{AssignmentTarget, Expr, SetExpr, Statement, Value};
 
 use super::{HMAC_SHA256_ALGO, Secret, SecretResolver, hmac_sha256_hex};
 
@@ -69,8 +69,8 @@ pub fn anonymize_statement(
             }
             Ok(())
         }
-        Statement::Update { assignments, .. } => {
-            for assignment in assignments {
+        Statement::Update(update) => {
+            for assignment in &mut update.assignments {
                 let col_name = match &assignment.target {
                     AssignmentTarget::ColumnName(name) => {
                         name.0.last().and_then(|p| p.as_ident()).map(|i| &i.value)

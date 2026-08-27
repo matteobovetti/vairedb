@@ -22,17 +22,38 @@ pub use statement::{
 };
 
 use std::ops::ControlFlow;
+use std::sync::OnceLock;
 
-use sqlparser::ast::{Ident, ObjectNamePart, Statement, visit_relations_mut};
-use sqlparser::dialect::PostgreSqlDialect;
-use sqlparser::parser::Parser;
+use datafusion_pg_catalog::sql::PostgresCompatibilityParser;
+
+use crate::sqlparser::ast::{Ident, ObjectNamePart, Statement, visit_relations_mut};
 
 use crate::error::Result;
 use crate::query_router::canonicalize_ident;
 
-/// Parse a SQL string into statements using the PostgreSQL dialect.
+/// The process-wide PostgreSQL-compatibility parser backing [`parse_sql`].
+///
+/// `PostgresCompatibilityParser::new` tokenizes its whole blacklist table, so it is
+/// built once and shared; the type is stateless and `Send + Sync`.
+fn pg_parser() -> &'static PostgresCompatibilityParser {
+    static PARSER: OnceLock<PostgresCompatibilityParser> = OnceLock::new();
+    PARSER.get_or_init(PostgresCompatibilityParser::new)
+}
+
+/// Parse a SQL string into statements — the coordinator's *only* parse.
+///
+/// Uses `datafusion_pg_catalog`'s PostgreSQL-compatibility parser, which tokenizes
+/// with sqlparser's `PostgreSqlDialect`, substitutes known driver probe queries,
+/// and applies the pg-compat rewrite rules (regclass casts, `::oid`, `ANY(array)`,
+/// unqualified `pg_catalog` names, …) so client introspection queries become
+/// executable against DataFusion plus the emulated `pg_catalog`.
+///
+/// The resulting AST is `datafusion::sql::sqlparser`'s own `Statement`, so it is
+/// handed straight to DataFusion's planner on the read path and rendered back to
+/// text only on the write path, where the SQL is shipped to DuckDB. Nothing
+/// re-parses a statement VaireDB has already parsed.
 pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
-    let statements = Parser::parse_sql(&PostgreSqlDialect {}, sql)?;
+    let statements = pg_parser().parse(sql)?;
     Ok(statements)
 }
 
@@ -57,6 +78,12 @@ pub fn rewrite_to_shard_local(stmt: &mut Statement, shard_suffix: &str) {
 }
 
 /// Render a statement back to its SQL text form.
+///
+/// **Write path only.** This is the last render in the system and it exists solely
+/// because the write path ships SQL *text* over gRPC for a core node to execute on
+/// DuckDB (see `write_router::generate_shard_local_sql`). The read path hands the
+/// AST to DataFusion directly, so no VaireDB component re-parses this output —
+/// which matters because `Display` is lossy (`0x1F` renders as `X'1F'`).
 pub fn statement_to_sql(stmt: &Statement) -> String {
     stmt.to_string()
 }

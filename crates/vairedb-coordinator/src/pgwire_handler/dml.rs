@@ -7,12 +7,12 @@
 
 use std::collections::HashMap;
 
+use crate::sqlparser::ast::{
+    Expr, FromTable, ObjectName, SetExpr, Statement, TableFactor, TableObject, Value,
+};
 use datafusion::scalar::ScalarValue;
 use pgwire::api::results::{Response, Tag};
 use pgwire::error::PgWireResult;
-use sqlparser::ast::{
-    Expr, FromTable, ObjectName, SetExpr, Statement, TableFactor, TableObject, Value,
-};
 
 use vairedb_common::proto::vairedb::v1::{AnonymizationSecret, VdbErrorCode};
 
@@ -46,7 +46,7 @@ fn targets_secret_table(stmt: &Statement) -> bool {
             TableObject::TableName(name) => Some(name),
             _ => None,
         },
-        Statement::Update { table, .. } => match &table.relation {
+        Statement::Update(update) => match &update.table.relation {
             TableFactor::Table { name, .. } => Some(name),
             _ => None,
         },

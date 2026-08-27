@@ -11,6 +11,11 @@ use common::*;
 // after a schema change the per-shard tables and the Ballista catalog
 // re-registration must agree with the catalog, so a query against the altered
 // schema actually returns correct rows — not just a matching catalog row.
+//
+// What this file covers is the DDL that WORKS. The gap surface of the same three
+// statements — CREATE TABLE AS SELECT, non-column ALTER operations, DROP of a
+// non-table object — is `sql_command_ddl.rs`, the executable counterpart of rows
+// 5-7 of docs/specs/gap-analysis-command.md.
 
 #[tokio::test]
 async fn test_node_ids_are_correct() {

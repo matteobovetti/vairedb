@@ -4,8 +4,8 @@
 //! exact string/integer arithmetic — never a float round-trip — so large
 //! integers and high-precision decimals route exactly.
 
+use crate::sqlparser::ast::{Expr, Value};
 use datafusion::scalar::ScalarValue;
-use sqlparser::ast::{Expr, Value};
 
 /// The routing form of a single shard-key expression.
 pub(super) enum RoutedValue {

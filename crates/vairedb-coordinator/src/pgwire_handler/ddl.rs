@@ -9,9 +9,9 @@
 
 use std::collections::HashMap;
 
+use crate::sqlparser::ast::Statement;
 use pgwire::api::results::{Response, Tag};
 use pgwire::error::{PgWireError, PgWireResult};
-use sqlparser::ast::Statement;
 use tonic::transport::Channel;
 
 use vairedb_common::proto::vairedb::v1::VdbErrorCode;
@@ -288,19 +288,15 @@ impl VaireDbQueryHandler {
     /// catalog is left unchanged.
     pub(super) async fn handle_alter_table(&self, stmt: &Statement) -> PgWireResult<Response> {
         let (table_name, operations, if_exists) = match stmt {
-            Statement::AlterTable {
-                name,
-                operations,
-                if_exists,
-                ..
-            } => {
-                let table_name = query_router::canonical_table_name(name).ok_or_else(|| {
-                    make_vdb_error(
-                        VdbErrorCode::SqlSyntaxError,
-                        "could not determine table name",
-                    )
-                })?;
-                (table_name, operations, *if_exists)
+            Statement::AlterTable(alter) => {
+                let table_name =
+                    query_router::canonical_table_name(&alter.name).ok_or_else(|| {
+                        make_vdb_error(
+                            VdbErrorCode::SqlSyntaxError,
+                            "could not determine table name",
+                        )
+                    })?;
+                (table_name, &alter.operations, alter.if_exists)
             }
             _ => {
                 return Err(make_vdb_error(

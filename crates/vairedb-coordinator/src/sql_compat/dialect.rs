@@ -5,7 +5,7 @@
 
 use std::ops::ControlFlow;
 
-use sqlparser::ast::{
+use crate::sqlparser::ast::{
     AlterColumnOperation, AlterTableOperation, CreateTableOptions, DataType, Expr, Function,
     FunctionArg, FunctionArgExpr, FunctionArguments, ObjectName, ObjectNamePart, SetExpr,
     Statement, Value, visit_expressions_mut, visit_relations_mut,
@@ -20,8 +20,8 @@ pub fn transform_to_duckdb(stmt: &mut Statement) {
             }
             create.table_options = CreateTableOptions::None;
         }
-        Statement::AlterTable { operations, .. } => {
-            for op in operations {
+        Statement::AlterTable(alter) => {
+            for op in &mut alter.operations {
                 match op {
                     AlterTableOperation::AddColumn { column_def, .. } => {
                         transform_data_type(&mut column_def.data_type);
@@ -36,7 +36,7 @@ pub fn transform_to_duckdb(stmt: &mut Statement) {
                 }
             }
         }
-        Statement::Insert(_) | Statement::Update { .. } | Statement::Delete(_) => {
+        Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_) => {
             transform_exprs_in_statement(stmt);
         }
         _ => {}
@@ -62,8 +62,8 @@ fn transform_exprs_in_statement(stmt: &mut Statement) {
                 transform_expr_in_set_expr(source.body.as_mut());
             }
         }
-        Statement::Update { assignments, .. } => {
-            for assignment in assignments {
+        Statement::Update(update) => {
+            for assignment in &mut update.assignments {
                 transform_expr(&mut assignment.value);
             }
         }
@@ -100,7 +100,7 @@ fn transform_function(func: &mut Function) {
 
     if func_name == "TO_CHAR" {
         func.name = ObjectName(vec![ObjectNamePart::Identifier(
-            sqlparser::ast::Ident::new("STRFTIME"),
+            crate::sqlparser::ast::Ident::new("STRFTIME"),
         )]);
         if let FunctionArguments::List(ref mut arg_list) = func.args {
             let args = &mut arg_list.args;

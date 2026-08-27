@@ -1,7 +1,9 @@
 //! SQL statement inspection used to decide how to route a query: classifying a
 //! parsed statement and extracting the target table name from it.
 
-use sqlparser::ast::{FromTable, Ident, ObjectName, SetExpr, Statement, TableFactor, TableObject};
+use crate::sqlparser::ast::{
+    FromTable, Ident, ObjectName, SetExpr, Statement, TableFactor, TableObject,
+};
 
 /// Coarse category of a SQL statement, used to choose between the read path
 /// (scheduler) and the write path (write router), and to detect DDL.
@@ -66,7 +68,7 @@ pub fn extract_table_name(stmt: &Statement) -> Option<String> {
             TableObject::TableName(name) => canonical_table_name(name),
             _ => None,
         },
-        Statement::Update { table, .. } => match &table.relation {
+        Statement::Update(update) => match &update.table.relation {
             TableFactor::Table { name, .. } => canonical_table_name(name),
             _ => None,
         },
@@ -81,7 +83,7 @@ pub fn extract_table_name(stmt: &Statement) -> Option<String> {
             }
         }
         Statement::CreateTable(create) => canonical_table_name(&create.name),
-        Statement::AlterTable { name, .. } => canonical_table_name(name),
+        Statement::AlterTable(alter) => canonical_table_name(&alter.name),
         Statement::Drop { names, .. } => names.first().and_then(canonical_table_name),
         _ => None,
     }

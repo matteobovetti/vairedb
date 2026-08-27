@@ -44,13 +44,13 @@ pub(super) fn catalog_table_names(ctx: &SessionContext) -> HashSet<String> {
 /// ([`CATALOG_SCHEMA_PREFIXES`]) or when its bare name is a known `pg_catalog`
 /// table in `catalog_names` (so unqualified `pg_class` is caught too).
 pub(super) fn references_catalog_schema(
-    stmt: &sqlparser::ast::Statement,
+    stmt: &crate::sqlparser::ast::Statement,
     catalog_names: &HashSet<String>,
 ) -> bool {
     use std::ops::ControlFlow;
     let mut found = false;
     let mut stmt = stmt.clone();
-    let _ = sqlparser::ast::visit_relations_mut(&mut stmt, |relation| {
+    let _ = crate::sqlparser::ast::visit_relations_mut(&mut stmt, |relation| {
         let name = relation.to_string().to_lowercase();
         if CATALOG_SCHEMA_PREFIXES
             .iter()
@@ -61,7 +61,7 @@ pub(super) fn references_catalog_schema(
         }
         // Unqualified bare name (last identifier segment) matching a known
         // pg_catalog table, e.g. `SELECT ... FROM pg_class`.
-        if let Some(sqlparser::ast::ObjectNamePart::Identifier(ident)) = relation.0.last()
+        if let Some(crate::sqlparser::ast::ObjectNamePart::Identifier(ident)) = relation.0.last()
             && catalog_names.contains(&ident.value.to_lowercase())
         {
             found = true;
@@ -77,7 +77,7 @@ mod tests {
     use super::*;
     use crate::sql_compat;
 
-    fn parse_one(sql: &str) -> sqlparser::ast::Statement {
+    fn parse_one(sql: &str) -> crate::sqlparser::ast::Statement {
         sql_compat::parse_sql(sql)
             .unwrap()
             .into_iter()

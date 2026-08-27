@@ -17,6 +17,7 @@ use datafusion::common::ParamValues;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::scalar::ScalarValue;
+use datafusion::sql::parser::Statement as DFStatement;
 use futures::sink::Sink;
 use pgwire::api::auth::StartupHandler;
 use pgwire::api::auth::noop::NoopStartupHandler;
@@ -45,7 +46,6 @@ use crate::query_router::{self, QueryType};
 use crate::replication::ReplicationManager;
 use crate::sql_compat;
 use crate::write_router::WriteRouter;
-use datafusion_pg_catalog::sql::PostgresCompatibilityParser;
 
 /// Bundles the per-connection handlers required by `pgwire`'s server interface
 /// (startup, simple/extended query, copy, cancel, error). One instance is shared
@@ -84,7 +84,6 @@ impl VaireDbHandlers {
                 local_ctx,
                 default_replication_factor,
                 query_parser,
-                pg_compat_parser: PostgresCompatibilityParser::new(),
                 catalog_table_names,
             }),
             startup_handler: Arc::new(VaireDbStartupHandler),
@@ -122,7 +121,7 @@ impl PgWireServerHandlers for VaireDbHandlers {
 /// (transaction control, SET/SHOW, TRUNCATE, CREATE VIEW, EXPLAIN, etc.). These
 /// used to fall through to a fake `OK`, silently misleading clients; now they
 /// fail with `FeatureNotSupported` (SQLSTATE `0A000`) naming the command.
-fn unsupported_statement_error(stmt: &sqlparser::ast::Statement) -> PgWireError {
+fn unsupported_statement_error(stmt: &crate::sqlparser::ast::Statement) -> PgWireError {
     make_vdb_error(
         VdbErrorCode::FeatureNotSupported,
         format!(
@@ -134,8 +133,8 @@ fn unsupported_statement_error(stmt: &sqlparser::ast::Statement) -> PgWireError 
 
 /// Human-readable command name for an unsupported statement, used in the error
 /// message so the client learns which command was rejected.
-fn unsupported_statement_label(stmt: &sqlparser::ast::Statement) -> &'static str {
-    use sqlparser::ast::Statement;
+fn unsupported_statement_label(stmt: &crate::sqlparser::ast::Statement) -> &'static str {
+    use crate::sqlparser::ast::Statement;
     match stmt {
         Statement::StartTransaction { .. } => "transaction control (BEGIN)",
         Statement::Commit { .. } => "transaction control (COMMIT)",
@@ -169,7 +168,6 @@ pub(crate) struct VaireDbQueryHandler {
     pub(super) local_ctx: Arc<SessionContext>,
     pub(super) default_replication_factor: u32,
     query_parser: Arc<VaireQueryParser>,
-    pg_compat_parser: PostgresCompatibilityParser,
     /// Lowercased bare names of `pg_catalog` tables, used to route unqualified
     /// catalog introspection (e.g. `pg_class`) to `local_ctx`.
     pub(super) catalog_table_names: Arc<std::collections::HashSet<String>>,
@@ -177,9 +175,9 @@ pub(crate) struct VaireDbQueryHandler {
 
 #[async_trait]
 impl SimpleQueryHandler for VaireDbQueryHandler {
-    /// Rewrite, parse, and execute every statement in a simple-protocol query
-    /// string, returning one response per statement. Returns a `SqlSyntaxError`
-    /// if parsing fails. No bind parameters are possible on this path.
+    /// Parse and execute every statement in a simple-protocol query string,
+    /// returning one response per statement. Returns a `SqlSyntaxError` if parsing
+    /// fails. No bind parameters are possible on this path.
     async fn do_query<C>(&self, _client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
@@ -187,8 +185,7 @@ impl SimpleQueryHandler for VaireDbQueryHandler {
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let query = parser::rewrite_pg_sql(&self.pg_compat_parser, query);
-        let statements = sql_compat::parse_sql(&query)
+        let statements = sql_compat::parse_sql(query)
             .map_err(|e| make_vdb_error(VdbErrorCode::SqlSyntaxError, e.to_string()))?;
 
         let mut responses = Vec::with_capacity(statements.len());
@@ -296,7 +293,7 @@ impl VaireDbQueryHandler {
     /// queries execute on `local_ctx` (plain DataFusion) rather than the Ballista
     /// `session_ctx`, since they are metadata — not sharded user data — and frequently join
     /// across catalog tables in ways that should not be distributed.
-    fn is_catalog_query(&self, stmt: &sqlparser::ast::Statement) -> bool {
+    fn is_catalog_query(&self, stmt: &crate::sqlparser::ast::Statement) -> bool {
         references_catalog_schema(stmt, &self.catalog_table_names)
     }
 
@@ -304,7 +301,7 @@ impl VaireDbQueryHandler {
     /// parameters are possible here, so writes run with an empty parameter list.
     async fn execute_one_statement(
         &self,
-        stmt: &sqlparser::ast::Statement,
+        stmt: &crate::sqlparser::ast::Statement,
     ) -> PgWireResult<Response> {
         let query_type = query_router::classify_statement(stmt);
         match query_type {
@@ -323,7 +320,7 @@ impl VaireDbQueryHandler {
     /// decoded bind parameters into the write path.
     async fn execute_write_statement(
         &self,
-        stmt: &sqlparser::ast::Statement,
+        stmt: &crate::sqlparser::ast::Statement,
         query_type: &QueryType,
         params: &[ScalarValue],
     ) -> PgWireResult<Response> {
@@ -402,7 +399,10 @@ impl VaireDbQueryHandler {
     /// Execute a simple-protocol SELECT, choosing the local catalog context for
     /// introspection queries and the distributed context otherwise, and encode
     /// the result as text (the only format the simple protocol uses).
-    async fn handle_select(&self, stmt: &sqlparser::ast::Statement) -> PgWireResult<Response> {
+    async fn handle_select(
+        &self,
+        stmt: &crate::sqlparser::ast::Statement,
+    ) -> PgWireResult<Response> {
         // Translate PG TO_CHAR format strings to strftime specifiers so DataFusion's
         // native to_char formats correctly on the read path.
         let mut stmt_read = stmt.clone();
@@ -416,7 +416,6 @@ impl VaireDbQueryHandler {
             sql_compat::collapse_schema_qualified_relations(&mut stmt_read);
         }
         let stmt = &stmt_read;
-        let sql = sql_compat::statement_to_sql(stmt);
 
         let ctx = if is_catalog {
             &self.local_ctx
@@ -428,8 +427,16 @@ impl VaireDbQueryHandler {
             .map(|t| ErrorContext::for_table(&t))
             .unwrap_or_default();
 
+        // Plan from the AST instead of `ctx.sql(&rendered)`: rendering back to text
+        // is lossy and made DataFusion re-parse with its default (generic) dialect,
+        // so the reachable expression surface was the intersection of two dialects.
+        let plan = ctx
+            .state()
+            .statement_to_plan(DFStatement::Statement(Box::new(stmt.clone())))
+            .await
+            .map_err(|e| enrich_generic_error(&e, &select_ctx))?;
         let df = ctx
-            .sql(&sql)
+            .execute_logical_plan(plan)
             .await
             .map_err(|e| enrich_generic_error(&e, &select_ctx))?;
 

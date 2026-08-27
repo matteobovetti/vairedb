@@ -1,7 +1,7 @@
 use vairedb_common::proto::vairedb::v1::VdbErrorCode;
 use vairedb_coordinator::error::{CoordinatorError, NodeError, Result};
 
-use sqlparser::parser::ParserError;
+use vairedb_coordinator::sqlparser::parser::ParserError;
 
 #[test]
 fn test_error_display_table_not_found() {

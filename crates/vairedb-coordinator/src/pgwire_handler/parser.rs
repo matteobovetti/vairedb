@@ -1,11 +1,12 @@
 //! Extended-protocol SQL parsing and statement preparation for the pgwire handler.
 //!
-//! Runs at the protocol Parse step: each statement is normalized through the
-//! PostgreSQL-compatibility rewriter, parsed, and classified for routing.
-//! SELECTs are planned against the appropriate DataFusion context so Describe can
-//! report true parameter/result OIDs and Execute can bind typed values; writes
-//! and DDL are routed to DuckDB and bound there, so no plan is cached for them
-//! (except as a best-effort source of inferred parameter types).
+//! Runs at the protocol Parse step: each statement is parsed *once* (by
+//! [`sql_compat::parse_sql`], the PostgreSQL-compatibility parser) and classified
+//! for routing. SELECTs are planned from that AST against the appropriate
+//! DataFusion context so Describe can report true parameter/result OIDs and
+//! Execute can bind typed values; writes and DDL are routed to DuckDB and bound
+//! there, so no plan is cached for them (except as a best-effort source of
+//! inferred parameter types).
 
 use std::collections::HashMap;
 use std::collections::HashSet;
@@ -15,6 +16,7 @@ use arrow_pg::datatypes::{arrow_schema_to_pg_fields, into_pg_type};
 use async_trait::async_trait;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::LogicalPlan;
+use datafusion::sql::parser::Statement as DFStatement;
 use pgwire::api::portal::Format;
 use pgwire::api::results::FieldInfo;
 use pgwire::api::stmt::QueryParser;
@@ -27,7 +29,6 @@ use crate::pgwire_handler::catalog_routing::references_catalog_schema;
 use crate::pgwire_handler::error_enrichment::{ErrorContext, enrich_generic_error, make_vdb_error};
 use crate::query_router::{self, QueryType};
 use crate::sql_compat;
-use datafusion_pg_catalog::sql::PostgresCompatibilityParser;
 
 /// A parsed extended-protocol statement. For SELECTs we cache the DataFusion
 /// `LogicalPlan` (with `$N` placeholders intact) so that Describe can report
@@ -36,9 +37,9 @@ use datafusion_pg_catalog::sql::PostgresCompatibilityParser;
 /// routed to DuckDB, and parameters are bound there as prepared-statement values.
 #[derive(Clone)]
 pub(crate) struct VairePrepared {
-    /// vairedb sqlparser AST, used for routing and shard-local rewriting.
+    /// The parsed AST, used for routing and shard-local rewriting.
     /// `None` for an empty query.
-    pub(super) stmt: Option<sqlparser::ast::Statement>,
+    pub(super) stmt: Option<crate::sqlparser::ast::Statement>,
     /// Classification driving dispatch (read vs. write vs. DDL).
     pub(super) query_type: QueryType,
     /// True when the statement references a metadata schema, so it runs on
@@ -55,7 +56,6 @@ pub(crate) struct VairePrepared {
 pub(crate) struct VaireQueryParser {
     session_ctx: Arc<SessionContext>,
     local_ctx: Arc<SessionContext>,
-    pg_compat_parser: PostgresCompatibilityParser,
     catalog_table_names: Arc<HashSet<String>>,
 }
 
@@ -70,7 +70,6 @@ impl VaireQueryParser {
         Self {
             session_ctx,
             local_ctx,
-            pg_compat_parser: PostgresCompatibilityParser::new(),
             catalog_table_names,
         }
     }
@@ -80,7 +79,7 @@ impl VaireQueryParser {
 impl QueryParser for VaireQueryParser {
     type Statement = VairePrepared;
 
-    /// Rewrite, parse, and classify an incoming statement, planning SELECTs (and
+    /// Parse and classify an incoming statement, planning SELECTs (and
     /// best-effort planning writes for type inference). Returns an empty
     /// `VairePrepared` for an empty query, a `SqlSyntaxError` on parse failure,
     /// or an enriched error if a SELECT fails to plan.
@@ -93,8 +92,7 @@ impl QueryParser for VaireQueryParser {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        let rendered_sql = rewrite_pg_sql(&self.pg_compat_parser, sql);
-        let statements = sql_compat::parse_sql(&rendered_sql)
+        let statements = sql_compat::parse_sql(sql)
             .map_err(|e| make_vdb_error(VdbErrorCode::SqlSyntaxError, e.to_string()))?;
         let Some(stmt) = statements.into_iter().next() else {
             return Ok(VairePrepared {
@@ -120,7 +118,6 @@ impl QueryParser for VaireQueryParser {
                 if !is_catalog {
                     sql_compat::collapse_schema_qualified_relations(&mut stmt);
                 }
-                let rendered = sql_compat::statement_to_sql(&stmt);
                 let ctx = if is_catalog {
                     &self.local_ctx
                 } else {
@@ -129,9 +126,13 @@ impl QueryParser for VaireQueryParser {
                 let select_ctx = query_router::extract_select_table_name(&stmt)
                     .map(|t| ErrorContext::for_table(&t))
                     .unwrap_or_default();
+                // Plan the AST directly rather than rendering it back to SQL for
+                // DataFusion to re-parse: `Display` is lossy, and the re-parse used
+                // DataFusion's default (generic) dialect, narrowing the reachable
+                // expression surface to the intersection of two dialects.
                 let plan = ctx
                     .state()
-                    .create_logical_plan(&rendered)
+                    .statement_to_plan(DFStatement::Statement(Box::new(stmt.clone())))
                     .await
                     .map_err(|e| enrich_generic_error(&e, &select_ctx))?;
                 Some(plan)
@@ -144,7 +145,7 @@ impl QueryParser for VaireQueryParser {
             QueryType::Insert | QueryType::Update | QueryType::Delete => self
                 .session_ctx
                 .state()
-                .create_logical_plan(&sql_compat::statement_to_sql(&stmt))
+                .statement_to_plan(DFStatement::Statement(Box::new(stmt.clone())))
                 .await
                 .ok(),
             _ => None,
@@ -202,26 +203,6 @@ impl QueryParser for VaireQueryParser {
             column_format.unwrap_or(&Format::UnifiedText),
             None,
         )
-    }
-}
-
-/// Normalize incoming SQL through the PostgreSQL-compatibility rewriter so that client
-/// introspection queries (regclass casts, `::oid`, `ANY(array)`, known driver probe
-/// queries, etc.) become executable against DataFusion + the emulated `pg_catalog`.
-/// On parse failure or empty output, falls back to the original SQL unchanged.
-///
-/// The boundary here is intentionally a SQL *string*: the rewriter operates on
-/// datafusion's sqlparser version, which differs from the one vairedb uses directly, so we
-/// never share AST types across the two. Shared by the simple-protocol handler and the
-/// extended-protocol parser, which both rewrite before parsing.
-pub(super) fn rewrite_pg_sql(pg_compat_parser: &PostgresCompatibilityParser, sql: &str) -> String {
-    match pg_compat_parser.parse(sql) {
-        Ok(stmts) if !stmts.is_empty() => stmts
-            .iter()
-            .map(|s| s.to_string())
-            .collect::<Vec<_>>()
-            .join("; "),
-        _ => sql.to_string(),
     }
 }
 

@@ -3,8 +3,8 @@
 
 use std::sync::Arc;
 
+use crate::sqlparser::ast::Statement;
 use datafusion::scalar::ScalarValue;
-use sqlparser::ast::Statement;
 
 use crate::catalog::{MetadataCatalog, ShardMeta, TableMeta};
 use crate::error::{CoordinatorError, Result};
