@@ -15,8 +15,6 @@ updates:
         update-types: ["version-update:semver-major"]
       - dependency-name: "ballista*"
         update-types: ["version-update:semver-major"]
-      - dependency-name: "sqlparser"
-        update-types: ["version-update:semver-major"]
       - dependency-name: "duckdb"
         update-types: ["version-update:semver-major"]
   - package-ecosystem: "github-actions"
