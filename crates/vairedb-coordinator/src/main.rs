@@ -103,6 +103,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         Arc::clone(&scheduler_handle.session_ctx),
         Arc::clone(&scheduler_handle.local_ctx),
         config.default_replication_factor,
+        config.allow_cross_shard_transactions,
     ));
 
     let pg_server = async move {

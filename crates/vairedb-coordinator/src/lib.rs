@@ -13,7 +13,7 @@
 /// The coordinator deliberately has no direct `sqlparser` dependency: the AST it
 /// parses, rewrites, and hands to DataFusion's planner must be *the same type*
 /// DataFusion uses, and `datafusion_pg_catalog::sql::PostgresCompatibilityParser`
-/// (the single parser, see [`sql_compat::parse_sql`]) already produces it. Taking
+/// (the single parser, see [`pgwire_handler::parser::parse_sql`]) already produces it. Taking
 /// the crate from this re-export makes a version split structurally impossible and
 /// means a DataFusion bump needs no change here.
 pub use datafusion::sql::sqlparser;
@@ -25,9 +25,8 @@ pub mod config;
 pub mod error;
 pub mod node_service;
 pub mod pgwire_handler;
-pub mod query_router;
 pub mod replication;
 pub mod scheduler;
-pub mod sql_compat;
 pub mod util;
 pub mod write_router;
+pub mod write_sql_cl;

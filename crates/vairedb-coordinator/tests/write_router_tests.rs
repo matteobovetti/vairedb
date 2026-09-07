@@ -6,8 +6,9 @@ use vairedb_coordinator::catalog::{
     ColumnDef, MetadataCatalog, NodeMeta, NodeState, ShardMeta, ShardStrategy, TableMeta,
 };
 use vairedb_coordinator::error::CoordinatorError;
-use vairedb_coordinator::sql_compat;
-use vairedb_coordinator::write_router::{WriteRouter, compute_shard_index};
+use vairedb_coordinator::pgwire_handler::parser;
+use vairedb_coordinator::write_router::{WriteRouter, compute_shard_index, shard_for_bucket};
+use vairedb_coordinator::write_sql_cl;
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -37,6 +38,8 @@ fn setup_catalog_with_table() -> (Arc<MetadataCatalog>, TableMeta) {
 
     let table_meta = TableMeta {
         anonymized_columns: std::collections::HashMap::new(),
+        indexes: Vec::new(),
+        constraints: Vec::new(),
         table_name: "orders".to_string(),
         columns: vec![
             ColumnDef {
@@ -168,7 +171,7 @@ fn test_resolve_target_shards_with_key() {
     let router = WriteRouter::new(catalog);
 
     let sql = "INSERT INTO orders (customer_id, amount) VALUES (42, 100)";
-    let stmts = sql_compat::parse_sql(sql).unwrap();
+    let stmts = parser::parse_sql(sql).unwrap();
 
     let result = router
         .resolve_target_shards(&stmts[0], &table_meta, &[])
@@ -182,7 +185,7 @@ fn test_resolve_target_shards_without_key_returns_all() {
     let router = WriteRouter::new(catalog);
 
     let sql = "DELETE FROM orders";
-    let stmts = sql_compat::parse_sql(sql).unwrap();
+    let stmts = parser::parse_sql(sql).unwrap();
 
     let result = router
         .resolve_target_shards(&stmts[0], &table_meta, &[])
@@ -195,6 +198,8 @@ fn test_resolve_target_shards_empty_table_errors() {
     let catalog = Arc::new(MetadataCatalog::open(&temp_db_path()).unwrap());
     let table_meta = TableMeta {
         anonymized_columns: std::collections::HashMap::new(),
+        indexes: Vec::new(),
+        constraints: Vec::new(),
         table_name: "empty_table".to_string(),
         columns: vec![],
         shard_strategy: ShardStrategy::Hash as i32,
@@ -207,7 +212,7 @@ fn test_resolve_target_shards_empty_table_errors() {
     let router = WriteRouter::new(catalog);
 
     let sql = "INSERT INTO empty_table (id) VALUES (1)";
-    let stmts = sql_compat::parse_sql(sql).unwrap();
+    let stmts = parser::parse_sql(sql).unwrap();
 
     let result = router.resolve_target_shards(&stmts[0], &table_meta, &[]);
     assert!(result.is_err());
@@ -229,7 +234,7 @@ fn test_generate_shard_local_sql() {
     };
 
     let sql = "INSERT INTO orders (customer_id) VALUES (1)";
-    let stmts = sql_compat::parse_sql(sql).unwrap();
+    let stmts = parser::parse_sql(sql).unwrap();
 
     let (result, _params) = router
         .generate_shard_local_sql(&stmts[0], &shard, &[])
@@ -256,7 +261,7 @@ fn test_generate_shard_local_sql_malformed_placeholder_errors() {
     // renumber_placeholders returns None. With non-empty params this must
     // surface as an error rather than silently dropping the bind parameters.
     let sql = "INSERT INTO orders (customer_id) VALUES ($foo)";
-    let stmts = sql_compat::parse_sql(sql).unwrap();
+    let stmts = parser::parse_sql(sql).unwrap();
     let params = vec![ScalarValue::Int64(Some(1))];
 
     let result = router.generate_shard_local_sql(&stmts[0], &shard, &params);
@@ -279,7 +284,7 @@ fn test_generate_shard_local_sql_with_bytea() {
     };
 
     let sql = "CREATE TABLE t (data BYTEA)";
-    let stmts = sql_compat::parse_sql(sql).unwrap();
+    let stmts = parser::parse_sql(sql).unwrap();
 
     let (result, _params) = router
         .generate_shard_local_sql(&stmts[0], &shard, &[])
@@ -294,7 +299,7 @@ fn test_resolve_target_shards_update_with_key() {
     let router = WriteRouter::new(catalog);
 
     let sql = "UPDATE orders SET amount = 200 WHERE customer_id = 42";
-    let stmts = sql_compat::parse_sql(sql).unwrap();
+    let stmts = parser::parse_sql(sql).unwrap();
 
     let result = router
         .resolve_target_shards(&stmts[0], &table_meta, &[])
@@ -308,7 +313,7 @@ fn test_resolve_target_shards_update_without_key() {
     let router = WriteRouter::new(catalog);
 
     let sql = "UPDATE orders SET amount = 0 WHERE amount > 100";
-    let stmts = sql_compat::parse_sql(sql).unwrap();
+    let stmts = parser::parse_sql(sql).unwrap();
 
     let result = router
         .resolve_target_shards(&stmts[0], &table_meta, &[])
@@ -322,7 +327,7 @@ fn test_resolve_target_shards_delete_with_key() {
     let router = WriteRouter::new(catalog);
 
     let sql = "DELETE FROM orders WHERE customer_id = 7";
-    let stmts = sql_compat::parse_sql(sql).unwrap();
+    let stmts = parser::parse_sql(sql).unwrap();
 
     let result = router
         .resolve_target_shards(&stmts[0], &table_meta, &[])
@@ -336,7 +341,7 @@ fn test_resolve_target_shards_select_returns_all() {
     let router = WriteRouter::new(catalog);
 
     let sql = "SELECT * FROM orders";
-    let stmts = sql_compat::parse_sql(sql).unwrap();
+    let stmts = parser::parse_sql(sql).unwrap();
 
     let result = router
         .resolve_target_shards(&stmts[0], &table_meta, &[])
@@ -360,7 +365,7 @@ fn test_generate_shard_local_sql_update() {
     };
 
     let sql = "UPDATE orders SET amount = 99 WHERE customer_id = 1";
-    let stmts = sql_compat::parse_sql(sql).unwrap();
+    let stmts = parser::parse_sql(sql).unwrap();
 
     let (result, _params) = router
         .generate_shard_local_sql(&stmts[0], &shard, &[])
@@ -385,7 +390,7 @@ fn test_generate_shard_local_sql_delete() {
     };
 
     let sql = "DELETE FROM orders WHERE customer_id = 5";
-    let stmts = sql_compat::parse_sql(sql).unwrap();
+    let stmts = parser::parse_sql(sql).unwrap();
 
     let (result, _params) = router
         .generate_shard_local_sql(&stmts[0], &shard, &[])
@@ -421,7 +426,7 @@ fn group_rows_by_shard(
     shard_key: &str,
     shard_count: usize,
 ) -> std::collections::HashMap<usize, Vec<usize>> {
-    let keys = sql_compat::extract_insert_row_shard_keys(stmt, shard_key, &[])
+    let keys = write_sql_cl::extract_insert_row_shard_keys(stmt, shard_key, &[])
         .expect("multi-row INSERT should expose per-row shard keys");
     let mut shard_rows: std::collections::HashMap<usize, Vec<usize>> =
         std::collections::HashMap::new();
@@ -451,7 +456,7 @@ fn test_multi_row_insert_splits_across_shards() {
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!("INSERT INTO orders (customer_id, amount) VALUES {values}");
-    let stmts = sql_compat::parse_sql(&sql).unwrap();
+    let stmts = parser::parse_sql(&sql).unwrap();
 
     let shard_rows = group_rows_by_shard(&stmts[0], "customer_id", 3);
     assert_eq!(
@@ -483,7 +488,7 @@ fn test_multi_row_insert_same_shard_one_group() {
         .collect::<Vec<_>>()
         .join(", ");
     let sql = format!("INSERT INTO orders (customer_id, amount) VALUES {values}");
-    let stmts = sql_compat::parse_sql(&sql).unwrap();
+    let stmts = parser::parse_sql(&sql).unwrap();
 
     let shard_rows = group_rows_by_shard(&stmts[0], "customer_id", 3);
     assert_eq!(shard_rows.len(), 1, "co-located rows must form one group");
@@ -499,9 +504,9 @@ fn test_resolve_consistent_shard_routing() {
     let update_sql = "UPDATE orders SET amount = 200 WHERE customer_id = 42";
     let delete_sql = "DELETE FROM orders WHERE customer_id = 42";
 
-    let insert_stmts = sql_compat::parse_sql(insert_sql).unwrap();
-    let update_stmts = sql_compat::parse_sql(update_sql).unwrap();
-    let delete_stmts = sql_compat::parse_sql(delete_sql).unwrap();
+    let insert_stmts = parser::parse_sql(insert_sql).unwrap();
+    let update_stmts = parser::parse_sql(update_sql).unwrap();
+    let delete_stmts = parser::parse_sql(delete_sql).unwrap();
 
     let insert_shards = router
         .resolve_target_shards(&insert_stmts[0], &table_meta, &[])
@@ -515,4 +520,121 @@ fn test_resolve_consistent_shard_routing() {
 
     assert_eq!(insert_shards[0].shard_id, update_shards[0].shard_id);
     assert_eq!(insert_shards[0].shard_id, delete_shards[0].shard_id);
+}
+
+// ---------------------------------------------------------------------------
+// Bucket-to-shard resolution over more than ten shards.
+//
+// A shard's position in a list of shards is not its hash bucket: catalog records
+// are keyed by the string "{table}:shard{n}", so a prefix scan returns `shard10`
+// before `shard2`. Up to ten shards the two orders coincide and indexing by
+// position happens to work; from eleven on it does not, and routing by position
+// would send a key to a shard that does not own it — with no error, because every
+// shard can run the statement.
+// ---------------------------------------------------------------------------
+
+/// The number of shards these tests use: the smallest count at which the
+/// lexicographic order of the shard ids differs from the bucket order.
+const WIDE_SHARDS: u32 = 11;
+
+/// One shard record of `orders` for `bucket`, primaried on the single test node.
+fn shard_of_bucket(bucket: u32) -> ShardMeta {
+    ShardMeta {
+        // The production spelling: this is what makes the stored key order
+        // lexicographic rather than numeric.
+        shard_id: format!("shard{bucket}"),
+        table_name: "orders".to_string(),
+        primary_node_id: "node-0".to_string(),
+        replica_node_ids: vec![],
+        hash_bucket: bucket,
+        range_lower: String::new(),
+        range_upper: String::new(),
+    }
+}
+
+/// The same `orders` table as [`setup_catalog_with_table`] but spread over
+/// `shard_count` shards whose records are keyed as production keys them.
+fn setup_catalog_with_shard_count(shard_count: u32) -> (Arc<MetadataCatalog>, TableMeta) {
+    let (catalog, mut table_meta) = setup_catalog_with_table();
+    catalog.delete_shards_for_table("orders").unwrap();
+    table_meta.shard_count = shard_count;
+    catalog.put_table(&table_meta).unwrap();
+    for bucket in 0..shard_count {
+        catalog.put_shard(&shard_of_bucket(bucket)).unwrap();
+    }
+    (catalog, table_meta)
+}
+
+#[test]
+fn test_shard_for_bucket_matches_the_bucket_not_the_position() {
+    // The order a prefix scan hands the shards back in.
+    let mut buckets: Vec<u32> = (0..WIDE_SHARDS).collect();
+    buckets.sort_by_key(|bucket| format!("shard{bucket}"));
+    assert_ne!(
+        buckets[2], 2,
+        "the fixture must be an order in which position and bucket disagree"
+    );
+
+    let shards: Vec<ShardMeta> = buckets.iter().copied().map(shard_of_bucket).collect();
+    for bucket in 0..WIDE_SHARDS as usize {
+        let shard = shard_for_bucket(&shards, bucket, "orders").unwrap();
+        assert_eq!(shard.hash_bucket as usize, bucket);
+        assert_eq!(shard.shard_id, format!("shard{bucket}"));
+    }
+}
+
+#[test]
+fn test_shard_for_bucket_reports_a_bucket_with_no_shard() {
+    // An incomplete layout: bucket 2 has no record, so no shard owns the keys
+    // that hash to it. Any other shard would be the wrong one.
+    let shards: Vec<ShardMeta> = [0, 1, 3].into_iter().map(shard_of_bucket).collect();
+    let err = shard_for_bucket(&shards, 2, "orders").unwrap_err();
+    assert!(
+        matches!(err, CoordinatorError::ShardNotAssigned(_)),
+        "got: {err:?}"
+    );
+    let message = err.to_string();
+    assert!(message.contains("orders"), "got: {message}");
+    assert!(message.contains("bucket 2"), "got: {message}");
+}
+
+#[test]
+fn test_resolve_target_shards_routes_to_the_hashed_bucket_over_ten_shards() {
+    let (catalog, table_meta) = setup_catalog_with_shard_count(WIDE_SHARDS);
+    let router = WriteRouter::new(catalog);
+
+    // Enough keys to cover every bucket, including the ones whose position and
+    // bucket disagree.
+    for id in 1..=60i64 {
+        let expected = compute_shard_index(&id.to_string(), WIDE_SHARDS as usize);
+        for sql in [
+            format!("INSERT INTO orders (customer_id, amount) VALUES ({id}, 1)"),
+            format!("UPDATE orders SET amount = 2 WHERE customer_id = {id}"),
+            format!("DELETE FROM orders WHERE customer_id = {id}"),
+        ] {
+            let stmts = parser::parse_sql(&sql).unwrap();
+            let shards = router
+                .resolve_target_shards(&stmts[0], &table_meta, &[])
+                .unwrap();
+            assert_eq!(shards.len(), 1, "`{sql}` must route to one shard");
+            assert_eq!(
+                shards[0].hash_bucket as usize, expected,
+                "`{sql}` must go to the shard owning bucket {expected}"
+            );
+        }
+    }
+}
+
+#[test]
+fn test_resolve_target_shards_broadcasts_in_bucket_order_over_ten_shards() {
+    let (catalog, table_meta) = setup_catalog_with_shard_count(WIDE_SHARDS);
+    let router = WriteRouter::new(catalog);
+
+    let stmts = parser::parse_sql("DELETE FROM orders").unwrap();
+    let shards = router
+        .resolve_target_shards(&stmts[0], &table_meta, &[])
+        .unwrap();
+
+    let buckets: Vec<u32> = shards.iter().map(|shard| shard.hash_bucket).collect();
+    assert_eq!(buckets, (0..WIDE_SHARDS).collect::<Vec<_>>());
 }

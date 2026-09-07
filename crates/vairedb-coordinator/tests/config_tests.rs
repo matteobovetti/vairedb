@@ -12,6 +12,7 @@ grpc_listen_addr: "127.0.0.1:9000"
 pg_listen_addr: "127.0.0.1:9001"
 heartbeat_timeout_secs: 30
 default_replication_factor: 5
+allow_cross_shard_transactions: true
 tail_retry_initial_ms: 200
 tail_retry_max_ms: 10000
 ballista_scheduler_listen_addr: "127.0.0.1:50050"
@@ -27,6 +28,7 @@ ballista_scheduler_listen_addr: "127.0.0.1:50050"
     assert_eq!(config.pg_listen_addr, "127.0.0.1:9001");
     assert_eq!(config.heartbeat_timeout_secs, 30);
     assert_eq!(config.default_replication_factor, 5);
+    assert!(config.allow_cross_shard_transactions);
     assert_eq!(config.tail_retry_initial_ms, 200);
     assert_eq!(config.tail_retry_max_ms, 10000);
     assert_eq!(config.ballista_scheduler_listen_addr, "127.0.0.1:50050");
@@ -101,6 +103,7 @@ grpc_listen_addr: "0.0.0.0:50040"
 pg_listen_addr: "0.0.0.0:5432"
 heartbeat_timeout_secs: 15
 default_replication_factor: 3
+allow_cross_shard_transactions: false
 tail_retry_initial_ms: 100
 tail_retry_max_ms: 5000
 ballista_scheduler_listen_addr: "0.0.0.0:50050"

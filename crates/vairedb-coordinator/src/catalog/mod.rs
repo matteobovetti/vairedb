@@ -8,5 +8,6 @@ mod schema_provider;
 pub use catalog::MetadataCatalog;
 pub use schema_provider::VaireDbCatalogSchema;
 pub use vairedb_common::proto::vairedb::v1::{
-    AnonymizationSecret, ColumnDef, NodeMeta, NodeState, ShardMeta, ShardStrategy, TableMeta,
+    AnonymizationSecret, ColumnDef, ConstraintKind, ConstraintMeta, IndexMeta, NodeMeta, NodeState,
+    SchemaMeta, ShardMeta, ShardStrategy, TableMeta, ViewMeta,
 };

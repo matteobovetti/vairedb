@@ -8,8 +8,15 @@ Reads served from a shard's primary observe the latest committed write (strong c
 
 ## Distributed Transactions
 
-**Single-statement writes** are executed and committed by the local DuckDB instance, which provides full ACID guarantees. The coordinator forwards each shard-local statement to its target shard, where DuckDB commits it independently. Multi-statement client transactions are not supported: transaction-control commands (`BEGIN`/`COMMIT`/`ROLLBACK`) are accepted but not honored as atomic units — each statement commits on its own.
+**Single-statement writes** are executed and committed by the local DuckDB instance, which provides full ACID guarantees. The coordinator forwards each shard-local statement to its target shard, where DuckDB commits it independently.
 
-**Multi-shard transactions** are not supported. When a write operation targets multiple shards, the coordinator sends shard-local SQL to each shard independently via the gRPC WriteService. Each shard commits independently after quorum acknowledgment. There is no cross-shard atomicity — if one shard commits and another fails, the system does not roll back the successful shard.
+**Multi-statement client transactions** (`BEGIN`/`COMMIT`/`ROLLBACK`/`SAVEPOINT`) are supported without a distributed commit protocol: the transaction block is never held open on the shards. The coordinator buffers the block's writes for the duration of the block and submits them when the client commits. Two consequences follow, and they are the guarantee VaireDB offers:
 
-This is a deliberate trade-off: as an OLAP database, VaireDB targets analytical workloads where multi-shard atomic writes are not needed. Avoiding distributed transaction protocols (2PC, 3PC, Saga) eliminates significant coordinator complexity and write-path latency.
+- `ROLLBACK` — including `ROLLBACK TO SAVEPOINT` — is honored exactly, because nothing has reached a shard yet.
+- A block whose writes all belong to one shard's replica set is applied as a single shard-local transaction, so it is atomic. A block spanning several is not, and is therefore **refused at commit time** rather than half-applied; operators who accept non-atomic commits can opt in by configuration.
+
+Because the writes are buffered rather than executed as they arrive, a block can only contain statements whose outcome the coordinator can report truthfully before running them. Statements that cannot be — those whose affected-row count is only known once the shards run them, schema changes, and reads of a table the same block has already written — are rejected inside a block, naming the alternative. No statement is ever accepted with an invented answer.
+
+**Multi-shard atomicity** is absent in both paths: a single statement spanning shards, and a committed block spanning replica sets with the opt-in enabled, commit shard by shard after quorum acknowledgment. If one shard commits and another fails, the successful shard is not rolled back; the failure is reported as a partial one, distinguishable from a clean rollback.
+
+This is a deliberate trade-off: as an OLAP database, VaireDB targets analytical workloads where multi-shard atomic writes are not needed. Avoiding distributed transaction protocols (2PC, 3PC, Saga) eliminates significant coordinator complexity and write-path latency, while the buffered block still gives ordinary clients and ORMs the transaction semantics they expect.

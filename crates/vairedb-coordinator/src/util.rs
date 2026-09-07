@@ -14,13 +14,32 @@ pub fn now_unix_secs() -> u64 {
         .as_secs()
 }
 
+/// The physical relation name a logical table's shards are built on, before the
+/// shard suffix: the catalog key with its schema qualifier folded into the name
+/// (`orders` → `orders`, `sales.orders` → `sales_orders`).
+///
+/// A core node has one flat DuckDB namespace and splices this name into SQL
+/// *unquoted*, so a schema cannot be carried as a qualifier or as quoting — it has
+/// to become part of a single plain identifier. Folding on `_` is not injective:
+/// `sales.orders` and `sales_orders` fold together, which is why `CREATE TABLE`
+/// refuses the second of two logical names that would share one physical name (see
+/// `pgwire_handler::schemas::physical_name_conflict`).
+pub fn physical_base_name(table_name: &str) -> String {
+    table_name.replace('.', "_")
+}
+
 /// The physical, shard-local table name for a logical table on a given hash
-/// bucket (e.g. `orders` bucket `3` → `orders_shard3`). This naming is the
-/// contract between the coordinator (which rewrites and routes SQL) and the
-/// storage nodes (which create the per-shard DuckDB tables), so it must have a
-/// single definition.
+/// bucket (e.g. `orders` bucket `3` → `orders_shard3`, `sales.orders` bucket `3` →
+/// `sales_orders_shard3`). This naming is the contract between the coordinator
+/// (which rewrites and routes SQL) and the storage nodes (which create the
+/// per-shard DuckDB tables), so it must have a single definition.
+///
+/// `table_name` is a canonical catalog key (see
+/// `pgwire_handler::query_router::canonical_table_name`); the write path reaches
+/// the same string from the statement's AST via
+/// `write_sql_cl::rewrite_to_shard_local`, and the two must agree byte for byte.
 pub fn shard_table_name(table_name: &str, hash_bucket: u32) -> String {
-    format!("{}_shard{}", table_name, hash_bucket)
+    format!("{}_shard{}", physical_base_name(table_name), hash_bucket)
 }
 
 /// The logical shard identifier for the `index`-th shard of a table (e.g. index
@@ -52,6 +71,15 @@ mod tests {
     fn shard_table_name_formats_bucket() {
         assert_eq!(shard_table_name("orders", 3), "orders_shard3");
         assert_eq!(shard_table_name("t", 0), "t_shard0");
+    }
+
+    // A schema-qualified key has to arrive at the node as one plain identifier,
+    // because the node splices it into SQL unquoted.
+    #[test]
+    fn shard_table_name_folds_the_schema_into_the_identifier() {
+        assert_eq!(shard_table_name("sales.orders", 2), "sales_orders_shard2");
+        assert_eq!(physical_base_name("sales.orders"), "sales_orders");
+        assert_eq!(physical_base_name("orders"), "orders");
     }
 
     #[test]

@@ -12,6 +12,7 @@ grpc_listen_addr: "0.0.0.0:50040"
 pg_listen_addr: "0.0.0.0:5432"
 heartbeat_timeout_secs: 15
 default_replication_factor: 3
+allow_cross_shard_transactions: false
 tail_retry_initial_ms: 100
 tail_retry_max_ms: 5000
 ballista_scheduler_listen_addr: "0.0.0.0:50050"
@@ -25,6 +26,7 @@ ballista_scheduler_listen_addr: "0.0.0.0:50050"
 | `pg_listen_addr` | Address for the PostgreSQL wire protocol listener — clients connect here. |
 | `heartbeat_timeout_secs` | How long a core node may miss heartbeats before being declared dead. |
 | `default_replication_factor` | Cluster-wide replica count (`N`) for shards, overridable per table at creation. |
+| `allow_cross_shard_transactions` | Whether a `BEGIN` … `COMMIT` block whose writes span several shard groups may commit. `false` (recommended) refuses such a `COMMIT` and writes nothing; `true` applies the groups one at a time, so a failure part-way through leaves the earlier groups applied. See [Transactions & Consistency](../concepts/transactions-consistency.md). |
 | `tail_retry_initial_ms` | Initial backoff before retrying a write to a lagging replica (tail replication). |
 | `tail_retry_max_ms` | Maximum backoff for tail-replication retries. |
 | `ballista_scheduler_listen_addr` | Address of the embedded Ballista scheduler; core node executors connect here. |

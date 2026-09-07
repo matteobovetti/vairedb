@@ -21,8 +21,10 @@ use crate::util::node_state_str;
 /// `table_exist` all derive from it, so adding a table means adding one arm to
 /// [`VaireDbCatalogSchema::build_provider`] and one entry here — never editing
 /// three separate match/list sites.
-const VIRTUAL_TABLES: [&str; 5] = [
+const VIRTUAL_TABLES: [&str; 7] = [
+    "schemas",
     "tables",
+    "views",
     "columns",
     "shards",
     "nodes",
@@ -53,13 +55,46 @@ impl VaireDbCatalogSchema {
     /// fallback so that pattern lives in exactly one place.
     fn build_provider(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
         match name {
+            "schemas" => Some(self.build_schemas_provider()),
             "tables" => Some(self.build_tables_provider()),
+            "views" => Some(self.build_views_provider()),
             "columns" => Some(self.build_columns_provider()),
             "shards" => Some(self.build_shards_provider()),
             "nodes" => Some(self.build_nodes_provider()),
             "anonymization_secret" => Some(self.build_anonymization_secret_provider()),
             _ => None,
         }
+    }
+
+    /// Build the `schemas` virtual table: the namespaces someone created. The
+    /// default schema is not listed, because it is not a record — it always exists,
+    /// and a relation in it carries no qualifier.
+    fn build_schemas_provider(&self) -> Arc<dyn TableProvider> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("schema_name", DataType::Utf8, false),
+            Field::new(
+                "created_at",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                true,
+            ),
+        ]));
+
+        let schemas = self.catalog.list_schemas().unwrap_or_default();
+
+        let mut names = Vec::with_capacity(schemas.len());
+        let mut created_ats: Vec<Option<i64>> = Vec::with_capacity(schemas.len());
+        for s in &schemas {
+            names.push(s.schema_name.as_str());
+            created_ats.push(s.created_at.as_ref().map(|ts| ts.seconds * 1_000_000));
+        }
+
+        make_memtable(
+            schema,
+            vec![
+                Arc::new(StringArray::from(names)),
+                Arc::new(TimestampMicrosecondArray::from(created_ats)),
+            ],
+        )
     }
 
     fn build_tables_provider(&self) -> Arc<dyn TableProvider> {
@@ -102,6 +137,53 @@ impl VaireDbCatalogSchema {
                 Arc::new(StringArray::from(keys)),
                 Arc::new(Int32Array::from(counts)),
                 Arc::new(Int32Array::from(repl_factors)),
+                Arc::new(TimestampMicrosecondArray::from(created_ats)),
+            ],
+        )
+    }
+
+    /// Build the `views` virtual table. A view is stored as its query text and
+    /// nothing else, so this is the whole record: there are no columns to list in
+    /// the `columns` table, since a view's columns are whatever its query returns
+    /// the next time it is read.
+    fn build_views_provider(&self) -> Arc<dyn TableProvider> {
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("view_name", DataType::Utf8, false),
+            Field::new("definition", DataType::Utf8, false),
+            // The explicit column list the client gave, comma-joined, or NULL when
+            // it gave none and the query's own output names stand.
+            Field::new("columns", DataType::Utf8, true),
+            Field::new(
+                "created_at",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                true,
+            ),
+        ]));
+
+        let views = self.catalog.list_views().unwrap_or_default();
+
+        let mut names = Vec::with_capacity(views.len());
+        let mut definitions = Vec::with_capacity(views.len());
+        let mut columns: Vec<Option<String>> = Vec::with_capacity(views.len());
+        let mut created_ats: Vec<Option<i64>> = Vec::with_capacity(views.len());
+
+        for v in &views {
+            names.push(v.view_name.as_str());
+            definitions.push(v.definition.as_str());
+            columns.push(if v.columns.is_empty() {
+                None
+            } else {
+                Some(v.columns.join(","))
+            });
+            created_ats.push(v.created_at.as_ref().map(|ts| ts.seconds * 1_000_000));
+        }
+
+        make_memtable(
+            schema,
+            vec![
+                Arc::new(StringArray::from(names)),
+                Arc::new(StringArray::from(definitions)),
+                Arc::new(StringArray::from(columns)),
                 Arc::new(TimestampMicrosecondArray::from(created_ats)),
             ],
         )

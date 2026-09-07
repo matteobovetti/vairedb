@@ -65,6 +65,12 @@ pub enum CoordinatorError {
     #[error("null shard key: {0}")]
     NullShardKey(String),
 
+    /// The statement pins the shard key to something the coordinator cannot
+    /// reduce to a value, so the owning shard is not computable. Rejected rather
+    /// than guessed: a guessed shard stores the row where no lookup finds it.
+    #[error("unroutable shard key: {0}")]
+    UnroutableShardKey(String),
+
     #[error("quorum not reached: needed {needed}, got {got}")]
     QuorumNotReached { needed: usize, got: usize },
 
@@ -105,6 +111,7 @@ impl CoordinatorError {
             CoordinatorError::NodeNotFound(_) => VdbErrorCode::NodeNotFound,
             CoordinatorError::ShardNotAssigned(_) => VdbErrorCode::ShardNotAssigned,
             CoordinatorError::NullShardKey(_) => VdbErrorCode::FeatureNotSupported,
+            CoordinatorError::UnroutableShardKey(_) => VdbErrorCode::FeatureNotSupported,
             CoordinatorError::QuorumNotReached { .. } => VdbErrorCode::QuorumNotReached,
             CoordinatorError::ShardUnavailable(_) => VdbErrorCode::ShardUnavailable,
             CoordinatorError::NoAliveNodes => VdbErrorCode::NoAliveNodes,

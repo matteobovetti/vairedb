@@ -15,7 +15,9 @@ import "vairedb/v1/error.proto";
 service WriteService {
   // Execute one or more shard-local DML statements on the core node.
   // Typically a single statement per call; batching is supported for
-  // multi-shard writes targeting the same core node.
+  // multi-shard writes targeting the same core node, and for a client
+  // transaction whose buffered statements all land on this node (see
+  // `ExecuteWriteRequest.atomic`).
   rpc ExecuteWrite(ExecuteWriteRequest) returns (ExecuteWriteResponse);
 }
 
@@ -31,6 +33,14 @@ message ExecuteWriteRequest {
 
   // One or more shard-local DML statements to execute.
   repeated WriteStatement statements = 2;
+
+  // Apply every statement as a single transaction on the node: all of them take
+  // effect or none does, and no other connection's statement is interleaved
+  // between them. Set by the coordinator when flushing a client transaction
+  // whose statements all belong to this node. When false the statements are
+  // applied one at a time and each reports its own result, which is what a
+  // single-statement write wants.
+  bool atomic = 3;
 }
 
 message WriteStatement {
@@ -72,7 +82,10 @@ enum WriteOperation {
 }
 
 message ExecuteWriteResponse {
-  // Per-statement results, in the same order as the request.
+  // Per-statement results, in the same order as the request. An `atomic`
+  // request that failed carries a single failed result describing the statement
+  // that aborted the transaction: nothing was applied, so there is no
+  // per-statement outcome to report.
   repeated WriteResult results = 1;
 }
 

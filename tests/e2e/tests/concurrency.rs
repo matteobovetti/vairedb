@@ -9,10 +9,6 @@ use futures::future::join_all;
 // The suite runs `--test-threads=1`, so tests are serialized at the process
 // level. Concurrency is exercised *within* a single test by opening several
 // `connect()` clients and driving them with `join_all` / `tokio::join!`.
-//
-// One test (`test_concurrent_create_table_exactly_one_wins`) asserts the
-// DESIRED behavior of a known bug and is `#[ignore]`d per the xfail convention
-// (see shard_key_hazards.rs); run it on demand with `cargo test -- --ignored`.
 
 #[tokio::test]
 async fn test_concurrent_writers_same_shard_no_lost_updates() {
@@ -250,13 +246,13 @@ async fn test_read_after_update_sees_latest() {
     drop_table(&client, &tbl).await;
 }
 
-// KNOWN BUG: `handle_create_table` checks `get_table()` for an existing table
-// and only later commits to the catalog, with no lock/CAS in between. Two
-// concurrent `CREATE TABLE <same>` can both pass the existence check and both
-// proceed. Correct behavior: exactly one succeeds, the other is rejected with
-// TableAlreadyExists, and the catalog holds exactly one table row.
+// The name is claimed atomically by `catalog::create_table_if_absent` (the
+// existence check and the write share one redb write transaction), so of two
+// concurrent `CREATE TABLE <same>` exactly one succeeds, the other is rejected
+// with TableAlreadyExists, and the catalog holds exactly one table row. Before
+// that claim existed, both could pass a separate `get_table` check and both go on
+// to assign shards and broadcast DDL.
 #[tokio::test]
-#[ignore = "known bug: concurrent CREATE TABLE has no catalog lock/CAS; both pass the get_table existence check and may both create the table"]
 async fn test_concurrent_create_table_exactly_one_wins() {
     let setup = ready_client().await;
     let tbl = unique_table_name("cc_create_race");

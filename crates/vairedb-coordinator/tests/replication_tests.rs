@@ -11,7 +11,7 @@ use vairedb_common::proto::vairedb::v1::{
 };
 use vairedb_coordinator::catalog::{MetadataCatalog, NodeMeta, NodeState, ShardMeta};
 use vairedb_coordinator::channel_pool::ChannelPool;
-use vairedb_coordinator::replication::{ReplicationManager, RetryConfig};
+use vairedb_coordinator::replication::{BatchStatement, ReplicationManager, RetryConfig};
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -120,6 +120,61 @@ impl WriteService for CountingSuccessWriteService {
                 error: None,
             }],
         }))
+    }
+}
+
+/// Records every request it receives and answers with one successful result per
+/// statement, as a core node applying a batch does. Lets a test inspect what the
+/// coordinator actually put on the wire.
+struct RecordingBatchWriteService {
+    requests: Arc<Mutex<Vec<ExecuteWriteRequest>>>,
+}
+
+#[tonic::async_trait]
+impl WriteService for RecordingBatchWriteService {
+    async fn execute_write(
+        &self,
+        request: Request<ExecuteWriteRequest>,
+    ) -> std::result::Result<Response<ExecuteWriteResponse>, Status> {
+        let request = request.into_inner();
+        // Distinct row counts per statement so a test can tell them apart.
+        let results = (0..request.statements.len())
+            .map(|idx| WriteResult {
+                success: true,
+                rows_affected: idx as i64 + 1,
+                error: None,
+            })
+            .collect();
+        self.requests.lock().await.push(request);
+        Ok(Response::new(ExecuteWriteResponse { results }))
+    }
+}
+
+/// A node that rolled an atomic batch back: it reports the statements it managed
+/// to run as successful and the one that broke as failed. Nothing was applied.
+struct RolledBackBatchWriteService;
+
+#[tonic::async_trait]
+impl WriteService for RolledBackBatchWriteService {
+    async fn execute_write(
+        &self,
+        request: Request<ExecuteWriteRequest>,
+    ) -> std::result::Result<Response<ExecuteWriteResponse>, Status> {
+        let count = request.get_ref().statements.len();
+        let results = (0..count)
+            .map(|idx| {
+                let failed = idx + 1 == count;
+                WriteResult {
+                    success: !failed,
+                    rows_affected: if failed { 0 } else { 1 },
+                    error: failed.then(|| ErrorDetail {
+                        code: 0,
+                        message: "constraint violation, transaction rolled back".to_string(),
+                    }),
+                }
+            })
+            .collect();
+        Ok(Response::new(ExecuteWriteResponse { results }))
     }
 }
 
@@ -810,5 +865,205 @@ async fn test_multi_shard_write_partial_failure_leaves_first_shard_committed() {
         *shard0_calls.lock().await,
         1,
         "shard0 received and committed its write before the statement failed"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ReplicationManager — transaction batches (execute_transaction_with_quorum).
+// This is what COMMIT ships for a buffered transaction block: every statement
+// of the block that shares a node set travels in ONE request marked atomic, so
+// the node applies all of them or none. These tests pin the two properties the
+// coordinator's transaction semantics rest on — the request really is one atomic
+// batch, and a node that rolls it back fails the whole commit.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn test_transaction_batch_reaches_every_node_as_one_atomic_request() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let addr = start_mock_server(RecordingBatchWriteService {
+        requests: Arc::clone(&requests),
+    })
+    .await;
+    let addr_str = addr.to_string();
+
+    let catalog = Arc::new(make_catalog());
+    setup_catalog_with_nodes(&catalog, &[("node-1", &addr_str), ("node-2", &addr_str)]);
+
+    let pool = Arc::new(ChannelPool::new());
+    let config = RetryConfig {
+        initial_retry_ms: 50,
+        max_retry_ms: 200,
+    };
+    let manager = ReplicationManager::new(catalog, pool, config);
+
+    let shard = ShardMeta {
+        shard_id: "shard0".to_string(),
+        table_name: "orders".to_string(),
+        primary_node_id: "node-1".to_string(),
+        replica_node_ids: vec!["node-2".to_string()],
+        hash_bucket: 0,
+        range_lower: String::new(),
+        range_upper: String::new(),
+    };
+
+    // Two tables on the same node set, exactly what a block writing both buffers.
+    let statements = vec![
+        BatchStatement {
+            sql: "INSERT INTO orders_shard0 VALUES (1)".to_string(),
+            params: vec![],
+            shard_id: "orders_shard0".to_string(),
+        },
+        BatchStatement {
+            sql: "INSERT INTO customers_shard0 VALUES (2)".to_string(),
+            params: vec![],
+            shard_id: "customers_shard0".to_string(),
+        },
+    ];
+
+    let rows = manager
+        .execute_transaction_with_quorum(&shard, statements, "txn-1", 2)
+        .await
+        .expect("both nodes ack the batch");
+
+    // One row count per statement, in the order the client issued them.
+    assert_eq!(rows, vec![1, 2]);
+
+    let requests = requests.lock().await;
+    assert_eq!(
+        requests.len(),
+        2,
+        "the primary and the replica each receive the batch"
+    );
+    for request in requests.iter() {
+        assert!(
+            request.atomic,
+            "a transaction batch must be marked atomic, or the node would apply its statements one by one"
+        );
+        assert_eq!(request.write_id, "txn-1");
+        let sql: Vec<&str> = request
+            .statements
+            .iter()
+            .map(|stmt| stmt.sql.as_str())
+            .collect();
+        assert_eq!(
+            sql,
+            vec![
+                "INSERT INTO orders_shard0 VALUES (1)",
+                "INSERT INTO customers_shard0 VALUES (2)"
+            ],
+            "the whole block travels in one request, in client order"
+        );
+        // The batch is named by one shard, but each statement keeps its own
+        // target table — otherwise the second write would land on `orders`.
+        assert_eq!(request.statements[1].shard_id, "customers_shard0");
+    }
+}
+
+#[tokio::test]
+async fn test_transaction_batch_rolled_back_by_the_primary_fails_the_commit() {
+    let addr = start_mock_server(RolledBackBatchWriteService).await;
+
+    let catalog = Arc::new(make_catalog());
+    setup_catalog_with_nodes(&catalog, &[("node-1", &addr.to_string())]);
+
+    let pool = Arc::new(ChannelPool::new());
+    let config = RetryConfig {
+        initial_retry_ms: 50,
+        max_retry_ms: 200,
+    };
+    let manager = ReplicationManager::new(catalog, pool, config);
+
+    let shard = ShardMeta {
+        shard_id: "shard0".to_string(),
+        table_name: "orders".to_string(),
+        primary_node_id: "node-1".to_string(),
+        replica_node_ids: vec![],
+        hash_bucket: 0,
+        range_lower: String::new(),
+        range_upper: String::new(),
+    };
+
+    let statements = vec![
+        BatchStatement {
+            sql: "INSERT INTO orders_shard0 VALUES (1)".to_string(),
+            params: vec![],
+            shard_id: "orders_shard0".to_string(),
+        },
+        BatchStatement {
+            sql: "INSERT INTO orders_shard0 VALUES (1)".to_string(),
+            params: vec![],
+            shard_id: "orders_shard0".to_string(),
+        },
+    ];
+
+    let result = manager
+        .execute_transaction_with_quorum(&shard, statements, "txn-2", 1)
+        .await;
+
+    // The node reported the first statement as applied and the second as failed.
+    // Because the batch was atomic, nothing was applied, so the caller must see
+    // an error rather than a partial success it might report as a commit.
+    let err_str = result
+        .expect_err("a rolled-back batch cannot be reported as committed")
+        .to_string();
+    assert!(
+        err_str.contains("constraint violation"),
+        "the node's reason should reach the client, got: {err_str}"
+    );
+}
+
+// A lagging replica does not fail the commit: the primary plus quorum decide,
+// and the replica is queued to receive the same batch — still as one
+// transaction — from the retry loop.
+#[tokio::test]
+async fn test_transaction_batch_commits_on_primary_when_a_replica_lags() {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let primary_addr = start_mock_server(RecordingBatchWriteService {
+        requests: Arc::clone(&requests),
+    })
+    .await;
+    let replica_addr = start_mock_server(FailingWriteService).await;
+
+    let catalog = Arc::new(make_catalog());
+    setup_catalog_with_nodes(
+        &catalog,
+        &[
+            ("node-1", &primary_addr.to_string()),
+            ("node-2", &replica_addr.to_string()),
+        ],
+    );
+
+    let pool = Arc::new(ChannelPool::new());
+    let config = RetryConfig {
+        initial_retry_ms: 50,
+        max_retry_ms: 200,
+    };
+    let manager = ReplicationManager::new(catalog, pool, config);
+
+    let shard = ShardMeta {
+        shard_id: "shard0".to_string(),
+        table_name: "orders".to_string(),
+        primary_node_id: "node-1".to_string(),
+        replica_node_ids: vec!["node-2".to_string()],
+        hash_bucket: 0,
+        range_lower: String::new(),
+        range_upper: String::new(),
+    };
+
+    let statements = vec![BatchStatement {
+        sql: "INSERT INTO orders_shard0 VALUES (1)".to_string(),
+        params: vec![],
+        shard_id: "orders_shard0".to_string(),
+    }];
+
+    let rows = manager
+        .execute_transaction_with_quorum(&shard, statements, "txn-3", 1)
+        .await
+        .expect("quorum of one is met by the primary alone");
+    assert_eq!(rows, vec![1]);
+    assert_eq!(
+        requests.lock().await.len(),
+        1,
+        "the primary applied the batch"
     );
 }

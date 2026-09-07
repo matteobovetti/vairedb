@@ -242,12 +242,11 @@ make coverage
 | `config` | YAML configuration loading |
 | `error` | Coordinator error types and their mapping to wire error codes |
 | `node_service` | gRPC `NodeService` (register/heartbeat/report) and the heartbeat-based failure detector |
-| `pgwire_handler` | PostgreSQL wire-protocol handler: query routing, DDL/DML execution, result encoding, and catalog introspection |
-| `query_router` | SQL statement classification and table-name extraction for routing |
+| `pgwire_handler` | PostgreSQL wire-protocol handler: the single SQL parse and read-path AST rewrites, statement classification and table-name extraction, query routing, DDL/DML execution, result encoding, and catalog introspection |
 | `replication` | Quorum writes plus a background retry/backoff loop that tails missed writes to lagging replicas |
 | `scheduler` | Embedded Ballista scheduler: distributed read planning, plan codecs, and shard-affinity task distribution |
-| `sql_compat` | PostgreSQL-dialect rewriting to DuckDB-compatible form plus shard-routing decisions |
 | `write_router` | Resolves shards and dispatches writes to core nodes |
+| `write_sql_cl` | Write-path-only compatibility layer: PostgreSQL-dialect rewriting to DuckDB-compatible form plus shard-routing decisions |
 | `util` | Cross-cutting helpers (epoch timestamps, shard-local table naming) |
 
 **Core Node** (`crates/vairedb-core/src/`):

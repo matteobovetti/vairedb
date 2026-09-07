@@ -1,204 +1,217 @@
-# DuckDB vs. VaireDB (PostgreSQL wire protocol) — SQL Command Gap
+# SQL Command Gap — DuckDB vs. VaireDB (PostgreSQL wire protocol)
 
-Gap analysis of the SQL **statements** DuckDB documents against what VaireDB's
-coordinator currently accepts over the PostgreSQL wire protocol.
+Which SQL **statements** VaireDB's coordinator accepts over the PostgreSQL wire
+protocol, measured against the statements DuckDB documents.
 
-- **Reference (DuckDB):** [SQL Statements overview](https://duckdb.org/docs/current/sql/statements/overview) — 35 documented entries.
-- **VaireDB dispatch:** every statement is classified by
-  [`classify_statement`](../../crates/vairedb-coordinator/src/query_router/query_router.rs)
-  into one of 7 `QueryType`s; anything unrecognized becomes `QueryType::Other`
-  and is rejected. Wire path: `pgwire_handler/handler.rs` →
-  `handle_select` / `handle_dml` / `handle_create_table` / `handle_drop_table` /
-  `handle_alter_table`.
+- **Reference:** DuckDB's [SQL Statements overview](https://duckdb.org/docs/current/sql/statements/overview) — 35 documented entries. The row numbers below are that list's, and the tests cite them, so they stay fixed even where a table groups rows by theme rather than by number. A few combined entries are split into their sub-commands, hence 36 rows.
+- **Siblings:** `gap-analysis-data-type.md`, `gap-analysis-operator-literal.md`, `gap-analysis-aggregate-function.md`, `gap-analysis-window-function.md`.
+- **Executable counterpart:** every row maps to an end-to-end test — see [Tests](#tests).
 
-## How VaireDB decides
+VaireDB is a sharded coordinator that speaks the PG wire protocol and executes on
+per-shard DuckDB backends; it is not a drop-in DuckDB. It recognizes only the statement
+kinds it can shard, route and replicate: `classify_statement`
+([`pgwire_handler/query_router.rs`](../../crates/vairedb-coordinator/src/pgwire_handler/query_router.rs))
+sorts a statement into one of 18 `QueryType`s, and anything else becomes
+`QueryType::Other` and is refused.
 
-VaireDB is a **sharded coordinator that speaks the PG wire protocol and executes
-on per-shard DuckDB backends** — it is not a drop-in DuckDB. It recognizes only
-the statement kinds it can shard, route, and replicate. The parser is
-`sqlparser 0.58` with `PostgreSqlDialect`, so a statement can fail at two points:
+## Legend
+
+| Status | Meaning |
+|---|---|
+| ✅ | Supported. |
+| 🟡 | Supported, with restrictions that follow from sharding. Each is listed in the row. |
+| 🚫 | **Not planned** — a decided limitation. The deliverable is a rejection that explains itself. |
+| ❌ | Refused today. In [Read path and session state](#read-path-and-session-state--next) that means *not yet*; in [Not planned, or out of scope](#not-planned-or-out-of-scope) it means *refused, and not on the roadmap*. |
+
+A refused statement fails at one of two points, and which one decides the cost of closing
+it:
 
 | Rejection point | Error | SQLSTATE | When |
 |---|---|---|---|
-| Parse | `SqlSyntaxError` | `42601` | Statement doesn't parse under `PostgreSqlDialect` (most DuckDB-only syntax: `PIVOT`, `SUMMARIZE`, `INSTALL`, …), **plus** `RESET`, `VACUUM`, `CHECKPOINT` and `ALTER VIEW/SCHEMA/SEQUENCE`, which sqlparser omits even though PostgreSQL has them. |
-| Classification | `FeatureNotSupported` | `0A000` | Parses fine but isn't one of the 7 routed kinds (`SET`, `SHOW`, `BEGIN`, `CREATE VIEW`, `TRUNCATE`, `EXPLAIN`, `MERGE`, …). See `unsupported_statement_error`, `handler.rs:125`. |
+| Parse | `SqlSyntaxError` | `42601` | Does not parse under sqlparser's `PostgreSqlDialect` (most DuckDB-only syntax), **plus** `RESET`, `VACUUM`, `CHECKPOINT`, `ALTER SCHEMA`, `ALTER SEQUENCE` and `ALTER VIEW … RENAME TO`, which sqlparser omits although PostgreSQL has them. Closing such a row needs the parser taught first. |
+| Classification | `FeatureNotSupported` | `0A000` | Parses, but is not one of the routed kinds. Only routing/execution is missing. |
 
-**Which point a statement hits decides the cost of closing it.** A `0A000` row parses
-already, so it only needs routing/execution. A `42601` row needs the parser taught
-first — either a sqlparser upgrade/dialect change or a pre-parse rewrite — before any
-distributed work starts. The `Rejected at` column below records the point **observed
-against the 5-node e2e cluster**, not a guess.
+The `SQLSTATE` column in the tables records what was **observed against the 5-node e2e
+cluster**, not a guess. Every classification refusal names the command it refused, so a
+client sending a batch can tell which statement was rejected.
 
-## Executable counterpart
+## Summary
 
-Every row of this document is mapped to an end-to-end test under `tests/e2e/tests/`:
+| Status | Count | Statements |
+|---|---:|---|
+| ✅ | 5 | SELECT, INSERT, UPDATE, DELETE, CREATE TABLE |
+| 🟡 | 9 | ALTER TABLE, DROP, ALTER VIEW, COPY, CREATE INDEX, CREATE SCHEMA, CREATE VIEW, MERGE INTO, transaction management |
+| 🚫 | 2 | CREATE SEQUENCE, CREATE TYPE |
+| ❌ | 20 | all others |
 
-| File | Rows | Contents |
-|---|---|---|
-| `sql_command_select.rs` | 1 | The read path's operator surface. |
-| `sql_command_dml.rs` | 2–4, 25 | INSERT/UPDATE/DELETE + MERGE/upsert. |
-| `sql_command_ddl.rs` | 5–7 | The 🟡 gap surface of CREATE/ALTER/DROP TABLE. |
-| `sql_command_unsupported.rs` | 8–36 | Every ❌ statement. |
+Of the 20 ❌ rows: **9 fail at classification**, **9 fail at parse**, and **2 are split
+across both points** (`ATTACH`/`DETACH`, `INSTALL`/`LOAD`).
+
+## Rules that apply to every row
+
+These are the invariants the write path is built on; the row notes below only record
+where a statement deviates.
+
+- **A statement is either correct on every shard or refused.** No statement is accepted
+  and silently under-applied, and no refusal is a fake `OK` for work that never happened.
+- **A write must have a determinable shard key before it leaves the coordinator**, because
+  the coordinator hashes it to pick the shard. A key that is a computed expression is
+  refused rather than guessed. `UPDATE`/`DELETE` predicates broadcast instead, since every
+  shard re-evaluates the `WHERE` clause.
+- **Uniqueness is only enforceable when it includes the shard key.** Equal shard keys share
+  a shard, so a per-shard unique index or constraint then sees every row that could
+  collide. Off the shard key it is refused, in every spelling (`UNIQUE` index, `UNIQUE` /
+  `PRIMARY KEY` constraint, `ON CONFLICT` arbiter).
+- **There is no cross-shard atomicity yet (no 2PC).** A transaction block on one node set
+  is all-or-nothing; one spanning node sets is refused at `COMMIT` unless
+  `allow_cross_shard_transactions` is set. A multi-shard write that fails part-way reports
+  `40003` and how much was written — never a rollback that did not happen. Statements whose
+  retry converges (`TRUNCATE`, index and constraint DDL) are shipped with
+  `IF (NOT) EXISTS` so re-running finishes the job.
+- **DDL is refused inside a transaction block**, because it reaches the catalog and the
+  shards immediately and `ROLLBACK` could not undo it.
+- **Every object kind resolves through its own namespace**, so no statement can destroy an
+  object of another kind: the wrong kind is `42809` naming the statement to use instead, a
+  name that resolves to nothing is `42P01`. Tables, views, indexes and index-backed
+  constraints share **one relation namespace**, claimed atomically.
+- **A schema qualifier is part of the catalog key** (`sales.t`; a relation in the default
+  schema keys as the bare `t`) and is folded into the physical per-shard name
+  (`sales_t_shard2`). There is no `search_path`: an unqualified name always means the
+  default schema.
+- **Decorations that only affect performance are stripped**; anything that would change
+  results is refused by name rather than accepted and ignored.
+
+## Write path and DDL — closed
+
+The statements that route to shards, plus the DDL that is coordinator-local (views and
+schemas reach no shard). This surface is complete; what stays refused in a 🟡 row is
+refused by design, not waiting for a turn.
+
+| # | Statement | `QueryType` | Status | SQLSTATE | Notes |
+|---|---|---|---|:-:|---|
+| 2 | `INSERT` | `Insert` | ✅ | — | Needs the shard key present with a non-NULL, determinable value per row; positional rows are resolved against the declared column order first. Multi-row inserts are split per shard. Any query source (`SELECT`, `UNION`, CTE) is materialized and re-emitted as literal `VALUES`, so it routes like a hand-written insert; `RETURNING` on that form is refused. `ON CONFLICT DO UPDATE` works when the arbiter includes the shard key and is backed by a `PRIMARY KEY`/`UNIQUE` index. |
+| 3 | `UPDATE` | `Update` | ✅ | — | Except mutating the shard-key column: row relocation is refused (`0A000`). |
+| 4 | `DELETE` | `Delete` | ✅ | — | Routed to the owning shards, or broadcast when the predicate's shard key is not a literal. |
+| 5 | `CREATE TABLE` | `CreateTable` | ✅ | — | VaireDB-extended: `WITH (shards, replication_factor, shard_by, anonymized_columns)`. PG types mapped to DuckDB. The name is claimed atomically. Declared constraints are recorded and reach every shard: `CHECK` always, `UNIQUE`/`PRIMARY KEY` only over the shard key, `FOREIGN KEY` never (unenforceable across shards). `AS SELECT` is supported when it states `WITH (shard_by = …)` **before** the query; `LIKE`/`CLONE` supply no column list and are refused. |
+| 6 | `ALTER TABLE` | `AlterTable` | 🟡 | `0A000` | Column ops (ADD/DROP/RENAME COLUMN, ALTER COLUMN type/nullability/default), `RENAME TO`, and `ADD`/`DROP CONSTRAINT … UNIQUE (<shard key>)`. `RENAME TO` re-keys the catalog and renames every `{table}_shard{n}`; it stays inside the table's schema and must be the only action (`42601`). Cannot drop the shard key or touch anonymized columns. While the table carries an index or index-backed constraint, only adding a column and changing a default are possible — the engine's dependency is on the table. A column a declared constraint covers cannot be dropped or retyped. Every other `ADD`/`DROP CONSTRAINT` form is refused by name: the shards' engine implements neither `ADD … CHECK` nor `DROP CONSTRAINT`. |
+| 7 | `DROP` | `DropTable` / `DropIndex` / `DropView` / `DropSchema` | 🟡 | `0A000` / `42P01` | The four kinds the catalog knows, each through its own namespace. `IF EXISTS` honored. Several names in one statement, and `CASCADE`/`RESTRICT`, are refused rather than partly applied. `DROP SEQUENCE` reaches the table handler and reports as a missing table. |
+| 8 | `ALTER VIEW` | `AlterView` | 🟡 | `42601` / `42P01` | `AS <query>` redefines a view in place, validated like a `CREATE`, and refuses a name no view holds. `RENAME TO` fails at parse. |
+| 14 | `COPY` | `Copy` | 🟡 | `0A000` | Bulk import/export over a **CSV file on the coordinator**: `TO` gathers from every shard, `FROM` routes each row by its shard key. `FORMAT CSV` must be stated (PG's default is `TEXT`); `HEADER`/`DELIMITER`/`QUOTE` are honored and any other option is refused by name. Refused: `FROM STDIN` / `TO STDOUT` (the streaming sub-protocol), `PROGRAM`, non-CSV formats. ⚠️ No privilege check exists — VaireDB has no role model, so any client reads and writes any path the coordinator process can. |
+| 15 | `CREATE INDEX` / `DROP INDEX` | `CreateIndex` / `DropIndex` | 🟡 | `0A000` | One real index per shard, on every replica, recorded on its table. `UNIQUE` over the shard key doubles as an `ON CONFLICT` arbiter, so an existing table can gain upsert. An index is created in its table's schema, so `CREATE INDEX` takes a bare name and `DROP INDEX` the qualified one. Refused: `UNIQUE` off the shard key, a `UNIQUE` index narrowed by `WHERE` or `NULLS NOT DISTINCT`, an unnamed index (nothing for `DROP` to resolve), an index over an expression. |
+| 17 | `CREATE SCHEMA` / `DROP SCHEMA` | `CreateSchema` / `DropSchema` | 🟡 | `0A000` | **Coordinator-local**: a namespace in the catalog, nothing broadcast. A taken name is `42P06`, a missing schema `3F000`, a non-empty `DROP SCHEMA` `2BP01` (RESTRICT-only). Because the physical name folds the qualifier in, `sales.t` and `sales_t` cannot both exist — the second is `42P07` naming the owner — and a `.` inside a quoted name still reads as a qualifier. Refused: `CASCADE` (it would drop tables as a side effect of a namespace statement), `AUTHORIZATION` (no role model), dropping `public` or a metadata schema. `ALTER SCHEMA` fails at parse. |
+| 20 | `CREATE VIEW` | `CreateView` | 🟡 | `0A000` | **Coordinator-local**: the query text is stored and inlined as a CTE ahead of every query naming the view, so it is planned fresh on each read, never stale, and gets the shard fan-out the query would. The definition is validated at create time. `CREATE OR REPLACE`, `IF NOT EXISTS`, a column list and a view over a view are honored; a client's own CTE of the same name wins. A view is read-only (writes are `42809`). Refused: `MATERIALIZED` (nothing is stored here), the dialect decorations (`TEMPORARY`, `WITH (…)`, `SECURE`, `CLUSTER BY`, `TO`, `COMMENT`, a typed column), a view over a metadata schema or named after a `pg_catalog` table, and a cyclic definition. |
+| 25 | `MERGE INTO` | `Merge` | 🟡 | `0A000` | Applied shard by shard, with all four `WHEN` clause kinds, their `AND` conditions and `UPDATE`/`INSERT`/`DELETE` actions honored as written. Accepted when `ON` equates the target's **shard key** with a source column and the source is either a co-located table sharded by that column (same shard count, same nodes) or an inline `VALUES` list, which is split per shard. Refused: any other source, an `ON` that does not pin the shard key (each shard would decide "not matched" on partial information and insert a duplicate), `UPDATE SET <shard key>`, an `INSERT` that omits or contradicts the shard key, `RETURNING`, `NOT MATCHED BY SOURCE` over a `VALUES` source, per-action `WHERE` predicates, a merge into a table with anonymized columns. |
+| 33 | Transactions (`BEGIN`/`COMMIT`/`ROLLBACK`/`SAVEPOINT`) | `TransactionControl` | 🟡 | `0A000` | All of `BEGIN`/`START TRANSACTION`, `COMMIT`/`END`, `ROLLBACK`/`ABORT`, `SAVEPOINT`, `ROLLBACK TO SAVEPOINT`, `RELEASE`, on both protocols — so a driver that opens a transaction implicitly works. The writes are **buffered in the coordinator** and shipped at `COMMIT` as one atomic batch per node set, which makes `ROLLBACK` exact and savepoints positions in that buffer. Buffering is also the constraint: only statements the coordinator can answer truthfully **without running them** are allowed inside a block, so `UPDATE`/`DELETE` (unknowable row count), DDL, and reads of a table the block has written are refused, `READ ONLY` is honored (`25006`), and a failed block stays failed (`25P02`). Isolation levels are accepted and ignored — the node-local DuckDB transaction's level governs. |
+| — | `TRUNCATE` | `TruncateTable` | 🟡 | `0A000` | Not in DuckDB's list, but standard PG that clients send. Every replica of every shard is emptied; the table, its shard layout and its schema survive. `ONLY` and a trailing `*` are accepted (nothing inherits here). Refused: several tables in one statement, `CASCADE`/`RESTRICT`, `RESTART IDENTITY`. |
+
+## Read path and session state — next
+
+Planned on DataFusion, or held in the connection's session state. None of them touch
+shard routing, which is why they are a separate body of work.
+
+| # | Statement | `QueryType` | Status | SQLSTATE | Notes |
+|---|---|---|---|:-:|---|
+| 1 | `SELECT` | `Select` | ✅ | — | Full read path, distributed via Ballista; `pg_catalog`/`vairedb_catalog` introspection is answered from a local context. Its operator, type and function coverage is the subject of the sibling gap docs. |
+| 29 | `SET` | `Other` | ❌ | `0A000` | **The compatibility risk on this list.** Drivers issue `SET` (`client_encoding`, `application_name`, `extra_float_digits`, …) on connect, so a refusal can break a client before its first query. Note `search_path` is *not* a no-op-safe parameter now that schemas exist: it has to be honored in name resolution or refused. |
+| 31 | `SHOW` / `SHOW DATABASES` | `Other` | ❌ | `0A000` | The read half of the same gap; `SHOW ALL` and `SHOW TABLES` too. |
+| 28 | `RESET` | `Other` | ❌ | `42601` | Same gap, but sqlparser has no `RESET`, so the parser has to be taught it first. |
+| 27 | `EXPLAIN` / `PRAGMA` / `EXPLAIN ANALYZE` | `Other` | ❌ | `0A000` | A `SELECT` already builds a DataFusion `LogicalPlan`, so `EXPLAIN` is mostly a rendering path. |
+| 22 | `DESCRIBE` | `Other` | ❌ | `0A000` | Schema exploration; introspection currently flows through emulated `pg_catalog` SELECTs. |
+| 9 | `ANALYZE` | `Other` | ❌ | `0A000` | No planner-statistics surface. |
+| 26 / 34 | `PIVOT` / `UNPIVOT` | `Other` | ❌ | `42601` | DuckDB-only syntax, so support starts at the parser. |
+| 32 | `SUMMARIZE` | `Other` | ❌ | `42601` | DuckDB-only. |
+| 30 | `SET VARIABLE` | `Other` | ❌ | `42601` | DuckDB variables. |
+
+## Not planned, or out of scope
+
+| # | Statement | Status | SQLSTATE | Why |
+|---|---|:-:|:-:|---|
+| 19 | `CREATE SEQUENCE` / `nextval()` / `SERIAL` | 🚫 | `0A000` (`ALTER SEQUENCE`: `42601`) | See [no sequences](#no-sequences). |
+| 21 | `CREATE TYPE` / `CREATE DOMAIN` / `ALTER TYPE` | 🚫 | `0A000` | See [no user-defined types](#no-user-defined-types). |
+| 10 | `ATTACH` / `DETACH` | ❌ | `0A000` / `42601` | Single-node DuckDB attachment; meaningless for a sharded cluster. |
+| 12 | `CHECKPOINT` | ❌ | `42601` | Per-shard storage concern, not coordinator-exposed. |
+| 23 | `EXPORT` / `IMPORT DATABASE` | ❌ | `42601` | Whole-DB dump/load. Use `COPY` (row 14). |
+| 24 | `INSTALL` / `LOAD` | ❌ | `42601` / `0A000` | Extension management is a per-node concern. |
+| 18 | `CREATE SECRET` | ❌ | `0A000` | DuckDB's secrets manager; VaireDB has its own anonymization-secret path (`INSERT INTO vairedb_catalog.anonymization_secret`). |
+| 35 | `USE` | ❌ | `0A000` | One database per cluster, and no `search_path` to switch — a relation elsewhere is named with its qualifier. |
+| 11 | `CALL` | ❌ | `0A000` | No stored or table procedures. |
+| 13 | `COMMENT ON` | ❌ | `0A000` | No catalog comment storage, and nowhere to read one back — accepting and discarding it would be a fake `OK`. |
+| 16 | `CREATE MACRO` | ❌ | `42601` | DuckDB-only. |
+| 36 | `VACUUM` | ❌ | `42601` | Per-shard storage maintenance. ⚠️ **Undecided**: either distributed vacuum management is in scope, or this belongs with `CHECKPOINT` above. `sql_command_unsupported.rs` keeps an `#[ignore]`d target-state test pending the decision. |
+
+Rows 10, 12, 18, 23, 24 and 35 are single-node DuckDB concerns: accepting one would mean it
+silently ran on one arbitrary node. They have no target-state test because they must **stay**
+rejected — `sql_command_unsupported.rs::test_out_of_scope_statements_stay_rejected` is the
+guard that none of them is ever quietly accepted.
+
+## Decided limitations
+
+### No sequences
+
+A sequence is one monotonically increasing counter, which is the single thing a
+shared-nothing cluster cannot provide cheaply. Broadcasting `CREATE SEQUENCE` gives every
+shard its own counter, so the "unique id" collides across shards — and because replication
+is statement shipping, a surviving `nextval()` would evaluate differently on each replica.
+A coordinator-allocated counter is correct but turns every insert into a round trip through
+one serialized allocator and makes the coordinator a hard point of failure for writes,
+which is the opposite of what sharding buys.
+
+So `CREATE`/`DROP SEQUENCE`, `nextval()` and `SERIAL`/`BIGSERIAL`/`SMALLSERIAL` are refused
+with a message naming the alternative: generate ids in the application (UUID/ULID, or a
+client-side snowflake), which needs no coordination and spreads evenly over the shards.
+This also settles the `SERIAL` row of `gap-analysis-data-type.md`.
+
+### No user-defined types
+
+A user-defined type is cluster-wide state the coordinator has nowhere to keep. The catalog
+models tables and has no replay path for non-table DDL, so a node that joins or is rebuilt
+would come back without the type and refuse every write using it. It would not survive the
+wire boundary either: the emulated `pg_catalog` has no `pg_type` row to give it an OID. And
+what an enum or domain buys is a value check, which is shard-local — a `CHECK` constraint
+declared at `CREATE TABLE` is the in-database version of the same guarantee.
+
+So `CREATE TYPE` (enum, composite, range), `CREATE DOMAIN` and `ALTER TYPE` are refused
+with the way out. `DROP TYPE` is left alone: it reports that the type does not exist, which
+is exactly true. DuckDB's **inline** `ENUM(...)` column type is not a named type and still
+reaches the shards — see `gap-analysis-data-type.md`.
+
+## Open gaps, ranked
+
+By how often real PG clients and ORMs need them. **(routing)** = parses today,
+**(parser + routing)** = the parser has to be taught the statement first.
+
+1. **`SET` / `SHOW`** *(routing)* and **`RESET`** *(parser + routing)* — the one gap that
+   can break a client on connect rather than on a query.
+2. **`EXPLAIN` / `DESCRIBE`** *(routing)* — query inspection and schema exploration, both
+   widely used by tooling.
+3. **The `COPY` streaming sub-protocol** (`FROM STDIN` / `TO STDOUT`, hence `psql`'s
+   `\copy`) — protocol work rather than routing.
+4. **`ALTER SCHEMA`** *(parser + routing)*, plus the two things a namespace alone does not
+   give: `search_path` (needs item 1) and `ALTER TABLE … SET SCHEMA`.
+5. **`PIVOT` / `UNPIVOT`** *(parser + routing)* — reshaping, DuckDB-only syntax.
+
+Beyond the statement list, the standing limitation is **cross-shard atomicity**: a
+transaction block spanning node sets is refused rather than half-applied, and multi-shard
+writes report partial commits honestly. Closing that is 2PC, not a statement gap.
+
+## Tests
+
+| File (`tests/e2e/tests/`) | Rows |
+|---|---|
+| `sql_command_select.rs` | 1 — the read path's operator surface. |
+| `sql_command_dml.rs` | 2–4, 25 — INSERT/UPDATE/DELETE, MERGE, upsert. |
+| `sql_command_ddl.rs` | 5–7 — CREATE/ALTER/DROP TABLE, constraints, `TRUNCATE`. |
+| `sql_command_transaction.rs` | 33 — what a buffered block honors and refuses. |
+| `sql_command_unsupported.rs` | 8–32, 34–36 — every ❌ statement, plus the closed rows (14 `COPY`, 15 indexes, 17 schemas, 20 views), which now pin what stays refused. |
+| `shard_key_hazards.rs`, `identifier_rewrite.rs`, `data_types_dialect_gaps.rs`, `concurrency.rs` | Write-path rules that cut across rows: which shard-key values route, how a name becomes one catalog key and one physical name, PG → DuckDB expression rewrites, concurrent DDL/DML. |
 
 Each gap has up to two tests: a **passing** `*_currently_rejected` test pinning that
-today's rejection is honest (a real SQLSTATE, never a fake `OK` for work that never
-happened), and an `#[ignore = "gap (row N): …"]` test asserting the
-PostgreSQL-correct target behavior. The ignored tests fail by construction and are
-the definition of done — un-ignore one as its gap closes:
+today's refusal is honest, and an `#[ignore = "gap (row N): …"]` test asserting the
+PostgreSQL-correct target behavior. The ignored ones fail by construction and are the
+definition of done — un-ignore one as its gap closes:
 
 ```sh
 cd tests/e2e && cargo test --test sql_command_unsupported -- --ignored --test-threads=1
 ```
 
 `make e2e` runs only the passing set, so the gap map never blocks CI.
-
-## Summary
-
-| Support | Count | Statements |
-|---|---:|---|
-| ✅ Supported | 5 | SELECT, INSERT, UPDATE, DELETE, CREATE TABLE |
-| 🟡 Partial | 2 | ALTER TABLE, DROP |
-| ❌ Not supported | 29 | all others (see table) |
-
-Of the 29 ❌ rows, counted by their headline statement: **17 fail at classification**
-(`0A000` — the parser is fine, only routing is missing), **10 fail at parse** (`42601` —
-the parser must be taught the statement first), and **2 are split across both points**
-(`ATTACH`/`DETACH`, `INSTALL`/`LOAD`). Some rows whose `CREATE` form is `0A000` have an
-`ALTER` form that is `42601` (schemas, sequences, views).
-
-### Confirmed behaviors that this table used to get wrong
-
-Found while building the executable counterpart, verified against the e2e cluster:
-
-- **`DROP VIEW <table>` silently drops the TABLE.** Every `DROP <kind>` is classified
-  `DropTable`, so `DROP VIEW`/`INDEX`/`SEQUENCE`/`SCHEMA` naming an existing table
-  reports success and destroys it (PostgreSQL would refuse with `42809` wrong object
-  type). Naming something that isn't a table gives `42P01 table "x" does not exist` —
-  wrong noun, but harmless. **This is the highest-consequence entry in the whole map:
-  a client typo on an object kind is unrecoverable data loss.**
-  Guard: `sql_command_ddl.rs::test_drop_view_must_not_drop_a_table`.
-- **Upsert is NOT a gap — `INSERT … ON CONFLICT DO UPDATE` works today**, provided the
-  arbiter column is declared `PRIMARY KEY` in the `CREATE TABLE`: the declaration
-  reaches the per-shard DuckDB tables and supplies the arbiter index. When the arbiter
-  is the shard key this is globally correct, because equal keys always hash to the same
-  shard. Without a declared PK the shard returns `[VDB-2001] … not referenced by a
-  UNIQUE/PRIMARY KEY CONSTRAINT or INDEX`. The constraint must exist at `CREATE` time —
-  `ALTER TABLE … ADD CONSTRAINT` (row 6) and `CREATE UNIQUE INDEX` (row 15) are both
-  rejected — and an arbiter on a **non**-shard-key column would only be enforced per
-  shard, so it must not be relied on for global uniqueness.
-- **`CREATE TABLE AS SELECT` doesn't merely skip shard validation — it fails.** CTAS
-  classifies as `CreateTable` and *is* broadcast, then dies with `08006 [VDB-3007] DDL
-  broadcast to node core-1 failed`; no shard table is created and no rows are
-  materialized.
-- **`MERGE INTO` parses.** sqlparser 0.58 accepts it, so it is rejected at
-  classification (`0A000`), not at parse — closing it is routing work only.
-
-## Full statement gap table
-
-`Rejected at` is the SQLSTATE observed against the e2e cluster; `—` means the
-statement is accepted.
-
-| # | DuckDB statement | VaireDB `QueryType` | Status | Rejected at | Notes |
-|---|---|---|---|---|---|
-| 1 | `SELECT` | `Select` | ✅ | — | Full read path. Planned on DataFusion; distributed via Ballista `session_ctx`, or `local_ctx` for `pg_catalog`/`vairedb_catalog` introspection. |
-| 2 | `INSERT` | `Insert` | ✅ | — | Requires an **explicit column list naming the shard key** with a non-NULL value per row. `INSERT … SELECT` and positional inserts are rejected `0A000` (`validate_insert_shard_key`). Multi-row inserts are split per shard. `ON CONFLICT DO UPDATE` works when the arbiter column was declared `PRIMARY KEY` at `CREATE` time — see the summary. |
-| 3 | `UPDATE` | `Update` | ✅ | — | Supported **except mutating the shard-key column** (row relocation, rejected `0A000`). |
-| 4 | `DELETE` | `Delete` | ✅ | — | Routed/broadcast to owning shards under quorum. |
-| 5 | `CREATE TABLE` | `CreateTable` | ✅ | — | VaireDB-extended: `WITH (shards, replication_factor, shard_by, anonymized_columns)`. PG types mapped to DuckDB (`BYTEA`→`BLOB`, `JSONB`→`JSON`). `IF NOT EXISTS` honored. **`CREATE TABLE AS SELECT` fails** `08006` at the shard DDL broadcast (no column list ⇒ shard key falls back to `"id"`). |
-| 6 | `ALTER TABLE` | `AlterTable` | 🟡 | `0A000` for other ops | Only column ops: ADD / DROP / RENAME COLUMN, ALTER COLUMN {SET DATA TYPE, SET/DROP NOT NULL, SET/DROP DEFAULT}. Constraints, `RENAME TO`, … → `0A000`. Cannot drop the shard key or touch anonymized columns (both intentional). |
-| 7 | `DROP` | `DropTable` | 🟡 | `42P01` if no such table | Only `DROP TABLE` is meaningful — the catalog only knows tables. `DROP VIEW/INDEX/SCHEMA/SEQUENCE` reach the same handler: missing object ⇒ `42P01 table "x" does not exist`; **existing table of that name ⇒ the table is dropped** (see summary). `IF EXISTS` honored for tables. |
-| 8 | `ALTER VIEW` | `Other` | ❌ | `42601` | Views unsupported. sqlparser only accepts `ALTER VIEW … AS <query>`, so `RENAME TO` fails at parse. |
-| 9 | `ANALYZE` | `Other` | ❌ | `0A000` | No planner statistics surface. |
-| 10 | `ATTACH` / `DETACH` | `Other` | ❌ | `0A000` / `42601` | Single-node DuckDB concept; not applicable to the sharded model. `ATTACH` parses, `DETACH` does not. |
-| 11 | `CALL` | `Other` | ❌ | `0A000` | No stored/table procedures. |
-| 12 | `CHECKPOINT` | `Other` | ❌ | `42601` | Per-shard storage concern, not coordinator-exposed. |
-| 13 | `COMMENT ON` | `Other` | ❌ | `0A000` | No catalog comment storage. |
-| 14 | `COPY` | `Other` | ❌ | `0A000` | **High-value gap** — bulk import/export. `copy_handler` is a `NoopHandler`. Aligns with the roadmap's "massive data import SQL command". |
-| 15 | `CREATE INDEX` | `Other` | ❌ | `0A000` | No distributed index management. A `UNIQUE` index **on the shard key** is the one uniqueness constraint enforceable without cross-shard coordination. |
-| 16 | `CREATE MACRO` | `Other` | ❌ | `42601` | No macro support; DuckDB-only syntax. |
-| 17 | `CREATE SCHEMA` | `Other` | ❌ | `0A000` (`ALTER SCHEMA`: `42601`) | Coordinator namespace is flat (`schema.tbl` collapsed to bare name), so two same-named tables in different schemas would collide on one catalog key. |
-| 18 | `CREATE SECRET` | `Other` | ❌ | `0A000` | DuckDB secrets manager. Note VaireDB has its **own** anonymization-secret mechanism via `INSERT INTO vairedb_catalog.anonymization_secret`. |
-| 19 | `CREATE SEQUENCE` | `Other` | ❌ | `0A000` (`ALTER SEQUENCE`: `42601`) | No distributed sequences. Also the blocker behind the `SERIAL` gap in the data-type analysis; `nextval()` in the shard-key position additionally needs routing of a non-literal key. |
-| 20 | `CREATE VIEW` | `Other` | ❌ | `0A000` | Explicitly labeled unsupported (`unsupported_statement_label`); `CREATE OR REPLACE VIEW` likewise. Common ORM/BI need. |
-| 21 | `CREATE TYPE` | `Other` | ❌ | `0A000` | No custom/enum types. |
-| 22 | `DESCRIBE` | `Other` | ❌ | `0A000` | Introspection instead flows through emulated `pg_catalog` SELECTs. Shares the `EXPLAIN` label. |
-| 23 | `EXPORT` / `IMPORT DATABASE` | `Other` | ❌ | `42601` | Whole-DB dump/load; not applicable to sharded model. |
-| 24 | `INSTALL` / `LOAD` | `Other` | ❌ | `42601` / `0A000` | Extension management is a per-node concern. `INSTALL` fails at parse, `LOAD` parses. |
-| 25 | `MERGE INTO` | `Other` | ❌ | `0A000` | Needs shard-key-aware routing of the matched/unmatched branches. **Parses fine** under sqlparser 0.58, so this is routing work only. The `INSERT … ON CONFLICT` spelling of upsert already works (see summary). |
-| 26 | `PIVOT` | `Other` | ❌ | `42601` | DuckDB-only syntax. |
-| 27 | Profiling (`PRAGMA` / `EXPLAIN ANALYZE`) | `Other` | ❌ | `0A000` | `EXPLAIN` explicitly labeled unsupported, although SELECTs already build a DataFusion `LogicalPlan` that could be rendered. |
-| 28 | `RESET` | `Other`/`Set` | ❌ | `42601` | Session config not modeled — **and** sqlparser's `PostgreSqlDialect` has no `RESET`, so this needs a parser fix too, unlike `SET`/`SHOW`. |
-| 29 | `SET` | `Set` | ❌ | `0A000` | Explicitly labeled unsupported. Drivers issue `SET` (`client_encoding`, `application_name`, `extra_float_digits`, …) on connect — a **compatibility risk** that can break a client before its first query. |
-| 30 | `SET VARIABLE` | `Other` | ❌ | `42601` | DuckDB variables unsupported. |
-| 31 | `SHOW` / `SHOW DATABASES` | `ShowVariable` | ❌ | `0A000` | Explicitly labeled unsupported; `SHOW ALL` and `SHOW TABLES` likewise. |
-| 32 | `SUMMARIZE` | `Other` | ❌ | `42601` | DuckDB-only. |
-| 33 | Transaction management (`BEGIN`/`COMMIT`/`ROLLBACK`/`SAVEPOINT`) | `StartTransaction`/`Commit`/`Rollback`/`Savepoint` | ❌ | `0A000` | Explicitly labeled unsupported. **Major client-compatibility gap** — many drivers/ORMs wrap statements in transactions by default. Note auto-commit emulation can fake `BEGIN`/`COMMIT` but not `ROLLBACK`. |
-| 34 | `UNPIVOT` | `Other` | ❌ | `42601` | DuckDB-only. |
-| 35 | `USE` | `Other` | ❌ | `0A000` | No database/schema switching (flat namespace). |
-| 36 | `VACUUM` | `Other` | ❌ | `42601` | Per-shard storage maintenance, not coordinator-exposed. sqlparser has no `VACUUM` either. ⚠️ In-scope status unresolved — see *Open question* below. |
-
-`TRUNCATE` is not in DuckDB's overview but is a standard PG statement clients do send:
-it is rejected `0A000`, and its rows survive (`sql_command_unsupported.rs` section 12).
-
-> The DuckDB overview page counts 34 entries; the table expands a few combined
-> entries (`ATTACH`/`DETACH`, `INSTALL`/`LOAD`, `SET`/`RESET`, `SHOW`/`SHOW
-> DATABASES`, transaction management) into their sub-commands, hence 36 rows.
-
-## Prioritized gaps (wire-protocol impact)
-
-Ranked by how often real PG clients/ORMs need them, independent of DuckDB parity.
-The parenthetical marks the rejection point, i.e. whether the parser also has to
-change: **(routing)** = `0A000`, parses today; **(parser + routing)** = `42601`.
-
-0. **`DROP <non-table>` data loss** — not a feature gap but a correctness bug, and it
-   outranks everything below: `DROP VIEW t` on a table drops the table. Fixing it means
-   checking the object kind in `handle_drop_table` and returning `42809`. Cheap,
-   independent of every item below, and prevents unrecoverable data loss.
-1. **Transaction control (`BEGIN`/`COMMIT`/`ROLLBACK`)** *(routing)* — most PG drivers
-   open a transaction implicitly. Even a single-statement / auto-commit emulation would
-   unblock many clients, though it cannot honor `ROLLBACK`.
-2. **`SET` / `SHOW`** *(routing)* / **`RESET`** *(parser + routing)* — drivers send
-   `SET` (e.g. `client_encoding`, `search_path`) at connect time; silently accepting
-   no-op-safe SETs would improve compatibility. `SET`/`SHOW` are the cheap half.
-3. **`COPY`** *(routing)* — bulk ingest/export; already on the roadmap ("massive data
-   import SQL command"). `copy_handler` currently a `NoopHandler`. Export must gather
-   from every shard; import must route each row by its shard key.
-4. **`CREATE VIEW` / `DROP VIEW`** *(routing)* / **`ALTER VIEW`** *(parser + routing)* —
-   common for BI/reporting layers. Requires modelling a non-table relation in the
-   catalog, which is also what unblocks item 0's object-kind check.
-5. **`EXPLAIN` and `DESCRIBE`** *(routing)* — widely used by tooling and humans for
-   query inspection and schema exploration. SELECTs already build a DataFusion
-   `LogicalPlan`, so `EXPLAIN` is mostly a rendering path.
-6. **`MERGE INTO`** *(routing)* — needs shard-key-aware routing of the matched and
-   unmatched branches. Scope reduced: the `INSERT … ON CONFLICT` half of this need
-   already works on a declared `PRIMARY KEY` (see summary), so this is only about the
-   `MERGE` spelling and multi-branch merges.
-7. **`INDEX`** *(routing)* — used for optimizing query performance. A `UNIQUE` index on
-   the shard key is also the only global uniqueness constraint currently expressible
-   at all, and today it can only be declared at `CREATE TABLE` time.
-8. **`CREATE SCHEMA` / `DROP SCHEMA`** *(routing)* / **`ALTER SCHEMA`**
-   *(parser + routing)* — schema creation and management. Blocked on the flat namespace:
-   `canonical_table_name` keeps only the last identifier part.
-9. **`CREATE SEQUENCE` / `DROP SEQUENCE`** *(routing)* / **`ALTER SEQUENCE`**
-   *(parser + routing)* — distributed sequence management; also the blocker behind
-   `SERIAL`.
-10. **`VACUUM`** *(parser + routing)* — distributed vacuum management. ⚠️ In-scope status
-    unresolved — see *Open question* below.
-11. **`PIVOT` / `UNPIVOT`** *(parser + routing)* — reshaping data. DuckDB-only syntax,
-    so support starts with teaching the parser the statement.
-
-Statements that are **intentionally out of scope** (single-node DuckDB concerns
-that don't map to a sharded coordinator): `ATTACH`/`DETACH`, `INSTALL`/`LOAD`,
-`CHECKPOINT`, `EXPORT`/`IMPORT DATABASE`, `USE`, `CREATE SECRET` (superseded by
-VaireDB's own anonymization-secret path). These must **stay** rejected — accepting one
-would mean it silently ran on one arbitrary node; that is guarded by
-`sql_command_unsupported.rs::test_out_of_scope_statements_stay_rejected`.
-
-### Open question: is `VACUUM` in scope?
-
-`VACUUM` appears **both** as prioritized gap #10 ("distributed vacuum management") and,
-previously, in the out-of-scope list — the two are mutually exclusive. It has been
-removed from the out-of-scope list above so that the ranked list and the test suite
-agree, and `sql_command_unsupported.rs` keeps an `#[ignore]`d target-state test for it.
-If the decision goes the other way, drop that xfail, delete item 10, and restore
-`VACUUM` to the out-of-scope list; the passing rejection test stays either way.

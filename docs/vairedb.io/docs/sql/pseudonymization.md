@@ -124,7 +124,31 @@ original email never touches disk.
 | Unsupported `algo` on the secret | Statement rejected. |
 | Bind parameter (`$1`) in an anonymized column | Rejected — the value must be a literal, or it would reach the node unhashed. |
 | Non-literal expression | Rejected for the same reason. |
-| `INSERT ... SELECT` | Rejected — anonymized columns require `INSERT ... VALUES`. |
+| `INSERT ... SELECT` | Rows are read first and re-inserted as literals, so they are hashed like any `VALUES` row — unless the source also pseudonymizes (see below). |
+
+### Copying between pseudonymized tables
+
+Reading a pseudonymized column gives you its **digest** — that is the whole
+point, the plaintext is gone. So inserting that digest into another table that
+pseudonymizes the same column would hash it a *second* time and store
+`H(H(email))`: a row that exists but that no lookup will ever match, because a
+query hashes its candidate value once.
+
+VaireDB refuses that copy rather than storing the mismatch, on both spellings,
+before the source query runs:
+
+```sql
+-- Refused (SQLSTATE 0A000) when both tables declare `customer_email` anonymized:
+INSERT INTO archive (id, customer_email) SELECT id, customer_email FROM foo_table;
+CREATE TABLE archive WITH (...) AS SELECT id, customer_email FROM foo_table;
+```
+
+Either declare the destination **without** `anonymized_columns` — it then stores
+the digests exactly as they are, which is the only faithful thing to do with them
+— or load it from the original plaintext. `COPY ... FROM '<file>'` cannot be
+checked this way: the coordinator has no way to tell that a column in a CSV
+already holds digests, so a file exported from a pseudonymized table will be
+hashed again on import.
 
 ## Why the coordinator, and why a literal
 

@@ -6,7 +6,9 @@ use xxhash_rust::xxh3::xxh3_64;
 // Shard-count and replication-factor configuration variants, and the placement
 // metadata they produce in `vairedb_catalog.shards`: shard count (explicit,
 // default, and the rf>nodes rejection), replica counts, no-duplicate-node
-// placement, string shard keys, and multi-row insert splitting.
+// placement, string shard keys, multi-row insert splitting, and a shard count
+// past ten, where a shard's position in a lexicographically keyed list is no
+// longer its hash bucket.
 //
 // Predicate routing (single-shard vs broadcast) lives in `shard_routing.rs`.
 
@@ -234,6 +236,143 @@ async fn test_string_shard_key() {
     .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][0].as_deref(), Some("2"));
+
+    drop_table(&client, &tbl).await;
+}
+
+/// Twelve shards: past ten, where the catalog's shard records — keyed by the
+/// string `"{table}:shard{n}"` — stop coming back in bucket order, because
+/// `shard10` sorts before `shard2`.
+const WIDE_SHARD_COUNT: usize = 12;
+
+// A table with more shards than the shard ids sort numerically for. Everything
+// here holds trivially at three shards and is the first thing to break at twelve
+// if any part of the write path treats a shard's position in the catalog's list
+// as its hash bucket — silently, because every shard can execute the statement.
+#[tokio::test]
+async fn test_more_than_ten_shards() {
+    let client = ready_client().await;
+    let tbl = create_table(
+        &client,
+        "sh_wide",
+        &format!(
+            "(id INTEGER NOT NULL, v VARCHAR) \
+             WITH (shards = {WIDE_SHARD_COUNT}, replication_factor = 3, shard_by = 'id')"
+        ),
+    )
+    .await;
+
+    // Deliberately unordered: the catalog must hand a table's shards back in
+    // bucket order on its own, since that is the order every caller reading the
+    // list positionally assumes.
+    let listed = simple_query_rows(
+        &client,
+        &format!("SELECT hash_bucket FROM vairedb_catalog.shards WHERE table_name = '{tbl}'"),
+    )
+    .await
+    .unwrap();
+    let buckets: Vec<u64> = listed
+        .iter()
+        .map(|r| r[0].as_deref().unwrap().parse().unwrap())
+        .collect();
+    assert_eq!(
+        buckets,
+        (0..WIDE_SHARD_COUNT as u64).collect::<Vec<_>>(),
+        "the catalog should list shards by hash bucket, got {buckets:?}"
+    );
+
+    // Ids spanning every bucket, including the two-digit ones whose bucket and
+    // lexicographic position disagree.
+    let ids: Vec<i64> = (1..=60).collect();
+    let high_ids: Vec<i64> = ids
+        .iter()
+        .copied()
+        .filter(|&id| bucket_of_in(id, WIDE_SHARD_COUNT) >= 10)
+        .collect();
+    assert!(
+        high_ids.len() >= 2,
+        "the test ids must reach the buckets above nine; got {high_ids:?}"
+    );
+
+    let values: Vec<String> = ids.iter().map(|id| format!("({id}, 'v{id}')")).collect();
+    let affected = execute(
+        &client,
+        &format!("INSERT INTO {tbl} (id, v) VALUES {}", values.join(", ")),
+    )
+    .await
+    .unwrap();
+    assert_eq!(affected, ids.len() as u64, "every row should be inserted");
+
+    let rows = simple_query_rows(&client, &format!("SELECT id FROM {tbl} ORDER BY id"))
+        .await
+        .unwrap();
+    let got: Vec<i64> = rows
+        .iter()
+        .map(|r| r[0].as_deref().unwrap().parse().unwrap())
+        .collect();
+    assert_eq!(
+        got, ids,
+        "the split insert should have stored every row once"
+    );
+
+    // A point lookup, update and delete are each routed to a single shard: they
+    // have to reach the one the row was written to.
+    let target = high_ids[0];
+    let rows = simple_query_rows(&client, &format!("SELECT v FROM {tbl} WHERE id = {target}"))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "id {target} should be found on its shard");
+    assert_eq!(rows[0][0].as_deref(), Some(format!("v{target}").as_str()));
+
+    let affected = execute(
+        &client,
+        &format!("UPDATE {tbl} SET v = 'updated' WHERE id = {target}"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(affected, 1, "the update should reach the row's shard");
+
+    let affected = execute(&client, &format!("DELETE FROM {tbl} WHERE id = {target}"))
+        .await
+        .unwrap();
+    assert_eq!(affected, 1, "the delete should reach the row's shard");
+    assert_eq!(row_count(&client, &tbl).await, ids.len() as i64 - 1);
+
+    // A MERGE from a VALUES list splits its rows the same way an INSERT does, so
+    // it must find the surviving row and re-insert the deleted one — on the shard
+    // each key belongs to, or the match fails and the row is stored twice.
+    let surviving = high_ids[1];
+    let affected = execute(
+        &client,
+        &format!(
+            "MERGE INTO {tbl} t \
+             USING (VALUES ({target}, 'merged'), ({surviving}, 'merged')) AS s(id, v) \
+             ON t.id = s.id \
+             WHEN MATCHED THEN UPDATE SET v = s.v \
+             WHEN NOT MATCHED THEN INSERT (id, v) VALUES (s.id, s.v)"
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(affected, 2, "one row re-inserted, one updated");
+    assert_eq!(row_count(&client, &tbl).await, ids.len() as i64);
+
+    let rows = simple_query_rows(
+        &client,
+        &format!("SELECT id, v FROM {tbl} WHERE v = 'merged' ORDER BY id"),
+    )
+    .await
+    .unwrap();
+    let merged: Vec<i64> = rows
+        .iter()
+        .map(|r| r[0].as_deref().unwrap().parse().unwrap())
+        .collect();
+    let mut expected = vec![target, surviving];
+    expected.sort_unstable();
+    assert_eq!(
+        merged, expected,
+        "each merged row should exist exactly once: {rows:?}"
+    );
 
     drop_table(&client, &tbl).await;
 }

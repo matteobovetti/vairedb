@@ -41,7 +41,7 @@ Client SQL (SELECT)
 Client SQL (DML)
     │  PostgreSQL wire protocol (v3)
     v
-[Parse & Identify Shards]        (Coordinator: DataFusion parser)
+[Parse & Identify Shards]        (Coordinator: PostgreSQL-compatible parser)
     │
     v
 [Rewrite to Shard-Local SQL]     (Coordinator: e.g. orders -> orders_shard0)
@@ -64,6 +64,10 @@ Client SQL (DML)
     v
 [Return to Client]
 ```
+
+Shard identification is a gate, not a guess: a write whose target shards cannot be
+determined is rejected before anything is sent, rather than routed somewhere plausible.
+See [SQL command gap analysis](gap-analysis-command.md) for which forms that rules out.
 
 ## Query Optimization (Delegated to Ballista + DataFusion)
 

@@ -129,6 +129,7 @@ config and one config per core node.
     pg_listen_addr: "0.0.0.0:5432"
     heartbeat_timeout_secs: 15
     default_replication_factor: 3
+    allow_cross_shard_transactions: false
     tail_retry_initial_ms: 100
     tail_retry_max_ms: 5000
     ballista_scheduler_listen_addr: "0.0.0.0:50050"

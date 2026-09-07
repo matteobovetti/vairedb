@@ -627,6 +627,8 @@ fn refresh_catalog_tables_single_table() {
 
     let table_meta = TableMeta {
         anonymized_columns: std::collections::HashMap::new(),
+        indexes: Vec::new(),
+        constraints: Vec::new(),
         table_name: "users".to_string(),
         columns: vec![
             ColumnDef {
@@ -676,6 +678,8 @@ fn refresh_catalog_tables_multiple_tables() {
     for name in &["orders", "products", "reviews"] {
         let table_meta = TableMeta {
             anonymized_columns: std::collections::HashMap::new(),
+            indexes: Vec::new(),
+            constraints: Vec::new(),
             table_name: name.to_string(),
             columns: vec![ColumnDef {
                 name: "id".to_string(),
@@ -712,6 +716,8 @@ fn refresh_catalog_tables_maps_column_types_correctly() {
 
     let table_meta = TableMeta {
         anonymized_columns: std::collections::HashMap::new(),
+        indexes: Vec::new(),
+        constraints: Vec::new(),
         table_name: "typed_table".to_string(),
         columns: vec![
             ColumnDef {
@@ -779,6 +785,8 @@ async fn local_ctx_select_vairedb_catalog_tables() {
 
     let table_meta = TableMeta {
         anonymized_columns: std::collections::HashMap::new(),
+        indexes: Vec::new(),
+        constraints: Vec::new(),
         table_name: "orders".to_string(),
         columns: vec![
             ColumnDef {
@@ -854,6 +862,8 @@ async fn local_ctx_select_vairedb_catalog_columns() {
 
     let table_meta = TableMeta {
         anonymized_columns: std::collections::HashMap::new(),
+        indexes: Vec::new(),
+        constraints: Vec::new(),
         table_name: "users".to_string(),
         columns: vec![
             ColumnDef {
@@ -1040,6 +1050,8 @@ async fn local_ctx_catalog_query_with_filter() {
     for name in &["alpha", "beta", "gamma"] {
         let table_meta = TableMeta {
             anonymized_columns: std::collections::HashMap::new(),
+            indexes: Vec::new(),
+            constraints: Vec::new(),
             table_name: name.to_string(),
             columns: vec![ColumnDef {
                 name: "id".to_string(),

@@ -3,15 +3,16 @@ use common::*;
 use tokio_postgres::Client;
 
 // SELECT — row 1 of docs/specs/gap-analysis-command.md (✅ supported, "full read
-// path"). One of four `sql_command_*` files that together make the command gap
+// path"). One of five `sql_command_*` files that together make the command gap
 // doc executable:
 //
 //   * `sql_command_select.rs`      — row 1 (SELECT)
 //   * `sql_command_dml.rs`         — rows 2-4 (INSERT/UPDATE/DELETE) + row 25 (MERGE)
 //   * `sql_command_ddl.rs`         — rows 5-7 (CREATE TABLE ✅, ALTER TABLE 🟡, DROP 🟡)
+//   * `sql_command_transaction.rs` — row 33 (BEGIN/COMMIT/ROLLBACK/SAVEPOINT)
 //   * `sql_command_unsupported.rs` — rows 8-36 (❌)
 //
-// Suite convention, shared by all four:
+// Suite convention, shared by all five:
 //   * plain `#[tokio::test]` — the command works end to end today; the test
 //     guards against regressions.
 //   * `#[tokio::test]` + `#[ignore = "gap (row N): ..."]` — asserts the

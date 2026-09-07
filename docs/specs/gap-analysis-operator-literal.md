@@ -46,9 +46,9 @@ A read-path expression is parsed **once** and never re-rendered:
 
 | # | Stage | Parser / dialect | Code |
 |---|---|---|---|
-| E1 | The single parse: `PostgresCompatibilityParser` — tokenize, substitute the pg-compat blacklist, parse, apply 12 rewrite rules | sqlparser **0.61**, `PostgreSqlDialect` | `sql_compat/mod.rs` → `sql_compat::parse_sql` |
-| E2 | AST rewrites (`to_char` format, schema collapse) | — | `sql_compat/dialect.rs:122`, `:146` |
-| E3 | Plan **from that AST** — `statement_to_plan(DFStatement::Statement(…))` | — no parse | `handler.rs:433`, `parser.rs:133` |
+| E1 | The single parse: `PostgresCompatibilityParser` — tokenize, substitute the pg-compat blacklist, parse, apply 12 rewrite rules | sqlparser **0.61**, `PostgreSqlDialect` | `pgwire_handler/parser.rs` → `pgwire_handler::parser::parse_sql` |
+| E2 | AST rewrites (`to_char` format, schema collapse) | — | `pgwire_handler/parser.rs:80`, `:104` |
+| E3 | Plan **from that AST** — `statement_to_plan(DFStatement::Statement(…))` | — no parse | `parser.rs:234` (`plan_select`, shared by both protocols) |
 | E4 | Plan, optimize, serialize to proto, execute | DataFusion kernels | `scheduler/`, Ballista |
 
 This is the state **after** the parser unification. Before it, the chain was three
@@ -80,9 +80,9 @@ The write path adds a shard-local rewrite and the one surviving render:
 
 | # | Stage | Code |
 |---|---|---|
-| W1 | E1 as above — the same single parse | `sql_compat::parse_sql` |
-| W2 | Shard-local relation rewrite | `sql_compat/mod.rs:49` |
-| W3 | `transform_to_duckdb` — PG→DuckDB rewrite | `sql_compat/dialect.rs:15` |
+| W1 | E1 as above — the same single parse | `pgwire_handler::parser::parse_sql` |
+| W2 | Shard-local relation rewrite | `write_sql_cl/mod.rs:43` |
+| W3 | `transform_to_duckdb` — PG→DuckDB rewrite | `write_sql_cl/dialect.rs:13` |
 | W4 | Render `.to_string()`, ship, execute verbatim on DuckDB | `write_router.rs:94` |
 
 **W4 is irreducible** — `write_router` ships SQL *text* over gRPC for DuckDB to
@@ -427,7 +427,7 @@ change results.
 
 1. **Fix `^`** — the only case where PostgreSQL and DuckDB agree and VaireDB's
    read path satisfies neither, and the easiest to hit. Rewrite the `PGExp` binary
-   op to a `power()` call in the read-path AST transform (`sql_compat/dialect.rs`),
+   op to a `power()` call in the read-path AST transform (`pgwire_handler/parser.rs`),
    which is already the right hook and already runs on every SELECT. Cheap,
    self-contained, and closes split #1 in both directions. The parser unification
    made this strictly simpler: the AST now carries `PGExp`, so the rewrite
@@ -512,7 +512,7 @@ the core nodes), over `psql` on the coordinator's PostgreSQL wire port — not b
 reading capability tables. 77 operator and literal fragments were probed:
 
 1. **Read path, FROM-less** — `SELECT <expr>`, which `extract_select_table_name`
-   (`query_router/query_router.rs:93`) resolves to no table, so it plans on
+   (`pgwire_handler/query_router.rs`) resolves to no table, so it plans on
    `session_ctx` and isolates pure DataFusion semantics.
 2. **Read path, table-backed** — the same fragment in a `WHERE` over a 3- and
    5-shard table, confirming the FROM-less result holds under distribution.

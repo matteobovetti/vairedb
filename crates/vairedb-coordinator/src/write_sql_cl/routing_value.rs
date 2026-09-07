@@ -3,40 +3,125 @@
 //! shard. Numeric forms are normalized (`10`, `10.0`, `1e1` all → `10`) using
 //! exact string/integer arithmetic — never a float round-trip — so large
 //! integers and high-precision decimals route exactly.
+//!
+//! Only forms whose value the coordinator can determine from the statement alone
+//! are routable. Anything else — a computed expression, a function call, a value
+//! of a type whose bound and literal spellings do not agree — yields
+//! [`RoutedValue::Unroutable`] so the caller rejects the write. Hashing such an
+//! expression's *source text* would place the row on a shard that no equivalent
+//! lookup ever visits, and nothing would fail.
 
-use crate::sqlparser::ast::{Expr, Value};
+use crate::sqlparser::ast::{Expr, UnaryOperator, Value};
 use datafusion::scalar::ScalarValue;
 
 /// The routing form of a single shard-key expression.
 pub(super) enum RoutedValue {
     /// A canonicalized routing string ready to hash.
     Value(String),
-    /// The expression resolves to SQL NULL (literal `NULL`, a `$N` bound to a
-    /// NULL parameter, or an unresolvable/out-of-range placeholder).
+    /// The expression resolves to SQL NULL (literal `NULL`, or a `$N` bound to a
+    /// NULL parameter).
     Null,
+    /// The expression's value is not determinable here, so it cannot be hashed.
+    /// Carries a client-facing reason; the caller decides whether that means
+    /// rejecting the statement (INSERT — routing on the wrong shard would lose
+    /// the row) or broadcasting it (UPDATE/DELETE — every shard re-evaluates the
+    /// predicate itself, so a broadcast is correct, just unoptimized).
+    Unroutable(String),
 }
 
-/// Resolve the routing string for a shard-key expression. A literal renders the
-/// same way it would be re-serialized into SQL (`expr.to_string()`); a `$N`
-/// placeholder is resolved against the decoded bind parameters so that a
-/// parameterized write hashes to the same shard as the equivalent literal. The
-/// result is canonicalized so that different textual forms of the same numeric
-/// value (`10`, `10.0`, `10.00`) route to the same shard.
+/// Resolve the routing string for a shard-key expression.
+///
+/// Routable forms are those whose value is fixed by the statement plus its bind
+/// parameters: a literal (rendered the way it would be re-serialized into SQL),
+/// a parenthesized such literal, a signed numeric literal, a typed string
+/// constant (`DATE '2022-01-08'`), and a `$N` placeholder resolved against the
+/// decoded parameters so a parameterized write hashes to the same shard as the
+/// equivalent literal. The result is canonicalized so different textual forms of
+/// one value (`10`, `10.0`, `10.00`) route together.
+///
+/// Every other expression is [`RoutedValue::Unroutable`]: `VALUES (1 + 1, …)`
+/// hashed as the text `1 + 1` lands on a different shard from the `2` the row is
+/// stored under, and `nextval('s')` or a bare column reference has no value here
+/// at all.
 pub(super) fn expr_routing_value(expr: &Expr, params: &[ScalarValue]) -> RoutedValue {
-    if let Expr::Nested(inner) = expr {
-        return expr_routing_value(inner, params);
-    }
-    let raw = if let Some(idx) = placeholder_index(expr) {
-        match params.get(idx).and_then(scalar_to_shard_key_string) {
-            Some(s) => s,
-            None => return RoutedValue::Null,
+    match expr {
+        // Parentheses do not change the value.
+        Expr::Nested(inner) => expr_routing_value(inner, params),
+        Expr::Value(v) => value_routing_value(&v.value, expr, params),
+        // `-1` parses as unary minus applied to the literal `1`. sqlparser
+        // re-renders it without a space, so the whole expression's text is a
+        // signed numeric token the canonicalizer understands.
+        Expr::UnaryOp {
+            op: UnaryOperator::Minus | UnaryOperator::Plus,
+            expr: operand,
+        } if matches!(operand.as_ref(), Expr::Value(v) if matches!(v.value, Value::Number(..))) => {
+            RoutedValue::Value(canonicalize_routing_value(expr.to_string()))
         }
-    } else if matches!(expr, Expr::Value(v) if matches!(v.value, Value::Null)) {
-        return RoutedValue::Null;
-    } else {
-        expr.to_string()
-    };
-    RoutedValue::Value(canonicalize_routing_value(raw))
+        // A typed string constant (`DATE '2022-01-08'`, `TIMESTAMP '...'`) routes
+        // on its string body, so the same value spelled bare — `'2022-01-08'`
+        // into a DATE column, which stores the identical value — hashes to the
+        // same shard. Date parameters are rendered to match (see
+        // [`scalar_routing_value`]).
+        Expr::TypedString(typed) => match typed.value.value.clone().into_string() {
+            Some(s) => RoutedValue::Value(canonicalize_routing_value(quote_literal(&s))),
+            None => unroutable_expr(expr),
+        },
+        _ => unroutable_expr(expr),
+    }
+}
+
+/// Routing form of a literal or placeholder in the shard-key position.
+///
+/// `expr` is the enclosing expression, used for its `Display` so a literal
+/// renders exactly as sqlparser would re-serialize it.
+fn value_routing_value(value: &Value, expr: &Expr, params: &[ScalarValue]) -> RoutedValue {
+    match value {
+        Value::Null => RoutedValue::Null,
+        Value::Placeholder(name) => match name
+            .strip_prefix('$')
+            .and_then(|d| d.parse::<usize>().ok())
+            .and_then(|n| n.checked_sub(1))
+        {
+            Some(idx) => match params.get(idx) {
+                Some(scalar) => scalar_routing_value(scalar),
+                // The client bound fewer parameters than the statement uses.
+                // Guessing a shard here would be worse than saying so.
+                None => RoutedValue::Unroutable(format!(
+                    "no value was bound for shard-key parameter {name}"
+                )),
+            },
+            None => RoutedValue::Unroutable(format!(
+                "shard-key placeholder `{name}` is not a positional `$N` parameter"
+            )),
+        },
+        // Literal spellings whose `Display` is the value itself.
+        Value::Number(..)
+        | Value::Boolean(_)
+        | Value::SingleQuotedString(_)
+        | Value::DollarQuotedString(_)
+        | Value::EscapedStringLiteral(_)
+        | Value::UnicodeStringLiteral(_)
+        | Value::NationalStringLiteral(_) => {
+            RoutedValue::Value(canonicalize_routing_value(expr.to_string()))
+        }
+        _ => unroutable_expr(expr),
+    }
+}
+
+/// Reject a shard-key expression the coordinator cannot reduce to a value,
+/// naming it so the client can see what to rewrite.
+fn unroutable_expr(expr: &Expr) -> RoutedValue {
+    RoutedValue::Unroutable(format!(
+        "shard-key expression `{expr}` is not a constant; the coordinator hashes \
+         the shard key before the write reaches a shard, so it must be a literal \
+         or a bind parameter"
+    ))
+}
+
+/// Wrap `s` as a single-quoted SQL string literal, doubling embedded quotes —
+/// the form sqlparser re-serializes a string literal in.
+fn quote_literal(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
 }
 
 /// Expand a scientific-notation numeric token (e.g. `"1e20"`, `"1.5e3"`,
@@ -175,30 +260,25 @@ fn canonicalize_numeric(t: &str) -> Option<String> {
     Some(out)
 }
 
-/// Zero-based parameter index for a `$N` placeholder expression, or `None`.
-fn placeholder_index(expr: &Expr) -> Option<usize> {
-    let Expr::Value(v) = expr else {
-        return None;
-    };
-    let Value::Placeholder(name) = &v.value else {
-        return None;
-    };
-    let n: usize = name.strip_prefix('$')?.parse().ok()?;
-    n.checked_sub(1)
-}
-
-/// Stringify a decoded parameter for shard routing so that it matches the
-/// textual form a literal of the same value would take when re-serialized by
-/// sqlparser: numbers/booleans bare, strings single-quoted. Routing only needs
-/// a stable, collision-resistant key, not a perfectly faithful SQL literal.
-fn scalar_to_shard_key_string(scalar: &ScalarValue) -> Option<String> {
+/// Routing form of a decoded bind parameter.
+///
+/// Only types whose bound form and literal form agree are routable: a parameter
+/// and a literal of the same value must hash to one shard, or a parameterized
+/// INSERT and a literal point lookup of the same row disagree about which shard
+/// holds it. `ScalarValue`'s `Display` is a *debug-ish* rendering, not a SQL
+/// literal, so each accepted type is spelled out here rather than falling back to
+/// it: a `Timestamp` displays as its raw epoch count (and a different count per
+/// `TimeUnit`), `Interval` as a Rust struct, `Binary` as hex — none of which any
+/// literal of the same value can match. Those are rejected.
+fn scalar_routing_value(scalar: &ScalarValue) -> RoutedValue {
     if scalar.is_null() {
-        return None;
+        return RoutedValue::Null;
     }
     let s = match scalar {
+        // Text: single-quoted, as sqlparser re-serializes a string literal.
         ScalarValue::Utf8(Some(s))
         | ScalarValue::LargeUtf8(Some(s))
-        | ScalarValue::Utf8View(Some(s)) => format!("'{}'", s.replace('\'', "''")),
+        | ScalarValue::Utf8View(Some(s)) => quote_literal(s),
         ScalarValue::Boolean(Some(b)) => {
             if *b {
                 "true".to_string()
@@ -206,36 +286,72 @@ fn scalar_to_shard_key_string(scalar: &ScalarValue) -> Option<String> {
                 "false".to_string()
             }
         }
-        // `Decimal128` Display renders the raw `(mantissa, precision, scale)`
-        // debug form, not a numeric literal, so format it as a plain decimal to
-        // match how an equivalent SQL literal is re-serialized.
-        ScalarValue::Decimal128(Some(v), _, scale) => decimal_to_plain_string(*v, *scale),
-        other => other.to_string(),
+        // Integers and floats already display as a bare numeric token, which the
+        // canonicalizer folds to the same form as the equivalent literal.
+        ScalarValue::Int8(Some(_))
+        | ScalarValue::Int16(Some(_))
+        | ScalarValue::Int32(Some(_))
+        | ScalarValue::Int64(Some(_))
+        | ScalarValue::UInt8(Some(_))
+        | ScalarValue::UInt16(Some(_))
+        | ScalarValue::UInt32(Some(_))
+        | ScalarValue::UInt64(Some(_))
+        | ScalarValue::Float16(Some(_))
+        | ScalarValue::Float32(Some(_))
+        | ScalarValue::Float64(Some(_)) => scalar.to_string(),
+        // `Decimal*` Display renders the raw `(mantissa, precision, scale)` debug
+        // form, not a numeric literal, so format it as a plain decimal to match
+        // how an equivalent SQL literal is re-serialized.
+        ScalarValue::Decimal128(Some(v), _, scale) => {
+            scaled_plain_string(*v < 0, &v.unsigned_abs().to_string(), *scale)
+        }
+        ScalarValue::Decimal256(Some(v), _, scale) => {
+            let text = v.to_string();
+            match text.strip_prefix('-') {
+                Some(digits) => scaled_plain_string(true, digits, *scale),
+                None => scaled_plain_string(false, &text, *scale),
+            }
+        }
+        // A date displays as `YYYY-MM-DD`; quoting it matches the `DATE '...'`
+        // literal form (see [`expr_routing_value`]), so both spellings of one date
+        // route together.
+        ScalarValue::Date32(Some(_)) | ScalarValue::Date64(Some(_)) => {
+            quote_literal(&scalar.to_string())
+        }
+        other => {
+            return RoutedValue::Unroutable(format!(
+                "a shard-key bind parameter of type {} cannot be routed: its bound \
+                 form and its SQL literal form do not agree, so the row would be \
+                 placed on a shard no lookup of the same value would search; send \
+                 the shard key as a literal instead",
+                other.data_type()
+            ));
+        }
     };
-    Some(s)
+    RoutedValue::Value(canonicalize_routing_value(s))
 }
 
-/// Render a decimal mantissa scaled by `10^-scale` as a plain decimal string
-/// (e.g. mantissa `123456`, scale `3` -> `"123.456"`) using exact integer ops.
-fn decimal_to_plain_string(mantissa: i128, scale: i8) -> String {
-    if scale <= 0 {
+/// Render `digits` (the unsigned decimal digits of a mantissa) scaled by
+/// `10^-scale` as a plain decimal string (e.g. `"123456"`, scale `3` ->
+/// `"123.456"`) using exact string ops — never a float round-trip.
+fn scaled_plain_string(neg: bool, digits: &str, scale: i8) -> String {
+    let body = if scale <= 0 {
         // Zero/negative scale multiplies by 10^-scale; append trailing zeros.
-        let mut s = mantissa.to_string();
-        if mantissa != 0 {
+        let mut s = digits.to_string();
+        if digits.bytes().any(|b| b != b'0') {
             s.extend(std::iter::repeat_n('0', (-scale) as usize));
         }
-        return s;
-    }
-    let neg = mantissa < 0;
-    let digits = mantissa.unsigned_abs().to_string();
-    let scale = scale as usize;
-    let s = if digits.len() > scale {
-        let point = digits.len() - scale;
-        format!("{}.{}", &digits[..point], &digits[point..])
+        s
     } else {
-        format!("0.{}{}", "0".repeat(scale - digits.len()), digits)
+        let scale = scale as usize;
+        if digits.len() > scale {
+            let point = digits.len() - scale;
+            format!("{}.{}", &digits[..point], &digits[point..])
+        } else {
+            format!("0.{}{}", "0".repeat(scale - digits.len()), digits)
+        }
     };
-    if neg { format!("-{s}") } else { s }
+    if neg { format!("-{body}") } else { body }
 }
 
 #[cfg(test)]

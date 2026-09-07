@@ -70,6 +70,13 @@ Client SQL (DML)
 See [Data Distribution — Write path](data-distribution.md#replication) for the
 quorum and tail-replication details.
 
+A write whose rows do not appear in the statement itself — `INSERT ... SELECT`,
+`CREATE TABLE ... AS SELECT`, `COPY ... FROM` — cannot be sharded as written, because
+the coordinator decides placement from the shard key's value. Those forms run their
+source first (the read path above, or a CSV file on the coordinator) and re-enter this
+write path as ordinary rows, so placement and replication work exactly as they do for
+a hand-written `INSERT`.
+
 ## DDL path
 
 DDL (CREATE/ALTER/DROP TABLE) also bypasses Ballista. The coordinator parses the

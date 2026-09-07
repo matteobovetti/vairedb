@@ -4,5 +4,5 @@
 mod replication;
 mod retry_config;
 
-pub use replication::ReplicationManager;
+pub use replication::{BatchStatement, ReplicationManager};
 pub use retry_config::RetryConfig;

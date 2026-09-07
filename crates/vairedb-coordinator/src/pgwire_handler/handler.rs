@@ -13,11 +13,13 @@ use std::sync::Arc;
 
 use arrow_pg::datatypes::df::deserialize_parameters;
 use async_trait::async_trait;
+use datafusion::arrow::array::RecordBatch;
+use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::common::ParamValues;
+use datafusion::common::metadata::ScalarAndMetadata;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::scalar::ScalarValue;
-use datafusion::sql::parser::Statement as DFStatement;
 use futures::sink::Sink;
 use pgwire::api::auth::StartupHandler;
 use pgwire::api::auth::noop::NoopStartupHandler;
@@ -42,9 +44,11 @@ use crate::pgwire_handler::catalog_routing::{catalog_table_names, references_cat
 use crate::pgwire_handler::encoding;
 use crate::pgwire_handler::error_enrichment::{ErrorContext, enrich_generic_error, make_vdb_error};
 use crate::pgwire_handler::parser::{self, VairePrepared, VaireQueryParser};
-use crate::query_router::{self, QueryType};
+use crate::pgwire_handler::query_router::{self, QueryType};
+use crate::pgwire_handler::sequences;
+use crate::pgwire_handler::session::SessionState;
+use crate::pgwire_handler::user_types;
 use crate::replication::ReplicationManager;
-use crate::sql_compat;
 use crate::write_router::WriteRouter;
 
 /// Bundles the per-connection handlers required by `pgwire`'s server interface
@@ -59,7 +63,8 @@ impl VaireDbHandlers {
     /// Construct the handler set, wiring the catalog, replication manager, gRPC
     /// channel pool, and the two DataFusion contexts into a shared query handler.
     /// `default_replication_factor` applies to tables created without an explicit
-    /// factor.
+    /// factor; `allow_cross_shard_transactions` lets a transaction block spanning
+    /// shard groups commit non-atomically instead of being refused.
     pub fn new(
         catalog: Arc<MetadataCatalog>,
         replication_manager: Arc<ReplicationManager>,
@@ -67,12 +72,14 @@ impl VaireDbHandlers {
         session_ctx: Arc<SessionContext>,
         local_ctx: Arc<SessionContext>,
         default_replication_factor: u32,
+        allow_cross_shard_transactions: bool,
     ) -> Self {
         let catalog_table_names = Arc::new(catalog_table_names(&local_ctx));
         let query_parser = Arc::new(VaireQueryParser::new(
             Arc::clone(&session_ctx),
             Arc::clone(&local_ctx),
             Arc::clone(&catalog_table_names),
+            Arc::clone(&catalog),
         ));
         Self {
             query_handler: Arc::new(VaireDbQueryHandler {
@@ -83,6 +90,7 @@ impl VaireDbHandlers {
                 session_ctx,
                 local_ctx,
                 default_replication_factor,
+                allow_cross_shard_transactions,
                 query_parser,
                 catalog_table_names,
             }),
@@ -118,10 +126,24 @@ impl PgWireServerHandlers for VaireDbHandlers {
 }
 
 /// Build the error returned for a statement the coordinator does not implement
-/// (transaction control, SET/SHOW, TRUNCATE, CREATE VIEW, EXPLAIN, etc.). These
-/// used to fall through to a fake `OK`, silently misleading clients; now they
-/// fail with `FeatureNotSupported` (SQLSTATE `0A000`) naming the command.
+/// (SET/SHOW, CREATE VIEW, EXPLAIN, etc.). These used to fall through to a fake
+/// `OK`, silently misleading clients; now they fail with `FeatureNotSupported`
+/// (SQLSTATE `0A000`) naming the command.
 fn unsupported_statement_error(stmt: &crate::sqlparser::ast::Statement) -> PgWireError {
+    // Sequences and user-defined types are the commands here that are refused by
+    // decision rather than by not being built yet, so they answer with the reason
+    // instead of a bare "not supported" a client would reasonably read as "not
+    // yet".
+    if matches!(
+        stmt,
+        crate::sqlparser::ast::Statement::CreateSequence { .. }
+    ) {
+        return sequences::sequence_error("CREATE SEQUENCE");
+    }
+    if let Some(command) = user_types::refused_user_type(stmt) {
+        return user_types::user_type_error(command);
+    }
+
     make_vdb_error(
         VdbErrorCode::FeatureNotSupported,
         format!(
@@ -133,18 +155,28 @@ fn unsupported_statement_error(stmt: &crate::sqlparser::ast::Statement) -> PgWir
 
 /// Human-readable command name for an unsupported statement, used in the error
 /// message so the client learns which command was rejected.
+///
+/// The fallback `"this statement"` is a last resort, not a default: a client that
+/// gets it cannot tell which of the statements it sent was refused. Every command
+/// the gap analysis lists as reaching this rejection point is named here.
 fn unsupported_statement_label(stmt: &crate::sqlparser::ast::Statement) -> &'static str {
     use crate::sqlparser::ast::Statement;
+
+    // The user-type family names itself in one place, so the label here and the
+    // explained refusal above cannot drift apart.
+    if let Some(command) = user_types::refused_user_type(stmt) {
+        return command;
+    }
+
     match stmt {
-        Statement::StartTransaction { .. } => "transaction control (BEGIN)",
-        Statement::Commit { .. } => "transaction control (COMMIT)",
-        Statement::Rollback { .. } => "transaction control (ROLLBACK)",
-        Statement::Savepoint { .. } | Statement::ReleaseSavepoint { .. } => "SAVEPOINT",
         Statement::Set(_) => "SET",
         Statement::ShowVariable { .. } => "SHOW",
-        Statement::Truncate { .. } => "TRUNCATE",
-        Statement::CreateView { .. } => "CREATE VIEW",
         Statement::Explain { .. } | Statement::ExplainTable { .. } => "EXPLAIN",
+        Statement::CreateSequence { .. } => "CREATE SEQUENCE",
+        Statement::Comment { .. } => "COMMENT ON",
+        Statement::Analyze { .. } => "ANALYZE",
+        Statement::Call(_) => "CALL",
+        Statement::Use(_) => "USE",
         _ => "this statement",
     }
 }
@@ -167,10 +199,60 @@ pub(crate) struct VaireDbQueryHandler {
     pub(super) session_ctx: Arc<SessionContext>,
     pub(super) local_ctx: Arc<SessionContext>,
     pub(super) default_replication_factor: u32,
+    /// When set, a transaction block whose writes span shard groups is committed
+    /// group by group instead of being refused — faster to adopt, but a failure
+    /// part-way through leaves the earlier groups applied.
+    pub(super) allow_cross_shard_transactions: bool,
     query_parser: Arc<VaireQueryParser>,
     /// Lowercased bare names of `pg_catalog` tables, used to route unqualified
     /// catalog introspection (e.g. `pg_class`) to `local_ctx`.
     pub(super) catalog_table_names: Arc<std::collections::HashSet<String>>,
+}
+
+#[cfg(test)]
+impl VaireDbQueryHandler {
+    /// A handler wired to an empty catalog and no reachable core nodes, for unit
+    /// tests of the paths that decide *whether* to run a statement. Anything that
+    /// actually ships a write will fail to resolve a shard, which is what makes
+    /// this cheap enough to build per test.
+    pub(super) fn for_tests(allow_cross_shard_transactions: bool) -> Self {
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static COUNTER: AtomicU32 = AtomicU32::new(0);
+
+        let path = std::env::temp_dir().join(format!(
+            "vairedb_test_handler_{}_{}.redb",
+            std::process::id(),
+            COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let catalog = Arc::new(MetadataCatalog::open(path.to_str().unwrap()).unwrap());
+        let pool = Arc::new(ChannelPool::new());
+        let replication_manager = Arc::new(ReplicationManager::new(
+            Arc::clone(&catalog),
+            Arc::clone(&pool),
+            crate::replication::RetryConfig::default(),
+        ));
+        let session_ctx = Arc::new(SessionContext::new());
+        let local_ctx = Arc::new(SessionContext::new());
+        let catalog_table_names = Arc::new(catalog_table_names(&local_ctx));
+
+        Self {
+            write_router: WriteRouter::new(Arc::clone(&catalog)),
+            query_parser: Arc::new(VaireQueryParser::new(
+                Arc::clone(&session_ctx),
+                Arc::clone(&local_ctx),
+                Arc::clone(&catalog_table_names),
+                Arc::clone(&catalog),
+            )),
+            catalog,
+            replication_manager,
+            pool,
+            session_ctx,
+            local_ctx,
+            default_replication_factor: 1,
+            allow_cross_shard_transactions,
+            catalog_table_names,
+        }
+    }
 }
 
 #[async_trait]
@@ -178,20 +260,21 @@ impl SimpleQueryHandler for VaireDbQueryHandler {
     /// Parse and execute every statement in a simple-protocol query string,
     /// returning one response per statement. Returns a `SqlSyntaxError` if parsing
     /// fails. No bind parameters are possible on this path.
-    async fn do_query<C>(&self, _client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
+    async fn do_query<C>(&self, client: &mut C, query: &str) -> PgWireResult<Vec<Response>>
     where
         C: ClientInfo + ClientPortalStore + Sink<PgWireBackendMessage> + Unpin + Send + Sync,
         C::PortalStore: PortalStore,
         C::Error: Debug,
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
-        let statements = sql_compat::parse_sql(query)
+        let session = SessionState::for_client(client);
+        let statements = parser::parse_sql(query)
             .map_err(|e| make_vdb_error(VdbErrorCode::SqlSyntaxError, e.to_string()))?;
 
         let mut responses = Vec::with_capacity(statements.len());
 
         for stmt in &statements {
-            responses.push(self.execute_one_statement(stmt).await?);
+            responses.push(self.execute_one_statement(stmt, &session).await?);
         }
 
         Ok(responses)
@@ -213,13 +296,14 @@ impl ExtendedQueryHandler for VaireDbQueryHandler {
     /// an empty statement.
     async fn do_query<C>(
         &self,
-        _client: &mut C,
+        client: &mut C,
         portal: &Portal<Self::Statement>,
         _max_rows: usize,
     ) -> PgWireResult<Response>
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
+        let session = SessionState::for_client(client);
         let prepared = &portal.statement.statement;
         let Some(stmt) = &prepared.stmt else {
             return Ok(Response::EmptyQuery);
@@ -227,19 +311,32 @@ impl ExtendedQueryHandler for VaireDbQueryHandler {
 
         if prepared.query_type == QueryType::Select {
             // Read path: bind typed parameters into the cached logical plan.
-            let plan = prepared.plan.as_ref().ok_or_else(|| {
-                make_vdb_error(VdbErrorCode::InternalError, "missing plan for SELECT")
-            })?;
-            let param_values = self.decode_param_values(portal)?;
-            return self
-                .execute_select_plan(prepared, plan, param_values, &portal.result_column_format)
+            let result = async {
+                self.check_transaction_allows(stmt, &prepared.query_type, &session)
+                    .await?;
+                let plan = prepared.plan.as_ref().ok_or_else(|| {
+                    make_vdb_error(VdbErrorCode::InternalError, "missing plan for SELECT")
+                })?;
+                let param_values = self.decode_param_values(portal)?;
+                self.execute_select_plan(prepared, plan, param_values, &portal.result_column_format)
+                    .await
+            }
+            .await;
+            self.note_failure_in_transaction(result.is_err(), &session)
                 .await;
+            return result;
         }
 
         // Write/DDL path: parameters (if any) are bound on DuckDB. Decode them to
         // ScalarValues for shard routing and transport.
-        let params = self.decode_param_scalars(portal)?;
-        self.execute_write_statement(stmt, &prepared.query_type, &params)
+        let params = match self.decode_param_scalars(portal) {
+            Ok(params) => params,
+            Err(e) => {
+                session.transaction().await.mark_failed();
+                return Err(e);
+            }
+        };
+        self.execute_write_statement(stmt, &prepared.query_type, &params, &session)
             .await
     }
 
@@ -293,7 +390,7 @@ impl VaireDbQueryHandler {
     /// queries execute on `local_ctx` (plain DataFusion) rather than the Ballista
     /// `session_ctx`, since they are metadata — not sharded user data — and frequently join
     /// across catalog tables in ways that should not be distributed.
-    fn is_catalog_query(&self, stmt: &crate::sqlparser::ast::Statement) -> bool {
+    pub(super) fn is_catalog_query(&self, stmt: &crate::sqlparser::ast::Statement) -> bool {
         references_catalog_schema(stmt, &self.catalog_table_names)
     }
 
@@ -302,36 +399,106 @@ impl VaireDbQueryHandler {
     async fn execute_one_statement(
         &self,
         stmt: &crate::sqlparser::ast::Statement,
+        session: &SessionState,
     ) -> PgWireResult<Response> {
         let query_type = query_router::classify_statement(stmt);
-        match query_type {
-            QueryType::Select => self.handle_select(stmt).await,
-            QueryType::Insert | QueryType::Update | QueryType::Delete => {
-                self.handle_dml(stmt, &query_type, &[]).await
+        let result = async {
+            if query_type == QueryType::TransactionControl {
+                return self.handle_transaction_control(stmt, session).await;
             }
-            QueryType::CreateTable => self.handle_create_table(stmt).await,
-            QueryType::DropTable => self.handle_drop_table(stmt).await,
-            QueryType::AlterTable => self.handle_alter_table(stmt).await,
-            QueryType::Other => Err(unsupported_statement_error(stmt)),
+            sequences::reject_sequence_use(stmt)?;
+            self.check_transaction_allows(stmt, &query_type, session)
+                .await?;
+            self.reject_view_as_table(stmt, &query_type)?;
+            match query_type {
+                QueryType::Select => self.handle_select(stmt).await,
+                QueryType::Insert | QueryType::Update | QueryType::Delete => {
+                    self.handle_dml(stmt, &query_type, &[], session).await
+                }
+                QueryType::Merge => self.handle_merge(stmt, &[]).await,
+                QueryType::CreateTable => self.handle_create_table(stmt, session).await,
+                QueryType::DropTable => self.handle_drop_table(stmt).await,
+                QueryType::AlterTable => self.handle_alter_table(stmt).await,
+                QueryType::TruncateTable => self.handle_truncate(stmt).await,
+                QueryType::CreateIndex => self.handle_create_index(stmt).await,
+                QueryType::DropIndex => self.handle_drop_index(stmt).await,
+                QueryType::CreateView => self.handle_create_view(stmt).await,
+                QueryType::AlterView => self.handle_alter_view(stmt).await,
+                QueryType::DropView => self.handle_drop_view(stmt).await,
+                QueryType::CreateSchema => self.handle_create_schema(stmt).await,
+                QueryType::DropSchema => self.handle_drop_schema(stmt).await,
+                QueryType::Copy => self.handle_copy(stmt, session).await,
+                QueryType::TransactionControl | QueryType::Other => {
+                    Err(unsupported_statement_error(stmt))
+                }
+            }
         }
+        .await;
+
+        self.note_failure_in_transaction(result.is_err(), session)
+            .await;
+        result
     }
 
     /// Dispatch a write/DDL statement from the extended protocol, carrying any
-    /// decoded bind parameters into the write path.
+    /// decoded bind parameters into the write path. Transaction control arrives
+    /// here too: it is not a read, so the extended handler routes it this way.
     async fn execute_write_statement(
         &self,
         stmt: &crate::sqlparser::ast::Statement,
         query_type: &QueryType,
         params: &[ScalarValue],
+        session: &SessionState,
     ) -> PgWireResult<Response> {
-        match query_type {
-            QueryType::Insert | QueryType::Update | QueryType::Delete => {
-                self.handle_dml(stmt, query_type, params).await
+        let result = async {
+            if *query_type == QueryType::TransactionControl {
+                return self.handle_transaction_control(stmt, session).await;
             }
-            QueryType::CreateTable => self.handle_create_table(stmt).await,
-            QueryType::DropTable => self.handle_drop_table(stmt).await,
-            QueryType::AlterTable => self.handle_alter_table(stmt).await,
-            QueryType::Select | QueryType::Other => Err(unsupported_statement_error(stmt)),
+            sequences::reject_sequence_use(stmt)?;
+            self.check_transaction_allows(stmt, query_type, session)
+                .await?;
+            self.reject_view_as_table(stmt, query_type)?;
+            match query_type {
+                QueryType::Insert | QueryType::Update | QueryType::Delete => {
+                    self.handle_dml(stmt, query_type, params, session).await
+                }
+                QueryType::Merge => self.handle_merge(stmt, params).await,
+                QueryType::CreateTable => self.handle_create_table(stmt, session).await,
+                QueryType::DropTable => self.handle_drop_table(stmt).await,
+                QueryType::AlterTable => self.handle_alter_table(stmt).await,
+                QueryType::TruncateTable => self.handle_truncate(stmt).await,
+                QueryType::CreateIndex => self.handle_create_index(stmt).await,
+                QueryType::DropIndex => self.handle_drop_index(stmt).await,
+                QueryType::CreateView => self.handle_create_view(stmt).await,
+                QueryType::AlterView => self.handle_alter_view(stmt).await,
+                QueryType::DropView => self.handle_drop_view(stmt).await,
+                QueryType::CreateSchema => self.handle_create_schema(stmt).await,
+                QueryType::DropSchema => self.handle_drop_schema(stmt).await,
+                QueryType::Copy => self.handle_copy(stmt, session).await,
+                QueryType::Select | QueryType::TransactionControl | QueryType::Other => {
+                    Err(unsupported_statement_error(stmt))
+                }
+            }
+        }
+        .await;
+
+        self.note_failure_in_transaction(result.is_err(), session)
+            .await;
+        result
+    }
+
+    /// Abort the client's transaction block when `failed`, matching PostgreSQL:
+    /// after an error inside a block, every following statement is refused with
+    /// `25P02` until the client ends the block or rolls back to a savepoint. A
+    /// no-op outside a block, and for a statement that already ended the block (a
+    /// failed `COMMIT` leaves the session idle).
+    ///
+    /// Takes a `bool` rather than the response: a `Response` is `Send` but not
+    /// `Sync`, so borrowing one across this `await` would make the enclosing
+    /// handler future non-`Send`.
+    async fn note_failure_in_transaction(&self, failed: bool, session: &SessionState) {
+        if failed {
+            session.transaction().await.mark_failed();
         }
     }
 
@@ -396,6 +563,54 @@ impl VaireDbQueryHandler {
         encoding::encode_dataframe_response(df, result_format, &select_ctx).await
     }
 
+    /// Plan `query` on the read path, bind `params` into it, run it, and collect
+    /// every row. Returns the result schema alongside the batches, so a caller
+    /// can check the shape of a result that turned out to be empty.
+    ///
+    /// This is how a write whose rows come from a query gets rows it can route:
+    /// the source is read *to completion first*, then written. That ordering is
+    /// the snapshot — `INSERT INTO t SELECT * FROM t` reads the old contents of
+    /// `t` and terminates, rather than consuming rows it is appending.
+    ///
+    /// The whole result is held in memory, exactly as the read path already holds
+    /// it to encode a response for the same query.
+    pub(super) async fn collect_query_rows(
+        &self,
+        query: &crate::sqlparser::ast::Statement,
+        params: &[ScalarValue],
+    ) -> PgWireResult<(SchemaRef, Vec<RecordBatch>)> {
+        let is_catalog = self.is_catalog_query(query);
+        let ctx = if is_catalog {
+            &self.local_ctx
+        } else {
+            &self.session_ctx
+        };
+
+        let (plan, select_ctx) = parser::plan_select(ctx, query, is_catalog, &self.catalog).await?;
+        let plan = if params.is_empty() {
+            plan
+        } else {
+            let bindings = params
+                .iter()
+                .map(|value| ScalarAndMetadata::new(value.clone(), None))
+                .collect();
+            plan.replace_params_with_values(&ParamValues::List(bindings))
+                .map_err(|e| enrich_generic_error(&e, &select_ctx))?
+        };
+
+        let df = ctx
+            .execute_logical_plan(plan)
+            .await
+            .map_err(|e| enrich_generic_error(&e, &select_ctx))?;
+        let schema = Arc::new(df.schema().as_arrow().clone());
+        let batches = df
+            .collect()
+            .await
+            .map_err(|e| enrich_generic_error(&e, &select_ctx))?;
+
+        Ok((schema, batches))
+    }
+
     /// Execute a simple-protocol SELECT, choosing the local catalog context for
     /// introspection queries and the distributed context otherwise, and encode
     /// the result as text (the only format the simple protocol uses).
@@ -403,38 +618,14 @@ impl VaireDbQueryHandler {
         &self,
         stmt: &crate::sqlparser::ast::Statement,
     ) -> PgWireResult<Response> {
-        // Translate PG TO_CHAR format strings to strftime specifiers so DataFusion's
-        // native to_char formats correctly on the read path.
-        let mut stmt_read = stmt.clone();
-        sql_compat::transform_to_char_format_for_read(&mut stmt_read);
-
         let is_catalog = self.is_catalog_query(stmt);
-        // User schemas are flat qualifiers: collapse `schema.tbl` to the bare
-        // registered name. Skip catalog queries so `pg_catalog.*` etc. keep their
-        // qualifier for the local catalog context.
-        if !is_catalog {
-            sql_compat::collapse_schema_qualified_relations(&mut stmt_read);
-        }
-        let stmt = &stmt_read;
-
         let ctx = if is_catalog {
             &self.local_ctx
         } else {
             &self.session_ctx
         };
 
-        let select_ctx = query_router::extract_select_table_name(stmt)
-            .map(|t| ErrorContext::for_table(&t))
-            .unwrap_or_default();
-
-        // Plan from the AST instead of `ctx.sql(&rendered)`: rendering back to text
-        // is lossy and made DataFusion re-parse with its default (generic) dialect,
-        // so the reachable expression surface was the intersection of two dialects.
-        let plan = ctx
-            .state()
-            .statement_to_plan(DFStatement::Statement(Box::new(stmt.clone())))
-            .await
-            .map_err(|e| enrich_generic_error(&e, &select_ctx))?;
+        let (plan, select_ctx) = parser::plan_select(ctx, stmt, is_catalog, &self.catalog).await?;
         let df = ctx
             .execute_logical_plan(plan)
             .await
@@ -442,5 +633,71 @@ impl VaireDbQueryHandler {
 
         // The simple query protocol always returns results in text format.
         encoding::encode_dataframe_response(df, &Format::UnifiedText, &select_ctx).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn label_of(sql: &str) -> &'static str {
+        let stmt = parser::parse_sql(sql)
+            .unwrap_or_else(|e| panic!("`{sql}` should parse: {e}"))
+            .into_iter()
+            .next()
+            .unwrap();
+        unsupported_statement_label(&stmt)
+    }
+
+    /// Every statement the gap analysis pins to the classification rejection point
+    /// must be named in the error, so a client can tell which command was refused.
+    #[test]
+    fn rejected_commands_are_named_in_the_error() {
+        for (sql, want) in [
+            ("SET client_encoding = 'UTF8'", "SET"),
+            ("SHOW client_encoding", "SHOW"),
+            ("EXPLAIN SELECT 1", "EXPLAIN"),
+            ("CREATE SEQUENCE s", "CREATE SEQUENCE"),
+            ("CREATE TYPE ty AS ENUM ('a', 'b')", "CREATE TYPE"),
+            ("CREATE DOMAIN d AS INTEGER", "CREATE DOMAIN"),
+            ("ALTER TYPE ty ADD VALUE 'c'", "ALTER TYPE"),
+            ("COMMENT ON TABLE t IS 'x'", "COMMENT ON"),
+            ("ANALYZE t", "ANALYZE"),
+            ("CALL p()", "CALL"),
+            ("USE db", "USE"),
+        ] {
+            assert_eq!(label_of(sql), want, "wrong label for `{sql}`");
+        }
+    }
+
+    #[test]
+    fn the_error_message_quotes_the_command_name() {
+        let stmt = parser::parse_sql("COMMENT ON TABLE t IS 'x'")
+            .unwrap()
+            .into_iter()
+            .next()
+            .unwrap();
+        let msg = unsupported_statement_error(&stmt).to_string();
+        assert!(msg.contains("COMMENT ON"), "got: {msg}");
+    }
+
+    /// The two decided limitations answer with the reason, not with the generic
+    /// "not supported" — which for them would read as "not yet".
+    #[test]
+    fn a_decided_limitation_explains_itself() {
+        for (sql, reason) in [
+            ("CREATE SEQUENCE s", "no sequences"),
+            ("CREATE TYPE ty AS ENUM ('a')", "no user-defined types"),
+            ("CREATE DOMAIN d AS INTEGER", "no user-defined types"),
+            ("ALTER TYPE ty ADD VALUE 'c'", "no user-defined types"),
+        ] {
+            let stmt = parser::parse_sql(sql)
+                .unwrap_or_else(|e| panic!("`{sql}` should parse: {e}"))
+                .into_iter()
+                .next()
+                .unwrap();
+            let msg = unsupported_statement_error(&stmt).to_string();
+            assert!(msg.contains(reason), "`{sql}` got: {msg}");
+        }
     }
 }

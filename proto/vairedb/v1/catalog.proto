@@ -34,6 +34,131 @@ message TableMeta {
   // these columns are HMAC-SHA256 hashed in the coordinator before any write
   // reaches a core node. Empty when the table has no anonymized columns.
   map<string, string> anonymized_columns = 8;
+
+  // Secondary indexes on this table, in creation order. Each one exists once
+  // per shard, named "{index_name}_shard{n}" on "{table_name}_shard{n}", so
+  // DROP INDEX can find the table an index belongs to from its name alone.
+  repeated IndexMeta indexes = 9;
+
+  // Table constraints, in declaration order. Every one is enforced by each
+  // shard on its own rows, so only the kinds that are globally correct that way
+  // are ever recorded here; see ConstraintMeta.
+  repeated ConstraintMeta constraints = 10;
+}
+
+// ---------------------------------------------------------------------------
+// IndexMeta — one secondary index of a table, stored inside its TableMeta.
+// Index names are unique cluster-wide, mirroring PostgreSQL, where an index
+// shares the relation namespace with tables.
+// ---------------------------------------------------------------------------
+
+message IndexMeta {
+  // Canonical index name as the client spelled it, without the shard suffix.
+  string name = 1;
+
+  // The indexed columns, canonical and in index order. Always real columns of
+  // the table: an index over an expression is refused, so this can be compared
+  // against the column list an ALTER TABLE is about to change.
+  repeated string columns = 2;
+
+  // UNIQUE indexes are only accepted when `columns` includes the shard key:
+  // equal keys always hash to one shard, so per-shard enforcement is then
+  // globally correct.
+  bool unique = 3;
+}
+
+// ---------------------------------------------------------------------------
+// ConstraintMeta — one table constraint, stored inside its TableMeta.
+//
+// Constraint names share the relation namespace with tables and indexes, the
+// way a PostgreSQL constraint's backing index does, so ALTER TABLE ... DROP
+// CONSTRAINT can find the table a constraint belongs to from its name alone.
+// ---------------------------------------------------------------------------
+
+message ConstraintMeta {
+  // Canonical constraint name, without the shard suffix. Generated from the
+  // table and columns when the client did not name the constraint, so every
+  // recorded constraint can be named by a later DROP CONSTRAINT.
+  string name = 1;
+
+  ConstraintKind kind = 2;
+
+  // The constrained columns, canonical and in declaration order. For a CHECK
+  // these are the table columns its expression mentions, so a column change can
+  // tell whether the constraint still stands.
+  repeated string columns = 3;
+
+  // The constraint as SQL, without the `CONSTRAINT <name>` prefix — e.g.
+  // "CHECK (amount > 0)" or "UNIQUE (customer_id)". This is what the shards were
+  // given, kept so the catalog can report the constraint back exactly as it is
+  // enforced.
+  string definition = 4;
+
+  // Whether the constraint is enforced by a per-shard unique index named after
+  // it, rather than by a constraint clause in the shard's table definition.
+  // Only ALTER TABLE ... ADD CONSTRAINT produces those, because that is the only
+  // uniqueness the shards' engine can add to a table that already exists — and
+  // it is what makes the constraint droppable again.
+  bool index_backed = 5;
+}
+
+// The constraint kinds VaireDB records. FOREIGN KEY is absent on purpose: it
+// cannot be enforced across shards, so it is refused rather than stored.
+enum ConstraintKind {
+  CONSTRAINT_KIND_UNSPECIFIED = 0;
+  CONSTRAINT_KIND_CHECK = 1;
+  CONSTRAINT_KIND_UNIQUE = 2;
+  CONSTRAINT_KIND_PRIMARY_KEY = 3;
+}
+
+// ---------------------------------------------------------------------------
+// ViewMeta — stored in redb table `views`, keyed by view_name.
+//
+// A view is the one relation VaireDB keeps entirely in the coordinator: nothing
+// is broadcast, because a per-shard view would be a query over one shard's rows
+// and the read path would have to union them back. Only the query text is
+// stored, and it is re-planned on every use, so a view can never go stale
+// against the tables it reads — and a base-table change surfaces where it
+// happened rather than being silently absorbed.
+//
+// View names share the relation namespace with tables and indexes, as in
+// PostgreSQL.
+// ---------------------------------------------------------------------------
+
+message ViewMeta {
+  // Canonical view name, the catalog key.
+  string view_name = 1;
+
+  // The view's query, as SQL. Re-parsed and planned every time the view is
+  // read, so this is the whole definition — there is no cached plan and no
+  // column list derived from one.
+  string definition = 2;
+
+  // The explicit column aliases the client gave (`CREATE VIEW v (a, b) AS ...`),
+  // canonical and in order. Empty when the client named none, in which case the
+  // query's own output names are the view's columns.
+  repeated string columns = 3;
+
+  google.protobuf.Timestamp created_at = 4;
+}
+
+// ---------------------------------------------------------------------------
+// SchemaMeta — stored in redb table `schemas`, keyed by schema_name.
+//
+// A schema is a pure coordinator-side namespace: it holds no rows and is never
+// broadcast, because the core nodes see only the physical per-shard tables whose
+// names already carry the schema. Recording one exists so a table can only be
+// created in a namespace someone asked for, the way PostgreSQL requires.
+//
+// `public` is not stored: it is the default namespace and always exists, so a
+// relation with no qualifier and one qualified `public.` are the same relation.
+// ---------------------------------------------------------------------------
+
+message SchemaMeta {
+  // Canonical schema name, the catalog key.
+  string schema_name = 1;
+
+  google.protobuf.Timestamp created_at = 2;
 }
 
 // ---------------------------------------------------------------------------

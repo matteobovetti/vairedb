@@ -12,7 +12,7 @@ rust-version = "1.95"
 repository = "https://github.com/matteobovetti/vairedb"
 homepage = "https://vairedb.io"
 license = "Apache-2.0"
-version = "0.1.0"
+version = "0.2.0"
 
 [workspace.dependencies]
 # Async runtime

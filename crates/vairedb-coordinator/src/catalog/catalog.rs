@@ -10,7 +10,7 @@ use prost::Message;
 use redb::{Database, ReadableDatabase, ReadableTable, TableDefinition};
 
 use vairedb_common::proto::vairedb::v1::{
-    AnonymizationSecret, NodeMeta, NodeState, ShardMeta, TableMeta,
+    AnonymizationSecret, NodeMeta, NodeState, SchemaMeta, ShardMeta, TableMeta, ViewMeta,
 };
 
 use crate::error::{CoordinatorError, Result};
@@ -19,6 +19,8 @@ use crate::util::{logical_shard_id, now_unix_secs};
 type RecordTable = TableDefinition<'static, &'static str, &'static [u8]>;
 
 const TABLES_TABLE: RecordTable = TableDefinition::new("tables");
+const VIEWS_TABLE: RecordTable = TableDefinition::new("views");
+const SCHEMAS_TABLE: RecordTable = TableDefinition::new("schemas");
 const SHARDS_TABLE: RecordTable = TableDefinition::new("shards");
 const NODES_TABLE: RecordTable = TableDefinition::new("nodes");
 const ANONYMIZATION_SECRET_TABLE: RecordTable = TableDefinition::new("anonymization_secret");
@@ -60,6 +62,8 @@ impl MetadataCatalog {
         let write_txn = self.db.begin_write()?;
         {
             let _ = write_txn.open_table(TABLES_TABLE)?;
+            let _ = write_txn.open_table(VIEWS_TABLE)?;
+            let _ = write_txn.open_table(SCHEMAS_TABLE)?;
             let _ = write_txn.open_table(SHARDS_TABLE)?;
             let _ = write_txn.open_table(NODES_TABLE)?;
             let _ = write_txn.open_table(ANONYMIZATION_SECRET_TABLE)?;
@@ -153,6 +157,34 @@ impl MetadataCatalog {
         self.put_record(TABLES_TABLE, &meta.table_name, meta)
     }
 
+    /// Claim a table name: store `meta` only if neither a table nor a view of that
+    /// name exists yet, and report whether the claim succeeded.
+    ///
+    /// The existence checks and the write share one redb write transaction, and redb
+    /// admits a single writer at a time, so two concurrent `CREATE TABLE` of the
+    /// same name cannot both observe "absent" — nor can a `CREATE TABLE` and a
+    /// `CREATE VIEW` racing for one name. Without this, a check-then-put sequence
+    /// lets both callers pass the check and both go on to assign shards and
+    /// broadcast DDL — two shard layouts for one catalog key, with the second
+    /// silently overwriting the first.
+    pub fn create_table_if_absent(&self, meta: &TableMeta) -> Result<bool> {
+        let bytes = meta.encode_to_vec();
+        let write_txn = self.db.begin_write()?;
+        let claimed = {
+            let views = write_txn.open_table(VIEWS_TABLE)?;
+            let taken_by_view = views.get(meta.table_name.as_str())?.is_some();
+            let mut t = write_txn.open_table(TABLES_TABLE)?;
+            if taken_by_view || t.get(meta.table_name.as_str())?.is_some() {
+                false
+            } else {
+                t.insert(meta.table_name.as_str(), bytes.as_slice())?;
+                true
+            }
+        };
+        write_txn.commit()?;
+        Ok(claimed)
+    }
+
     /// Fetch a table's metadata by name, or `None` if it does not exist.
     pub fn get_table(&self, name: &str) -> Result<Option<TableMeta>> {
         self.get_record(TABLES_TABLE, name)
@@ -169,6 +201,132 @@ impl MetadataCatalog {
         self.list_records(TABLES_TABLE, |_| true)
     }
 
+    /// Find the table carrying the index named `index_name`, or `None` if no
+    /// table does.
+    ///
+    /// Indexes live inside their table's [`TableMeta`], because that is where
+    /// every other per-table schema fact lives and it keeps a table and its
+    /// indexes impossible to leave inconsistent. `DROP INDEX` names only the
+    /// index, so resolving it means a scan — which is what this is. Cheap enough:
+    /// it runs on DDL only, and the table list is the metadata of one cluster.
+    ///
+    /// `index_name` must already be canonical (see
+    /// `query_router::canonicalize_ident`), as the stored names are.
+    pub fn table_with_index(&self, index_name: &str) -> Result<Option<TableMeta>> {
+        Ok(self
+            .list_tables()?
+            .into_iter()
+            .find(|table| table.indexes.iter().any(|idx| idx.name == index_name)))
+    }
+
+    /// Find the table carrying an index-backed constraint named `name`, or `None`.
+    ///
+    /// A constraint VaireDB added to a table after the fact is enforced by one
+    /// physical index per shard, named after the constraint — so unlike a constraint
+    /// the shards declared in their own `CREATE TABLE`, its name occupies the
+    /// cluster-wide relation namespace and has to be resolvable the same way an
+    /// index's is. `name` must already be canonical.
+    pub fn table_with_index_backed_constraint(&self, name: &str) -> Result<Option<TableMeta>> {
+        Ok(self.list_tables()?.into_iter().find(|table| {
+            table
+                .constraints
+                .iter()
+                .any(|c| c.index_backed && c.name == name)
+        }))
+    }
+
+    /// Claim a view name: store `meta` only if neither a view nor a table of that
+    /// name exists yet, and report whether the claim succeeded.
+    ///
+    /// Views and tables live in separate redb tables but in one relation namespace,
+    /// so the claim has to look in both — and it looks in both inside a single write
+    /// transaction, for the reason [`Self::create_table_if_absent`] gives.
+    pub fn create_view_if_absent(&self, meta: &ViewMeta) -> Result<bool> {
+        let bytes = meta.encode_to_vec();
+        let write_txn = self.db.begin_write()?;
+        let claimed = {
+            let tables = write_txn.open_table(TABLES_TABLE)?;
+            let taken_by_table = tables.get(meta.view_name.as_str())?.is_some();
+            let mut t = write_txn.open_table(VIEWS_TABLE)?;
+            if taken_by_table || t.get(meta.view_name.as_str())?.is_some() {
+                false
+            } else {
+                t.insert(meta.view_name.as_str(), bytes.as_slice())?;
+                true
+            }
+        };
+        write_txn.commit()?;
+        Ok(claimed)
+    }
+
+    /// Upsert a view's definition, keyed by its view name. Used to redefine a view
+    /// that already exists (`CREATE OR REPLACE VIEW`, `ALTER VIEW ... AS`); a new
+    /// view is claimed with [`Self::create_view_if_absent`] instead.
+    pub fn put_view(&self, meta: &ViewMeta) -> Result<()> {
+        self.put_record(VIEWS_TABLE, &meta.view_name, meta)
+    }
+
+    /// Fetch a view's definition by name, or `None` if no view of that name exists.
+    pub fn get_view(&self, name: &str) -> Result<Option<ViewMeta>> {
+        self.get_record(VIEWS_TABLE, name)
+    }
+
+    /// Remove a view's definition by name (no-op if absent).
+    pub fn delete_view(&self, name: &str) -> Result<()> {
+        self.delete_record(VIEWS_TABLE, name)
+    }
+
+    /// Return every registered view, in key order.
+    pub fn list_views(&self) -> Result<Vec<ViewMeta>> {
+        self.list_records(VIEWS_TABLE, |_| true)
+    }
+
+    /// Claim a schema name: store `meta` only if no schema of that name exists
+    /// yet, and report whether the claim succeeded.
+    ///
+    /// The check and the write share one redb write transaction, for the reason
+    /// [`Self::create_table_if_absent`] gives — two concurrent `CREATE SCHEMA` of
+    /// one name must not both see "absent" and both report success.
+    ///
+    /// The default schema is never stored — it always exists and cannot be created —
+    /// so this is only ever called for a named one.
+    pub fn create_schema_if_absent(&self, meta: &SchemaMeta) -> Result<bool> {
+        let bytes = meta.encode_to_vec();
+        let write_txn = self.db.begin_write()?;
+        let claimed = {
+            let mut t = write_txn.open_table(SCHEMAS_TABLE)?;
+            if t.get(meta.schema_name.as_str())?.is_some() {
+                false
+            } else {
+                t.insert(meta.schema_name.as_str(), bytes.as_slice())?;
+                true
+            }
+        };
+        write_txn.commit()?;
+        Ok(claimed)
+    }
+
+    /// Fetch a schema's metadata by name, or `None` if it does not exist. The
+    /// default schema and the metadata schemas are not records, so they are not found
+    /// here: existence questions that must account for them go through the handler's
+    /// `require_schema_exists`.
+    pub fn get_schema(&self, name: &str) -> Result<Option<SchemaMeta>> {
+        self.get_record(SCHEMAS_TABLE, name)
+    }
+
+    /// Remove a schema by name (no-op if absent). Does not touch the relations it
+    /// contained: `DROP SCHEMA` refuses a non-empty schema, so by the time this
+    /// runs there are none.
+    pub fn delete_schema(&self, name: &str) -> Result<()> {
+        self.delete_record(SCHEMAS_TABLE, name)
+    }
+
+    /// Return every named schema, in key order. The default schema is not among
+    /// them — it is not a record.
+    pub fn list_schemas(&self) -> Result<Vec<SchemaMeta>> {
+        self.list_records(SCHEMAS_TABLE, |_| true)
+    }
+
     /// Upsert a shard's metadata under the composite key `"{table}:{shard_id}"`,
     /// keeping shards for one table grouped together for prefix scans.
     pub fn put_shard(&self, meta: &ShardMeta) -> Result<()> {
@@ -176,9 +334,20 @@ impl MetadataCatalog {
         self.put_record(SHARDS_TABLE, &key, meta)
     }
 
-    /// Return all shards belonging to `table_name`, in shard-key order.
+    /// Return all shards belonging to `table_name`, ordered by hash bucket.
+    ///
+    /// Deliberately not in stored-key order: the keys are the strings
+    /// `"{table}:shard{n}"`, so a raw scan returns `shard10` before `shard2` and
+    /// `shards[i]` stops being the shard of bucket `i` from eleven shards on.
+    /// Sorting on the bucket each record carries restores that, which is what
+    /// every caller that reads the list in order — broadcast plans, the
+    /// `vairedb_catalog.shards` view, per-shard DDL — reasonably expects. Routing
+    /// does not rely on it and matches on the bucket itself; see
+    /// [`write_router::shard_for_bucket`](crate::write_router::shard_for_bucket).
     pub fn get_shards_for_table(&self, table_name: &str) -> Result<Vec<ShardMeta>> {
-        self.scan_prefix(SHARDS_TABLE, table_name)
+        let mut shards: Vec<ShardMeta> = self.scan_prefix(SHARDS_TABLE, table_name)?;
+        shards.sort_by_key(|shard| shard.hash_bucket);
+        Ok(shards)
     }
 
     /// Delete every shard record belonging to `table_name`. Collects matching
@@ -223,9 +392,18 @@ impl MetadataCatalog {
         })
     }
 
-    /// Return every shard record across all tables, in key order.
+    /// Return every shard record across all tables, by table name then hash
+    /// bucket — the same bucket ordering [`Self::get_shards_for_table`] uses, so
+    /// `vairedb_catalog.shards` lists a table's shards `0, 1, 2, …` rather than
+    /// lexicographically by shard id.
     pub fn list_all_shards(&self) -> Result<Vec<ShardMeta>> {
-        self.list_records(SHARDS_TABLE, |_| true)
+        let mut shards: Vec<ShardMeta> = self.list_records(SHARDS_TABLE, |_| true)?;
+        shards.sort_by(|a, b| {
+            a.table_name
+                .cmp(&b.table_name)
+                .then(a.hash_bucket.cmp(&b.hash_bucket))
+        });
+        Ok(shards)
     }
 
     /// Return every registered node regardless of state, in key order.

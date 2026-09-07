@@ -14,6 +14,23 @@ enum VdbErrorCode {
   VDB_ERROR_CODE_FEATURE_NOT_SUPPORTED = 1004;
   VDB_ERROR_CODE_TABLE_ALREADY_EXISTS = 1005;
   VDB_ERROR_CODE_COLUMN_ALREADY_EXISTS = 1006;
+  VDB_ERROR_CODE_WRONG_OBJECT_TYPE = 1007;
+  VDB_ERROR_CODE_IN_FAILED_TRANSACTION = 1008;
+  VDB_ERROR_CODE_NO_ACTIVE_TRANSACTION = 1009;
+  VDB_ERROR_CODE_INVALID_SAVEPOINT = 1010;
+  VDB_ERROR_CODE_READ_ONLY_TRANSACTION = 1011;
+  // A COMMIT applied some of its shard groups and then failed. The outcome of
+  // the statement is genuinely unknown to the client, which is what SQLSTATE
+  // 40003 (statement_completion_unknown) means.
+  VDB_ERROR_CODE_PARTIAL_COMMIT = 1012;
+  // A relation named a schema the catalog does not have. Distinct from
+  // TABLE_NOT_FOUND because the client's mistake is one level up: the table may
+  // well exist, just not there.
+  VDB_ERROR_CODE_SCHEMA_NOT_FOUND = 1013;
+  VDB_ERROR_CODE_SCHEMA_ALREADY_EXISTS = 1014;
+  // The object named still has objects inside it, so dropping it would drop
+  // them too. Reported by `DROP SCHEMA` without `CASCADE`.
+  VDB_ERROR_CODE_DEPENDENT_OBJECTS_EXIST = 1015;
 
   // Storage errors (2000-2999)
   VDB_ERROR_CODE_SHARD_NOT_FOUND = 2000;

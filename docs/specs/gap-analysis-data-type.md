@@ -56,8 +56,8 @@ A type crosses five boundaries. It can be lost at any of them.
 
 | # | Boundary | Code | What can go wrong |
 |---|---|---|---|
-| W1 | Parse the statement under `PostgreSqlDialect` (sqlparser 0.58) | `sql_compat::parse_sql` | Unknown type names parse as `DataType::Custom`; nothing is rejected. `STRUCT`/`UNION` field lists are **mangled on re-render**. |
-| W2 | Rewrite PG → DuckDB, broadcast shard-local DDL/DML | `sql_compat/dialect.rs` (`transform_data_type`), `pgwire_handler/ddl.rs:453` | Only `BYTEA`→`BLOB` and `JSONB`→`JSON` are rewritten. A type DuckDB cannot parse fails the DDL on every shard. |
+| W1 | Parse the statement under `PostgreSqlDialect` (sqlparser 0.58) | `pgwire_handler::parser::parse_sql` | Unknown type names parse as `DataType::Custom`; nothing is rejected. `STRUCT`/`UNION` field lists are **mangled on re-render**. |
+| W2 | Rewrite PG → DuckDB, broadcast shard-local DDL/DML | `write_sql_cl/dialect.rs` (`transform_data_type`), `pgwire_handler/ddl.rs:453` | Only `BYTEA`→`BLOB` and `JSONB`→`JSON` are rewritten. A type DuckDB cannot parse fails the DDL on every shard. |
 | W3 | Store the declared type string in the catalog | `table_meta_ops.rs:238` — stores `col.data_type.to_string()`, **untransformed** | The catalog keeps the PostgreSQL spelling (`BYTEA`, `JSONB`), not what DuckDB received. Both spellings must be handled downstream. |
 | W4 | Convert extended-protocol bind parameters for transport | `write_router.rs:124` (`scalar_to_write_param`) → `WriteParam` oneof → `param_conversion.rs` (`write_param_to_duckdb_value`) | The `WriteParam` oneof carries only `bool / i64 / f64 / string / bytes`. Everything else falls through `other => StringVal(other.to_string())` — see [The write-path parameter defect](#the-write-path-parameter-defect). |
 
@@ -549,7 +549,7 @@ anything reaching the wire:
 Empirically, with seven probes rather than by reading mapping tables. 78 type
 declarations were pushed through the full chain:
 
-1. `CREATE TABLE t (c <TYPE>)` parsed with `sql_compat::parse_sql`, then
+1. `CREATE TABLE t (c <TYPE>)` parsed with `pgwire_handler::parser::parse_sql`, then
    `transform_to_duckdb` + re-render — what DuckDB actually receives, and what
    string the catalog stores.
 2. That DDL plus an `INSERT` of a representative literal executed against an

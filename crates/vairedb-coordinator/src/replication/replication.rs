@@ -22,6 +22,15 @@ use crate::channel_pool::ChannelPool;
 use crate::error::{CoordinatorError, NodeError, Result};
 use crate::replication::retry_config::{MAX_PENDING_RETRIES, RetryConfig};
 
+/// One statement of a write, already rewritten to shard-local SQL.
+#[derive(Debug, Clone)]
+pub struct BatchStatement {
+    pub sql: String,
+    pub params: Vec<WriteParam>,
+    /// Physical shard table the statement targets, e.g. `orders_shard0`.
+    pub shard_id: String,
+}
+
 /// A write that failed to reach a replica node and is queued for re-delivery.
 /// Carries everything needed to resend it independently and `attempt` drives the
 /// backoff schedule.
@@ -30,8 +39,9 @@ pub(crate) struct PendingRetry {
     pub(crate) node_address: String,
     pub(crate) node_id: String,
     pub(crate) write_id: String,
-    pub(crate) sql: String,
-    pub(crate) params: Vec<WriteParam>,
+    pub(crate) statements: Vec<BatchStatement>,
+    /// Re-send the statements as one transaction, as the original write did.
+    pub(crate) atomic: bool,
     pub(crate) shard_id: String,
     /// Number of retry attempts already made; used to compute the next backoff.
     pub(crate) attempt: u32,
@@ -77,6 +87,50 @@ impl ReplicationManager {
         write_id: &str,
         quorum_size: usize,
     ) -> Result<u64> {
+        let shard_id = crate::util::shard_table_name(&shard.table_name, shard.hash_bucket);
+        let statements = vec![BatchStatement {
+            sql: sql.to_string(),
+            params: params.to_vec(),
+            shard_id,
+        }];
+
+        let rows = self
+            .fan_out(shard, statements, write_id, quorum_size, false)
+            .await?;
+
+        Ok(rows.first().copied().unwrap_or(0))
+    }
+
+    /// Send `statements` to the shard's nodes as a single transaction: on each
+    /// node either all of them take effect or none does. Returns one row count
+    /// per statement once the primary plus a quorum acknowledge.
+    ///
+    /// The statements may target several shards as long as those shards live on
+    /// the same nodes — `shard` names that node set. Atomicity is per node, so a
+    /// node that acks has applied the whole batch while a lagging node applies it
+    /// (still as one transaction) from the retry queue.
+    pub async fn execute_transaction_with_quorum(
+        &self,
+        shard: &ShardMeta,
+        statements: Vec<BatchStatement>,
+        write_id: &str,
+        quorum_size: usize,
+    ) -> Result<Vec<u64>> {
+        self.fan_out(shard, statements, write_id, quorum_size, true)
+            .await
+    }
+
+    /// Fan `statements` out to the shard's primary and replicas in parallel and
+    /// collect the per-statement row counts (the max reported by any acking node).
+    /// `atomic` asks each node to apply them as one transaction.
+    async fn fan_out(
+        &self,
+        shard: &ShardMeta,
+        statements: Vec<BatchStatement>,
+        write_id: &str,
+        quorum_size: usize,
+        atomic: bool,
+    ) -> Result<Vec<u64>> {
         let node_addresses = self.resolve_node_addresses(shard)?;
         let primary_address = node_addresses
             .get(&shard.primary_node_id)
@@ -91,14 +145,17 @@ impl ReplicationManager {
             }
         }
 
+        // Names the batch as a whole in node errors; per-statement shard ids ride
+        // along on the statements themselves.
         let shard_id = crate::util::shard_table_name(&shard.table_name, shard.hash_bucket);
+
+        let statements = Arc::new(statements);
 
         let mut handles = Vec::new();
         for (node_id, addr) in &all_targets {
             let pool = Arc::clone(&self.pool);
             let addr = addr.clone();
-            let sql = sql.to_string();
-            let params = params.to_vec();
+            let statements = Arc::clone(&statements);
             let write_id = write_id.to_string();
             let shard_id = shard_id.clone();
             let node_id = node_id.clone();
@@ -113,16 +170,22 @@ impl ReplicationManager {
                         node_id: node_id.clone(),
                     }
                 })?;
-                let result =
-                    send_write_to_node(channel, &write_id, &sql, &params, &shard_id, &node_id)
-                        .await;
+                let result = send_write_to_node(
+                    channel,
+                    &write_id,
+                    &statements,
+                    atomic,
+                    &shard_id,
+                    &node_id,
+                )
+                .await;
                 Ok::<_, NodeError>((node_id, addr, result))
             });
             handles.push(handle);
         }
 
         let mut ack_count = 0usize;
-        let mut rows_affected = 0u64;
+        let mut rows_affected = vec![0u64; statements.len()];
         let mut primary_acked = false;
         let mut lagging_nodes: Vec<(String, String)> = Vec::new();
         let mut primary_error: Option<NodeError> = None;
@@ -131,9 +194,7 @@ impl ReplicationManager {
             match handle.await {
                 Ok(Ok((node_id, _addr, Ok(rows)))) => {
                     ack_count += 1;
-                    if rows > rows_affected {
-                        rows_affected = rows;
-                    }
+                    merge_rows_affected(&mut rows_affected, &rows);
                     if node_id == shard.primary_node_id {
                         primary_acked = true;
                     }
@@ -172,7 +233,7 @@ impl ReplicationManager {
         }
 
         if !lagging_nodes.is_empty() {
-            self.enqueue_retries(lagging_nodes, write_id, sql, params, &shard_id)
+            self.enqueue_retries(lagging_nodes, write_id, &statements, atomic, &shard_id)
                 .await;
         }
 
@@ -192,8 +253,8 @@ impl ReplicationManager {
         &self,
         lagging_nodes: Vec<(String, String)>,
         write_id: &str,
-        sql: &str,
-        params: &[WriteParam],
+        statements: &[BatchStatement],
+        atomic: bool,
         shard_id: &str,
     ) {
         let mut retries = self.pending_retries.lock().await;
@@ -204,8 +265,8 @@ impl ReplicationManager {
                     node_address: address,
                     node_id,
                     write_id: write_id.to_string(),
-                    sql: sql.to_string(),
-                    params: params.to_vec(),
+                    statements: statements.to_vec(),
+                    atomic,
                     shard_id: shard_id.to_string(),
                     attempt: 0,
                 },
@@ -271,8 +332,8 @@ impl ReplicationManager {
                         match send_write_to_node(
                             channel,
                             &entry.write_id,
-                            &entry.sql,
-                            &entry.params,
+                            &entry.statements,
+                            entry.atomic,
                             &entry.shard_id,
                             &entry.node_id,
                         )
@@ -315,27 +376,32 @@ fn compute_backoff(attempt: u32, config: &RetryConfig) -> u64 {
     backoff.min(config.max_retry_ms)
 }
 
-/// Send a single write statement to one node over `channel` and return the rows
-/// affected. Maps tonic transport status to a `VdbErrorCode`, and surfaces a
-/// node-reported failure (or a missing result) as a `NodeError`.
+/// Send `statements` to one node over `channel` and return the rows affected by
+/// each, in order. `atomic` asks the node to apply them as one transaction. Maps
+/// tonic transport status to a `VdbErrorCode`, and surfaces a node-reported
+/// failure (or a missing result) as a `NodeError`.
 async fn send_write_to_node(
     channel: Channel,
     write_id: &str,
-    sql: &str,
-    params: &[WriteParam],
+    statements: &[BatchStatement],
+    atomic: bool,
     shard_id: &str,
     node_id: &str,
-) -> std::result::Result<u64, NodeError> {
+) -> std::result::Result<Vec<u64>, NodeError> {
     let mut client = WriteServiceClient::new(channel);
 
     let request = tonic::Request::new(ExecuteWriteRequest {
         write_id: write_id.to_string(),
-        statements: vec![WriteStatement {
-            sql: sql.to_string(),
-            shard_id: shard_id.to_string(),
-            operation: WriteOperation::Insert.into(),
-            params: params.to_vec(),
-        }],
+        statements: statements
+            .iter()
+            .map(|stmt| WriteStatement {
+                sql: stmt.sql.clone(),
+                shard_id: stmt.shard_id.clone(),
+                operation: WriteOperation::Insert.into(),
+                params: stmt.params.clone(),
+            })
+            .collect(),
+        atomic,
     });
 
     let response = client.execute_write(request).await.map_err(|e| {
@@ -356,29 +422,42 @@ async fn send_write_to_node(
     })?;
     let resp = response.into_inner();
 
-    if let Some(result) = resp.results.first() {
-        if result.success {
-            Ok(result.rows_affected as u64)
-        } else {
-            let error = result.error.as_ref();
-            let msg = error
-                .map(|e| e.message.clone())
-                .unwrap_or_else(|| "unknown error".to_string());
-            let code = error.map(|e| e.code).unwrap_or(0);
-            Err(NodeError {
-                message: msg,
-                error_code: code,
-                shard_id: shard_id.to_string(),
-                node_id: node_id.to_string(),
-            })
-        }
-    } else {
-        Err(NodeError {
+    if resp.results.is_empty() {
+        return Err(NodeError {
             message: "no results returned".to_string(),
             error_code: 0,
             shard_id: shard_id.to_string(),
             node_id: node_id.to_string(),
-        })
+        });
+    }
+
+    // Any failed statement fails the whole call: for an atomic batch nothing was
+    // applied, and for a single statement there is nothing else to report.
+    if let Some(failed) = resp.results.iter().find(|result| !result.success) {
+        let error = failed.error.as_ref();
+        return Err(NodeError {
+            message: error
+                .map(|e| e.message.clone())
+                .unwrap_or_else(|| "unknown error".to_string()),
+            error_code: error.map(|e| e.code).unwrap_or(0),
+            shard_id: shard_id.to_string(),
+            node_id: node_id.to_string(),
+        });
+    }
+
+    Ok(resp
+        .results
+        .iter()
+        .map(|result| result.rows_affected as u64)
+        .collect())
+}
+
+/// Fold one node's per-statement row counts into the running maxima. A node that
+/// reports fewer counts than the batch has statements (only possible from a
+/// malformed response) contributes what it did report.
+fn merge_rows_affected(rows_affected: &mut [u64], node_rows: &[u64]) {
+    for (total, rows) in rows_affected.iter_mut().zip(node_rows) {
+        *total = (*total).max(*rows);
     }
 }
 
@@ -460,6 +539,20 @@ mod tests {
         assert_eq!(compute_backoff(1, &config), 100);
         assert_eq!(compute_backoff(2, &config), 200);
         assert_eq!(compute_backoff(20, &config), 1000);
+    }
+
+    #[test]
+    fn merge_rows_affected_keeps_the_max_per_statement() {
+        let mut totals = vec![0, 5, 2];
+        merge_rows_affected(&mut totals, &[1, 3, 7]);
+        assert_eq!(totals, vec![1, 5, 7]);
+    }
+
+    #[test]
+    fn merge_rows_affected_tolerates_a_short_node_response() {
+        let mut totals = vec![0, 0, 0];
+        merge_rows_affected(&mut totals, &[4]);
+        assert_eq!(totals, vec![4, 0, 0]);
     }
 
     #[test]

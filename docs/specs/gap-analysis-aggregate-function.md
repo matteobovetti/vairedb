@@ -53,7 +53,7 @@ the available aggregate surface is *exactly* DataFusion 53's 38 default
 `AggregateUDF`s (`datafusion-functions-aggregate-53.1.0/src/lib.rs`,
 `all_default_aggregate_functions`) plus their 7 aliases — no more, no less.
 Nothing in VaireDB inspects an aggregate's name: `classify_statement`
-(`query_router/query_router.rs:24`) branches on the `Statement` variant only.
+(`pgwire_handler/query_router.rs`) branches on the `Statement` variant only.
 
 ### The distributed merge is correct, and that is not an accident
 

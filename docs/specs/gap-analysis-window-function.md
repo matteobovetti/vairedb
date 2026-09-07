@@ -256,7 +256,7 @@ the equality predicate was isolated as the trigger.
 The precise mechanism is **INCONCLUSIVE** because `EXPLAIN` is unsupported
 (`0A000 [VDB-1004] EXPLAIN is not supported by VaireDB`) — the behavior is certain and
 reproducible, the cause is a hypothesis. This is a concrete cost of that gap; see
-[command analysis](gap-analysis-command.md) priority 5.
+[command analysis](gap-analysis-command.md) open gap 2.
 
 ## § 8 — Window functions over anonymized columns
 
@@ -430,9 +430,11 @@ Recorded so they are not re-litigated:
 
 Verified while measuring this axis:
 
-- **The parser is sqlparser 0.61, not 0.58.** [gap-analysis-command.md](gap-analysis-command.md)
-  ("How VaireDB decides", and row 25's note on `MERGE INTO`) and the aggregate analysis
-  both cite 0.58. `Cargo.lock` on this branch contains only 0.61.0; `main` had both,
+- **The parser is sqlparser 0.61, not 0.58.**
+  [gap-analysis-data-type.md](gap-analysis-data-type.md) (stage W1),
+  [gap-analysis-operator-literal.md](gap-analysis-operator-literal.md) (the E1 note) and the
+  aggregate analysis still cite 0.58; the command analysis no longer pins a version.
+  `Cargo.lock` on this branch contains only 0.61.0; `main` had both,
   and the branch diff removes 0.58.0. The deployed coordinator image matches the
   current lock file. The 0.58-era conclusions were re-verified against 0.61 and still
   hold — only the version citations are stale.

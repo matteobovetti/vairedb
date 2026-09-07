@@ -1,8 +1,8 @@
 use std::sync::atomic::{AtomicU32, Ordering};
 
 use vairedb_coordinator::catalog::{
-    AnonymizationSecret, ColumnDef, MetadataCatalog, NodeMeta, NodeState, ShardMeta, ShardStrategy,
-    TableMeta,
+    AnonymizationSecret, ColumnDef, MetadataCatalog, NodeMeta, NodeState, SchemaMeta, ShardMeta,
+    ShardStrategy, TableMeta,
 };
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -24,6 +24,8 @@ fn make_catalog() -> MetadataCatalog {
 fn sample_table_meta() -> TableMeta {
     TableMeta {
         anonymized_columns: std::collections::HashMap::new(),
+        indexes: Vec::new(),
+        constraints: Vec::new(),
         table_name: "orders".to_string(),
         columns: vec![
             ColumnDef {
@@ -102,6 +104,76 @@ fn test_delete_table() {
 
     let result = catalog.get_table("orders").unwrap();
     assert!(result.is_none());
+}
+
+#[test]
+fn test_create_table_if_absent_claims_a_free_name() {
+    let catalog = make_catalog();
+    let meta = sample_table_meta();
+
+    assert!(catalog.create_table_if_absent(&meta).unwrap());
+    assert_eq!(
+        catalog.get_table("orders").unwrap().unwrap().shard_key,
+        "customer_id"
+    );
+}
+
+#[test]
+fn test_create_table_if_absent_refuses_a_taken_name_without_overwriting() {
+    let catalog = make_catalog();
+    let meta = sample_table_meta();
+    catalog.create_table_if_absent(&meta).unwrap();
+
+    // A second claim on the same name, with a different layout: it must be
+    // refused *and* leave the first table's metadata untouched. An overwrite here
+    // would strand every row already written under the original shard key.
+    let mut other = sample_table_meta();
+    other.shard_key = "id".to_string();
+    other.shard_count = 2;
+    assert!(!catalog.create_table_if_absent(&other).unwrap());
+
+    let stored = catalog.get_table("orders").unwrap().unwrap();
+    assert_eq!(stored.shard_key, "customer_id");
+    assert_eq!(stored.shard_count, 6);
+}
+
+#[test]
+fn test_create_table_if_absent_claims_again_after_delete() {
+    let catalog = make_catalog();
+    let meta = sample_table_meta();
+
+    assert!(catalog.create_table_if_absent(&meta).unwrap());
+    catalog.delete_table("orders").unwrap();
+    assert!(
+        catalog.create_table_if_absent(&meta).unwrap(),
+        "a dropped name is free again"
+    );
+}
+
+#[test]
+fn test_concurrent_create_table_if_absent_yields_exactly_one_winner() {
+    use std::sync::Arc;
+
+    let catalog = Arc::new(make_catalog());
+    let threads: Vec<_> = (0..8)
+        .map(|i| {
+            let catalog = Arc::clone(&catalog);
+            std::thread::spawn(move || {
+                let mut meta = sample_table_meta();
+                // Distinguishable layouts, so a lost write would be visible.
+                meta.shard_count = i + 1;
+                catalog.create_table_if_absent(&meta).unwrap()
+            })
+        })
+        .collect();
+
+    let winners = threads
+        .into_iter()
+        .map(|t| t.join().unwrap())
+        .filter(|claimed| *claimed)
+        .count();
+    assert_eq!(winners, 1, "exactly one claim on the same name may succeed");
+    assert!(catalog.get_table("orders").unwrap().is_some());
 }
 
 #[test]
@@ -323,6 +395,8 @@ fn test_table_meta_with_range_strategy() {
     let catalog = make_catalog();
     let meta = TableMeta {
         anonymized_columns: std::collections::HashMap::new(),
+        indexes: Vec::new(),
+        constraints: Vec::new(),
         table_name: "events".to_string(),
         columns: vec![ColumnDef {
             name: "ts".to_string(),
@@ -744,4 +818,129 @@ fn test_list_anonymization_secrets() {
 
     let all = catalog.list_anonymization_secrets().unwrap();
     assert_eq!(all.len(), 2);
+}
+
+// ---------------------------------------------------------------------------
+// Shard ordering. Records are keyed by the string `"{table}:shard{n}"`, so a raw
+// prefix scan hands them back lexicographically — `shard10` before `shard2`.
+// Every caller that reads the list in order means bucket order, so that is what
+// the catalog returns.
+// ---------------------------------------------------------------------------
+
+/// One shard record of `table` for `bucket`, keyed as production keys it.
+fn shard_record(table: &str, bucket: u32) -> ShardMeta {
+    ShardMeta {
+        shard_id: format!("shard{bucket}"),
+        table_name: table.to_string(),
+        primary_node_id: "n1".to_string(),
+        replica_node_ids: vec![],
+        hash_bucket: bucket,
+        range_lower: String::new(),
+        range_upper: String::new(),
+    }
+}
+
+#[test]
+fn test_get_shards_for_table_is_ordered_by_bucket() {
+    let catalog = make_catalog();
+    // Stored back to front, to show the returned order comes from the bucket and
+    // not from the order the records were written in.
+    for bucket in (0..12).rev() {
+        catalog.put_shard(&shard_record("orders", bucket)).unwrap();
+    }
+
+    let buckets: Vec<u32> = catalog
+        .get_shards_for_table("orders")
+        .unwrap()
+        .iter()
+        .map(|shard| shard.hash_bucket)
+        .collect();
+
+    assert_eq!(buckets, (0..12).collect::<Vec<_>>());
+}
+
+#[test]
+fn test_list_all_shards_is_ordered_by_table_then_bucket() {
+    let catalog = make_catalog();
+    for table in ["orders", "invoices"] {
+        for bucket in 0..12 {
+            catalog.put_shard(&shard_record(table, bucket)).unwrap();
+        }
+    }
+
+    let listed: Vec<(String, u32)> = catalog
+        .list_all_shards()
+        .unwrap()
+        .iter()
+        .map(|shard| (shard.table_name.clone(), shard.hash_bucket))
+        .collect();
+
+    let mut expected: Vec<(String, u32)> = Vec::new();
+    for table in ["invoices", "orders"] {
+        for bucket in 0..12 {
+            expected.push((table.to_string(), bucket));
+        }
+    }
+    assert_eq!(listed, expected);
+}
+
+// --- schemas ---
+
+// A schema is claimed by name in one write transaction, so two concurrent
+// `CREATE SCHEMA`s cannot both believe they created it: the second is told the name
+// was already there.
+#[test]
+fn test_create_schema_is_claimed_once() {
+    let catalog = make_catalog();
+    let meta = SchemaMeta {
+        schema_name: "sales".to_string(),
+        created_at: None,
+    };
+
+    assert!(catalog.create_schema_if_absent(&meta).unwrap());
+    assert!(
+        !catalog.create_schema_if_absent(&meta).unwrap(),
+        "the second claim must report the name was taken"
+    );
+    assert_eq!(
+        catalog.get_schema("sales").unwrap().unwrap().schema_name,
+        "sales"
+    );
+}
+
+#[test]
+fn test_schema_roundtrip_and_delete() {
+    let catalog = make_catalog();
+    for name in ["sales", "billing"] {
+        catalog
+            .create_schema_if_absent(&SchemaMeta {
+                schema_name: name.to_string(),
+                created_at: None,
+            })
+            .unwrap();
+    }
+
+    let listed: Vec<String> = catalog
+        .list_schemas()
+        .unwrap()
+        .into_iter()
+        .map(|s| s.schema_name)
+        .collect();
+    assert_eq!(listed, vec!["billing", "sales"], "listed in key order");
+
+    catalog.delete_schema("sales").unwrap();
+    assert!(catalog.get_schema("sales").unwrap().is_none());
+    // Deleting a name that is not there is a no-op, so DROP SCHEMA IF EXISTS needs
+    // no separate path.
+    catalog.delete_schema("sales").unwrap();
+    assert_eq!(catalog.list_schemas().unwrap().len(), 1);
+}
+
+// The default schema is not a record: it always exists, and a relation in it
+// carries no qualifier, so nothing stores or lists it.
+#[test]
+fn test_the_default_schema_is_not_a_record() {
+    let catalog = make_catalog();
+    assert!(catalog.get_schema("public").unwrap().is_none());
+    assert!(catalog.list_schemas().unwrap().is_empty());
 }

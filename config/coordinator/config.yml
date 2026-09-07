@@ -18,6 +18,13 @@ heartbeat_timeout_secs: 15
 # Default replication factor for new tables
 default_replication_factor: 3
 
+# Allow a transaction block whose writes span several shard groups to COMMIT.
+# VaireDB has no cross-shard commit protocol: with false (the default posture)
+# such a COMMIT is refused and nothing is written; with true the groups are
+# applied one at a time, so a failure part-way through leaves earlier groups
+# applied.
+allow_cross_shard_transactions: false
+
 # Tail replication retry configuration (exponential backoff)
 tail_retry_initial_ms: 100
 tail_retry_max_ms: 5000

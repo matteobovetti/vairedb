@@ -155,6 +155,7 @@ pub(crate) fn classify_error(err: &CoordinatorError) -> (VdbErrorCode, String) {
         }
         CoordinatorError::ShardNotAssigned(msg) => msg.clone(),
         CoordinatorError::NullShardKey(msg) => msg.clone(),
+        CoordinatorError::UnroutableShardKey(msg) => msg.clone(),
         CoordinatorError::QuorumNotReached { needed, got } => {
             format!(
                 "write quorum not reached: {}/{} nodes acknowledged",

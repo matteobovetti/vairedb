@@ -8,7 +8,7 @@ use datafusion::scalar::ScalarValue;
 
 use crate::catalog::{MetadataCatalog, ShardMeta, TableMeta};
 use crate::error::{CoordinatorError, Result};
-use crate::sql_compat;
+use crate::write_sql_cl;
 use vairedb_common::proto::vairedb::v1::{WriteParam, write_param};
 
 /// Resolves where a write goes and how it is expressed against the storage
@@ -27,8 +27,9 @@ impl WriteRouter {
     ///
     /// Hashes the shard-key value to a single shard when the statement pins the
     /// key, or returns all shards for a broadcast write. Returns `Err` if the
-    /// table has no shards (`ShardNotAssigned`) or the routed key is NULL
-    /// (`NullShardKey`).
+    /// table has no shards (`ShardNotAssigned`), the routed key is NULL
+    /// (`NullShardKey`), or the key is pinned to something not reducible to a
+    /// value (`UnroutableShardKey`).
     pub fn resolve_target_shards(
         &self,
         stmt: &Statement,
@@ -45,15 +46,22 @@ impl WriteRouter {
 
         let key_column = &table_meta.shard_key;
 
-        match sql_compat::route_target(stmt, key_column, params) {
-            sql_compat::ShardRouting::One(value) => {
-                let idx = compute_shard_index(&value, shards.len());
-                Ok(vec![shards[idx].clone()])
+        match write_sql_cl::route_target(stmt, key_column, params) {
+            write_sql_cl::ShardRouting::One(value) => {
+                let bucket = compute_shard_index(&value, shards.len());
+                Ok(vec![
+                    shard_for_bucket(&shards, bucket, &table_meta.table_name)?.clone(),
+                ])
             }
-            sql_compat::ShardRouting::Null => Err(CoordinatorError::NullShardKey(format!(
+            write_sql_cl::ShardRouting::Null => Err(CoordinatorError::NullShardKey(format!(
                 "shard key \"{key_column}\" cannot be NULL"
             ))),
-            sql_compat::ShardRouting::Broadcast => Ok(shards),
+            write_sql_cl::ShardRouting::Unroutable(reason) => {
+                Err(CoordinatorError::UnroutableShardKey(format!(
+                    "cannot route on shard key \"{key_column}\": {reason}"
+                )))
+            }
+            write_sql_cl::ShardRouting::Broadcast => Ok(shards),
         }
     }
 
@@ -70,13 +78,13 @@ impl WriteRouter {
     ) -> Result<(String, Vec<WriteParam>)> {
         let mut stmt_clone = stmt.clone();
         let shard_suffix = format!("shard{}", shard.hash_bucket);
-        sql_compat::rewrite_to_shard_local(&mut stmt_clone, &shard_suffix);
-        sql_compat::transform_to_duckdb(&mut stmt_clone);
+        write_sql_cl::rewrite_to_shard_local(&mut stmt_clone, &shard_suffix);
+        write_sql_cl::transform_to_duckdb(&mut stmt_clone);
 
         let write_params = if params.is_empty() {
             Vec::new()
         } else {
-            match sql_compat::renumber_placeholders(&mut stmt_clone) {
+            match write_sql_cl::renumber_placeholders(&mut stmt_clone) {
                 Some(order) => order
                     .into_iter()
                     .map(|idx| scalar_to_write_param(params.get(idx)))
@@ -91,7 +99,7 @@ impl WriteRouter {
             }
         };
 
-        Ok((sql_compat::statement_to_sql(&stmt_clone), write_params))
+        Ok((write_sql_cl::statement_to_sql(&stmt_clone), write_params))
     }
 
     /// Number of acknowledgements needed for a majority quorum given the
@@ -109,12 +117,47 @@ impl WriteRouter {
     }
 }
 
-/// Map a shard-key value to a shard index in `0..shard_count` via xxh3 hashing.
+/// Map a shard-key value to a hash bucket in `0..shard_count` via xxh3 hashing.
 /// This hash function is the routing contract; it must match wherever shard
-/// placement is decided.
+/// placement is decided. The bucket it returns is a *bucket number*, not an index
+/// into a shard list — use [`shard_for_bucket`] to turn it into a shard.
 pub fn compute_shard_index(value: &str, shard_count: usize) -> usize {
     let hash = xxhash_rust::xxh3::xxh3_64(value.as_bytes());
     (hash as usize) % shard_count
+}
+
+/// The shard of `table_name` that owns `bucket`, matched on the `hash_bucket`
+/// each record carries rather than on its position in `shards`.
+///
+/// Position is not the bucket. Shard records are stored under the string key
+/// `"{table}:shard{n}"`, so a scan returns them in lexicographic order:
+/// `shard10` before `shard2`. Up to ten shards the two orders coincide and
+/// positional indexing happens to be right; from eleven on it is not, and it
+/// fails silently — every shard can execute the statement, so the row is simply
+/// written to, or looked for on, a shard that does not own its key.
+/// [`MetadataCatalog::get_shards_for_table`] now orders by bucket, but routing
+/// must not depend on that: the ordering is a convenience for callers that read
+/// the list in order, this is the correctness guarantee.
+///
+/// A bucket with no shard record is an error, not something to fall back from: the
+/// layout is incomplete and any other shard would be the wrong one.
+///
+/// [`MetadataCatalog::get_shards_for_table`]: crate::catalog::MetadataCatalog::get_shards_for_table
+pub fn shard_for_bucket<'a>(
+    shards: &'a [ShardMeta],
+    bucket: usize,
+    table_name: &str,
+) -> Result<&'a ShardMeta> {
+    shards
+        .iter()
+        .find(|shard| shard.hash_bucket as usize == bucket)
+        .ok_or_else(|| {
+            CoordinatorError::ShardNotAssigned(format!(
+                "table {table_name} has no shard for hash bucket {bucket}: its shard layout is \
+                 incomplete ({} of the buckets a key can hash to are assigned)",
+                shards.len()
+            ))
+        })
 }
 
 /// Convert a decoded bind parameter into a typed `WriteParam` for transport to

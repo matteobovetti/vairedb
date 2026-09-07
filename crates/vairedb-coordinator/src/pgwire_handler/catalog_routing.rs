@@ -75,14 +75,10 @@ pub(super) fn references_catalog_schema(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sql_compat;
+    use crate::pgwire_handler::parser;
 
     fn parse_one(sql: &str) -> crate::sqlparser::ast::Statement {
-        sql_compat::parse_sql(sql)
-            .unwrap()
-            .into_iter()
-            .next()
-            .unwrap()
+        parser::parse_sql(sql).unwrap().into_iter().next().unwrap()
     }
 
     /// Stand-in for the set built from the registered `pg_catalog` provider at

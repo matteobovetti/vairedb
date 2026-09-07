@@ -14,6 +14,15 @@ pub fn sqlstate_for_code(code: VdbErrorCode) -> &'static str {
         VdbErrorCode::FeatureNotSupported => "0A000",
         VdbErrorCode::TableAlreadyExists => "42P07",
         VdbErrorCode::ColumnAlreadyExists => "42701",
+        VdbErrorCode::WrongObjectType => "42809",
+        VdbErrorCode::InFailedTransaction => "25P02",
+        VdbErrorCode::NoActiveTransaction => "25P01",
+        VdbErrorCode::InvalidSavepoint => "3B001",
+        VdbErrorCode::ReadOnlyTransaction => "25006",
+        VdbErrorCode::PartialCommit => "40003",
+        VdbErrorCode::SchemaNotFound => "3F000",
+        VdbErrorCode::SchemaAlreadyExists => "42P06",
+        VdbErrorCode::DependentObjectsExist => "2BP01",
         VdbErrorCode::ShardNotFound => "42P01",
         VdbErrorCode::WriteConflict => "40001",
         VdbErrorCode::EngineError => "XX000",
@@ -50,5 +59,43 @@ mod tests {
     #[test]
     fn unspecified_falls_back_to_internal_sqlstate() {
         assert_eq!(sqlstate_for_code(VdbErrorCode::Unspecified), "XX000");
+    }
+
+    // Drivers and ORMs branch on these five: `25P02` is what tells a client its
+    // transaction is aborted and only a rollback will do, `3B001` what tells it a
+    // savepoint is gone, and `40003` that a commit's outcome is genuinely unknown.
+    // A wrong SQLSTATE here turns a recoverable state into a hung session.
+    #[test]
+    fn maps_transaction_states_to_the_sqlstates_clients_branch_on() {
+        assert_eq!(
+            sqlstate_for_code(VdbErrorCode::InFailedTransaction),
+            "25P02"
+        );
+        assert_eq!(
+            sqlstate_for_code(VdbErrorCode::NoActiveTransaction),
+            "25P01"
+        );
+        assert_eq!(sqlstate_for_code(VdbErrorCode::InvalidSavepoint), "3B001");
+        assert_eq!(
+            sqlstate_for_code(VdbErrorCode::ReadOnlyTransaction),
+            "25006"
+        );
+        assert_eq!(sqlstate_for_code(VdbErrorCode::PartialCommit), "40003");
+    }
+
+    // A schema that is missing and a schema that is already there are the two
+    // states `CREATE SCHEMA` / `DROP SCHEMA` and every schema-qualified relation
+    // report, and PostgreSQL clients distinguish them from the table-level codes.
+    #[test]
+    fn maps_schema_states_to_their_own_sqlstates() {
+        assert_eq!(sqlstate_for_code(VdbErrorCode::SchemaNotFound), "3F000");
+        assert_eq!(
+            sqlstate_for_code(VdbErrorCode::SchemaAlreadyExists),
+            "42P06"
+        );
+        assert_eq!(
+            sqlstate_for_code(VdbErrorCode::DependentObjectsExist),
+            "2BP01"
+        );
     }
 }

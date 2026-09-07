@@ -6,7 +6,7 @@ use datafusion::execution::context::SessionContext;
 
 use vairedb_coordinator::catalog::{
     ColumnDef, MetadataCatalog, NodeMeta, NodeState, ShardMeta, ShardStrategy, TableMeta,
-    VaireDbCatalogSchema,
+    VaireDbCatalogSchema, ViewMeta,
 };
 
 static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -28,6 +28,8 @@ fn make_catalog() -> Arc<MetadataCatalog> {
 fn sample_table() -> TableMeta {
     TableMeta {
         anonymized_columns: std::collections::HashMap::new(),
+        indexes: Vec::new(),
+        constraints: Vec::new(),
         table_name: "orders".to_string(),
         columns: vec![
             ColumnDef {
@@ -66,8 +68,10 @@ async fn test_table_names() {
             "anonymization_secret",
             "columns",
             "nodes",
+            "schemas",
             "shards",
-            "tables"
+            "tables",
+            "views"
         ]
     );
 }
@@ -81,6 +85,7 @@ async fn test_table_exist() {
     assert!(schema.table_exist("shards"));
     assert!(schema.table_exist("nodes"));
     assert!(schema.table_exist("anonymization_secret"));
+    assert!(schema.table_exist("schemas"));
     assert!(!schema.table_exist("nonexistent"));
 }
 
@@ -194,6 +199,116 @@ async fn test_tables_view_with_data() {
         .downcast_ref::<datafusion::arrow::array::Int32Array>()
         .unwrap();
     assert_eq!(rf.value(0), 2);
+}
+
+/// A view is stored as query text and nothing else, so the `views` table is the
+/// only place its definition is visible — the `columns` table has no row for it.
+// The namespaces someone created. `public` is absent because it is not a record:
+// it always exists, and a relation in it carries no qualifier.
+#[tokio::test]
+async fn test_schemas_view_lists_created_namespaces() {
+    use vairedb_coordinator::catalog::SchemaMeta;
+
+    let catalog = make_catalog();
+    catalog
+        .create_schema_if_absent(&SchemaMeta {
+            schema_name: "sales".to_string(),
+            created_at: None,
+        })
+        .unwrap();
+
+    let schema = VaireDbCatalogSchema::new(Arc::clone(&catalog));
+    let provider = schema.table("schemas").await.unwrap().unwrap();
+
+    let ctx = SessionContext::new();
+    ctx.register_table("s", provider).unwrap();
+    let batches = ctx
+        .sql("SELECT schema_name FROM s ORDER BY schema_name")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    assert_eq!(batches[0].num_rows(), 1);
+    assert_eq!(
+        batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StringArray>()
+            .unwrap()
+            .value(0),
+        "sales"
+    );
+}
+
+#[tokio::test]
+async fn test_views_view_reports_the_definition() {
+    let catalog = make_catalog();
+    catalog
+        .put_view(&ViewMeta {
+            view_name: "big_orders".to_string(),
+            definition: "SELECT id FROM orders WHERE amount > 10".to_string(),
+            columns: vec!["order_id".to_string()],
+            created_at: None,
+        })
+        .unwrap();
+
+    let schema = VaireDbCatalogSchema::new(Arc::clone(&catalog));
+    let provider = schema.table("views").await.unwrap().unwrap();
+
+    let ctx = SessionContext::new();
+    ctx.register_table("v", provider).unwrap();
+    let batches = ctx
+        .sql("SELECT view_name, definition, columns FROM v")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+
+    assert_eq!(batches[0].num_rows(), 1);
+    let strings = |col: usize| {
+        batches[0]
+            .column(col)
+            .as_any()
+            .downcast_ref::<datafusion::arrow::array::StringArray>()
+            .unwrap()
+            .value(0)
+            .to_string()
+    };
+    assert_eq!(strings(0), "big_orders");
+    assert_eq!(strings(1), "SELECT id FROM orders WHERE amount > 10");
+    assert_eq!(strings(2), "order_id");
+}
+
+/// The common case: no explicit column list, so the query's own output names are
+/// the view's columns and there is nothing to report.
+#[tokio::test]
+async fn test_views_view_reports_no_columns_when_none_were_named() {
+    let catalog = make_catalog();
+    catalog
+        .put_view(&ViewMeta {
+            view_name: "v".to_string(),
+            definition: "SELECT 1".to_string(),
+            columns: Vec::new(),
+            created_at: None,
+        })
+        .unwrap();
+
+    let schema = VaireDbCatalogSchema::new(Arc::clone(&catalog));
+    let provider = schema.table("views").await.unwrap().unwrap();
+
+    let ctx = SessionContext::new();
+    ctx.register_table("v", provider).unwrap();
+    let batches = ctx
+        .sql("SELECT columns FROM v")
+        .await
+        .unwrap()
+        .collect()
+        .await
+        .unwrap();
+    assert!(batches[0].column(0).is_null(0));
 }
 
 #[tokio::test]

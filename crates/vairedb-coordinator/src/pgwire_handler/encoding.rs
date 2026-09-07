@@ -97,7 +97,16 @@ pub(super) async fn encode_dataframe_response(
 /// encoder is used for binary result columns, but its text path always emits
 /// `%.6f` fractional seconds, whereas Postgres trims trailing zeros; this keeps
 /// the text wire form faithful for libpq/JDBC clients.
-fn arrow_array_value_to_string(col: &dyn datafusion::arrow::array::Array, row: usize) -> String {
+///
+/// The write path renders cells with this too ([`crate::write_sql_cl`]'s row
+/// materialization), deliberately sharing the one renderer: a value re-emitted as
+/// a SQL literal then spells itself the same way a client reading it back sees it,
+/// which is what makes `INSERT ... SELECT` route a row to the shard a literal of
+/// the same value would.
+pub(crate) fn arrow_array_value_to_string(
+    col: &dyn datafusion::arrow::array::Array,
+    row: usize,
+) -> String {
     use datafusion::arrow::array::*;
     use datafusion::arrow::datatypes::DataType as ArrowDT;
 

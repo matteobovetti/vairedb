@@ -1,11 +1,15 @@
 //! Decides how a write statement maps onto shards from its shard-key constraint:
-//! a single owning shard, a reject (NULL key), or a legitimate broadcast. This is
-//! the single source of truth for that route/reject/broadcast decision.
+//! a single owning shard, a reject (a NULL key, or one not reducible to a value),
+//! or a legitimate broadcast. This is the single source of truth for that
+//! route/reject/broadcast decision.
 
 use crate::sqlparser::ast::{Expr, SetExpr, Statement};
 use datafusion::scalar::ScalarValue;
 
+use crate::pgwire_handler::query_router::canonicalize_ident;
+
 use super::routing_value::{RoutedValue, expr_routing_value};
+use super::statement::shard_key_column_index;
 
 /// How a write statement should be routed across shards.
 pub enum ShardRouting {
@@ -15,6 +19,12 @@ pub enum ShardRouting {
     /// be hashed to a shard, so the write must be rejected rather than silently
     /// broadcast (which would duplicate an INSERT across every shard).
     Null,
+    /// An INSERT supplies a shard key the coordinator cannot reduce to a value
+    /// (a computed expression, a function call, a bind parameter of a type whose
+    /// bound and literal forms disagree). The row must be rejected: hashing the
+    /// expression's source text would store it on a shard that no lookup of the
+    /// same value visits. Carries the client-facing reason.
+    Unroutable(String),
     /// No shard-key constraint is present (e.g. `DELETE FROM t` with no WHERE);
     /// the write legitimately applies to every shard.
     Broadcast,
@@ -26,8 +36,7 @@ pub enum ShardRouting {
 pub fn route_target(stmt: &Statement, shard_key: &str, params: &[ScalarValue]) -> ShardRouting {
     match stmt {
         Statement::Insert(insert) => {
-            let columns: Vec<String> = insert.columns.iter().map(|c| c.value.clone()).collect();
-            let Some(key_idx) = columns.iter().position(|c| c == shard_key) else {
+            let Some(key_idx) = shard_key_column_index(&insert.columns, shard_key) else {
                 return ShardRouting::Broadcast;
             };
 
@@ -39,6 +48,7 @@ pub fn route_target(stmt: &Statement, shard_key: &str, params: &[ScalarValue]) -
                 return match expr_routing_value(expr, params) {
                     RoutedValue::Value(v) => ShardRouting::One(v),
                     RoutedValue::Null => ShardRouting::Null,
+                    RoutedValue::Unroutable(reason) => ShardRouting::Unroutable(reason),
                 };
             }
             ShardRouting::Broadcast
@@ -59,17 +69,25 @@ pub fn route_target(stmt: &Statement, shard_key: &str, params: &[ScalarValue]) -
     }
 }
 
+/// Turn the shard-key value found in an UPDATE/DELETE predicate into a route.
+///
+/// An unroutable value broadcasts rather than rejecting: each shard re-evaluates
+/// the WHERE clause against its own rows, so `DELETE FROM t WHERE id = 1 + 1`
+/// applied everywhere removes exactly the right rows — the key just cannot be
+/// used to narrow the fan-out. (An INSERT has no predicate to fall back on, which
+/// is why [`route_target`] rejects there instead.)
 fn routing_from_equality(value: Option<RoutedValue>) -> ShardRouting {
     match value {
         Some(RoutedValue::Value(v)) => ShardRouting::One(v),
         Some(RoutedValue::Null) => ShardRouting::Null,
-        None => ShardRouting::Broadcast,
+        Some(RoutedValue::Unroutable(_)) | None => ShardRouting::Broadcast,
     }
 }
 
 /// The single routable shard-key value for `stmt`, or `None` when the statement
-/// has no usable single-shard key (no constraint, or a NULL value). Prefer
-/// [`route_target`] when the NULL-vs-absent distinction matters.
+/// has no usable single-shard key (no constraint, a NULL value, or a value the
+/// coordinator cannot hash). Prefer [`route_target`] when those distinctions
+/// matter.
 pub fn extract_shard_key_value(
     stmt: &Statement,
     shard_key: &str,
@@ -77,7 +95,7 @@ pub fn extract_shard_key_value(
 ) -> Option<String> {
     match route_target(stmt, shard_key, params) {
         ShardRouting::One(value) => Some(value),
-        ShardRouting::Null | ShardRouting::Broadcast => None,
+        ShardRouting::Null | ShardRouting::Unroutable(_) | ShardRouting::Broadcast => None,
     }
 }
 
@@ -92,13 +110,16 @@ fn extract_equality_from_where(
     match expr {
         Expr::BinaryOp { left, op, right } => {
             if matches!(op, crate::sqlparser::ast::BinaryOperator::Eq) {
+                // `key_column` is the catalog's canonical name, so fold the
+                // client's identifier the same way: `WHERE ID = 1` constrains a
+                // shard key declared `id`.
                 if let Expr::Identifier(ident) = left.as_ref()
-                    && ident.value == key_column
+                    && canonicalize_ident(ident) == key_column
                 {
                     return Some(expr_routing_value(right, params));
                 }
                 if let Expr::Identifier(ident) = right.as_ref()
-                    && ident.value == key_column
+                    && canonicalize_ident(ident) == key_column
                 {
                     return Some(expr_routing_value(left, params));
                 }
@@ -117,8 +138,8 @@ fn extract_equality_from_where(
 
 #[cfg(test)]
 mod tests {
-    use super::super::parse_sql;
     use super::*;
+    use crate::pgwire_handler::parser::parse_sql;
 
     fn parse_one(sql: &str) -> Statement {
         parse_sql(sql).unwrap().into_iter().next().unwrap()
@@ -265,6 +286,237 @@ mod tests {
         let from_literal = extract_shard_key_value(&literal, "id", &[]).unwrap();
         assert_eq!(from_param, from_literal);
         assert_eq!(from_param, "9007199254740993");
+    }
+
+    // Identifiers fold like PostgreSQL's: an unquoted `ID` names the canonical
+    // `id`. Missing that match does not fail loudly — it falls through to
+    // Broadcast, duplicating an INSERT across every shard.
+    #[test]
+    fn unquoted_shard_key_matches_regardless_of_case() {
+        let upper = parse_one("INSERT INTO t (ID, v) VALUES (5, 'a')");
+        let mixed = parse_one("INSERT INTO t (Id, v) VALUES (5, 'a')");
+        let lower = parse_one("INSERT INTO t (id, v) VALUES (5, 'a')");
+        let expected = extract_shard_key_value(&lower, "id", &[]).unwrap();
+        assert_eq!(
+            extract_shard_key_value(&upper, "id", &[]).unwrap(),
+            expected
+        );
+        assert_eq!(
+            extract_shard_key_value(&mixed, "id", &[]).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn unquoted_shard_key_in_where_matches_regardless_of_case() {
+        for sql in [
+            "DELETE FROM t WHERE ID = 5",
+            "DELETE FROM t WHERE Id = 5",
+            "UPDATE t SET v = 'x' WHERE ID = 5",
+            "UPDATE t SET v = 'x' WHERE a = 1 AND ID = 5",
+        ] {
+            let stmt = parse_one(sql);
+            assert_eq!(
+                extract_shard_key_value(&stmt, "id", &[]).as_deref(),
+                Some("5"),
+                "`{sql}` must route on the shard key, not broadcast"
+            );
+        }
+    }
+
+    // A quoted identifier keeps its case, so `"ID"` is a *different* column from
+    // the canonical `id` and must not be mistaken for the shard key.
+    #[test]
+    fn quoted_shard_key_of_a_different_case_does_not_match() {
+        let stmt = parse_one("INSERT INTO t (\"ID\", v) VALUES (5, 'a')");
+        assert!(matches!(
+            route_target(&stmt, "id", &[]),
+            ShardRouting::Broadcast
+        ));
+
+        let del = parse_one("DELETE FROM t WHERE \"ID\" = 5");
+        assert!(matches!(
+            route_target(&del, "id", &[]),
+            ShardRouting::Broadcast
+        ));
+    }
+
+    // A table declared with a quoted mixed-case shard key stores it verbatim, so
+    // only the same quoted form matches.
+    #[test]
+    fn quoted_shard_key_matches_its_own_case() {
+        let stmt = parse_one("INSERT INTO t (\"Id\", v) VALUES (5, 'a')");
+        assert_eq!(
+            extract_shard_key_value(&stmt, "Id", &[]).as_deref(),
+            Some("5")
+        );
+    }
+
+    // --- Unroutable shard keys: reject, never guess from the source text ---
+    //
+    // Hashing an expression's text puts the row on a shard that no lookup of the
+    // equivalent value ever visits, and nothing fails: the INSERT reports success
+    // and the row is unreachable. So every form whose value the coordinator
+    // cannot determine must be refused.
+
+    #[test]
+    fn computed_insert_shard_key_is_unroutable() {
+        // `1 + 1` hashed as the text "1 + 1" lands on a different shard from the
+        // `2` DuckDB actually stores.
+        let stmt = parse_one("INSERT INTO t (id, v) VALUES (1 + 1, 'a')");
+        let reason = match route_target(&stmt, "id", &[]) {
+            ShardRouting::Unroutable(r) => r,
+            _ => panic!("a computed shard key must be refused, not routed on its text"),
+        };
+        assert!(
+            reason.contains("1 + 1"),
+            "reason must name the expression: {reason}"
+        );
+    }
+
+    #[test]
+    fn non_constant_insert_shard_keys_are_unroutable() {
+        for sql in [
+            // Evaluated on the shard, so its value is unknown here.
+            "INSERT INTO t (id, v) VALUES (nextval('s'), 'a')",
+            // Another column's value; not available at routing time.
+            "INSERT INTO t (id, v) VALUES (other_col, 'a')",
+            // A subquery result.
+            "INSERT INTO t (id, v) VALUES ((SELECT max(id) FROM u), 'a')",
+            // A cast may change the value that is stored (`'10.5'::INTEGER`),
+            // so the cast's text is not a safe routing key.
+            "INSERT INTO t (id, v) VALUES ('10.5'::INTEGER, 'a')",
+        ] {
+            let stmt = parse_one(sql);
+            assert!(
+                matches!(route_target(&stmt, "id", &[]), ShardRouting::Unroutable(_)),
+                "`{sql}` must be refused rather than routed on its source text"
+            );
+        }
+    }
+
+    // An UPDATE/DELETE carries its predicate to every shard, which re-evaluates it
+    // against its own rows — so a broadcast is *correct* there, just unoptimized.
+    // Rejecting would be a gratuitous refusal of a statement we can run.
+    #[test]
+    fn unroutable_predicate_broadcasts_rather_than_rejecting() {
+        for sql in [
+            "DELETE FROM t WHERE id = 1 + 1",
+            "UPDATE t SET v = 'x' WHERE id = other_col",
+        ] {
+            let stmt = parse_one(sql);
+            assert!(
+                matches!(route_target(&stmt, "id", &[]), ShardRouting::Broadcast),
+                "`{sql}` is correct on every shard, so it must broadcast"
+            );
+        }
+    }
+
+    // A negative literal parses as unary minus over a number, not as one numeric
+    // token; it must still route, and route with the param of the same value.
+    #[test]
+    fn signed_numeric_literal_routes_like_the_param() {
+        let literal = parse_one("INSERT INTO t (id, v) VALUES (-1, 'a')");
+        let from_literal = extract_shard_key_value(&literal, "id", &[]).unwrap();
+        assert_eq!(from_literal, "-1");
+
+        let stmt = parse_one("INSERT INTO t (id, v) VALUES ($1, $2)");
+        let params = vec![
+            ScalarValue::Int32(Some(-1)),
+            ScalarValue::Utf8(Some("a".into())),
+        ];
+        assert_eq!(
+            extract_shard_key_value(&stmt, "id", &params).unwrap(),
+            from_literal
+        );
+    }
+
+    #[test]
+    fn parenthesized_literal_routes_like_the_bare_literal() {
+        let nested = parse_one("INSERT INTO t (id, v) VALUES ((5), 'a')");
+        let bare = parse_one("INSERT INTO t (id, v) VALUES (5, 'a')");
+        assert_eq!(
+            extract_shard_key_value(&nested, "id", &[]).unwrap(),
+            extract_shard_key_value(&bare, "id", &[]).unwrap()
+        );
+    }
+
+    // A `DATE '...'` literal and a bound Date32 of the same day must agree, so a
+    // parameterized INSERT and a literal point lookup find the same shard.
+    #[test]
+    fn date_param_routes_like_a_date_literal() {
+        let stmt = parse_one("INSERT INTO t (id, v) VALUES ($1, $2)");
+        let params = vec![
+            ScalarValue::Date32(Some(19000)), // 2022-01-08
+            ScalarValue::Utf8(Some("a".into())),
+        ];
+        let from_param = extract_shard_key_value(&stmt, "id", &params).unwrap();
+        let literal = parse_one("INSERT INTO t (id, v) VALUES (DATE '2022-01-08', 'a')");
+        assert_eq!(
+            extract_shard_key_value(&literal, "id", &[]).unwrap(),
+            from_param
+        );
+        // The bare-string spelling stores the same DATE value, so it routes there too.
+        let bare = parse_one("INSERT INTO t (id, v) VALUES ('2022-01-08', 'a')");
+        assert_eq!(
+            extract_shard_key_value(&bare, "id", &[]).unwrap(),
+            from_param
+        );
+    }
+
+    // `ScalarValue` Display is not a SQL literal for these types: a timestamp
+    // renders as a raw epoch count (a *different* count per TimeUnit), an interval
+    // as a Rust struct, binary as hex. No literal of the same value hashes to that
+    // string, so binding one as the shard key must be refused, not guessed.
+    #[test]
+    fn params_whose_literal_form_differs_are_unroutable() {
+        let stmt = parse_one("INSERT INTO t (id, v) VALUES ($1, $2)");
+        let cases = [
+            ScalarValue::TimestampMicrosecond(Some(1641024000000000), None),
+            ScalarValue::TimestampNanosecond(Some(1641024000000000000), None),
+            ScalarValue::Time64Microsecond(Some(3600000000)),
+            ScalarValue::Binary(Some(vec![1, 2, 255])),
+            ScalarValue::DurationSecond(Some(90)),
+        ];
+        for scalar in cases {
+            let params = vec![scalar.clone(), ScalarValue::Utf8(Some("a".into()))];
+            match route_target(&stmt, "id", &params) {
+                ShardRouting::Unroutable(reason) => assert!(
+                    reason.contains(&scalar.data_type().to_string()),
+                    "reason must name the type: {reason}"
+                ),
+                _ => panic!(
+                    "{:?} must not be routed on its Display form",
+                    scalar.data_type()
+                ),
+            }
+        }
+    }
+
+    // Under-binding is the client's error; picking a shard anyway would hide it.
+    #[test]
+    fn an_unbound_shard_key_parameter_is_unroutable() {
+        let stmt = parse_one("INSERT INTO t (id, v) VALUES ($1, $2)");
+        assert!(matches!(
+            route_target(&stmt, "id", &[]),
+            ShardRouting::Unroutable(_)
+        ));
+    }
+
+    #[test]
+    fn decimal256_param_matches_literal() {
+        use datafusion::arrow::datatypes::i256;
+        let stmt = parse_one("INSERT INTO t (id, v) VALUES ($1, $2)");
+        let params = vec![
+            ScalarValue::Decimal256(Some(i256::from_i128(123456)), 6, 3),
+            ScalarValue::Utf8(Some("a".into())),
+        ];
+        let from_param = extract_shard_key_value(&stmt, "id", &params).unwrap();
+        let literal = parse_one("INSERT INTO t (id, v) VALUES (123.456, 'a')");
+        assert_eq!(
+            extract_shard_key_value(&literal, "id", &[]).unwrap(),
+            from_param
+        );
     }
 
     #[test]

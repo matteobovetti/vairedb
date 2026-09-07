@@ -20,12 +20,19 @@ use crate::catalog::ShardMeta;
 use super::scheduler::SchedulerTableProvider;
 
 /// Wire form of a `SchedulerTableProvider`: the table name plus, per shard, its
-/// physical shard name, primary node id, and replica node ids. Affinity fields
-/// default to empty for backward compatibility with older encodings.
+/// physical shard name, hash bucket, primary node id, and replica node ids.
+/// Every field but the first two defaults to empty for backward compatibility
+/// with older encodings.
 #[derive(Debug, Serialize, Deserialize)]
 struct EncodedTableProvider {
     table_name: String,
     shard_names: Vec<String>,
+    /// The bucket each entry belongs to, carried rather than inferred from the
+    /// entry's position: a shard's position in a list is not its bucket number
+    /// (see `write_router::shard_for_bucket`), and the bucket is what names the
+    /// physical table the scan reads.
+    #[serde(default)]
+    hash_buckets: Vec<u32>,
     #[serde(default)]
     primary_node_ids: Vec<String>,
     #[serde(default)]
@@ -74,18 +81,24 @@ impl LogicalExtensionCodec for VaireLogicalCodec {
             .shard_names
             .iter()
             .enumerate()
-            .map(|(i, _)| ShardMeta {
-                shard_id: crate::util::logical_shard_id(i as u32),
-                table_name: encoded.table_name.clone(),
-                hash_bucket: i as u32,
-                primary_node_id: encoded.primary_node_ids.get(i).cloned().unwrap_or_default(),
-                replica_node_ids: encoded
-                    .replica_node_ids_per_shard
-                    .get(i)
-                    .cloned()
-                    .unwrap_or_default(),
-                range_lower: String::new(),
-                range_upper: String::new(),
+            .map(|(i, _)| {
+                // An encoding from before `hash_buckets` existed has none to read,
+                // and its shards were listed in bucket order, so the position is
+                // the best available answer for it.
+                let bucket = encoded.hash_buckets.get(i).copied().unwrap_or(i as u32);
+                ShardMeta {
+                    shard_id: crate::util::logical_shard_id(bucket),
+                    table_name: encoded.table_name.clone(),
+                    hash_bucket: bucket,
+                    primary_node_id: encoded.primary_node_ids.get(i).cloned().unwrap_or_default(),
+                    replica_node_ids: encoded
+                        .replica_node_ids_per_shard
+                        .get(i)
+                        .cloned()
+                        .unwrap_or_default(),
+                    range_lower: String::new(),
+                    range_upper: String::new(),
+                }
             })
             .collect();
 
@@ -129,9 +142,12 @@ impl LogicalExtensionCodec for VaireLogicalCodec {
             .map(|p| p.replica_node_ids.clone())
             .collect();
 
+        let hash_buckets: Vec<u32> = provider.shards().iter().map(|p| p.hash_bucket).collect();
+
         let encoded = EncodedTableProvider {
             table_name: provider.table_name().to_string(),
             shard_names,
+            hash_buckets,
             primary_node_ids,
             replica_node_ids_per_shard,
         };

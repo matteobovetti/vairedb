@@ -4,11 +4,12 @@ use duckdb::types::Value;
 use tonic::{Request, Response, Status};
 
 use vairedb_common::proto::vairedb::v1::{
-    ErrorDetail, ExecuteWriteRequest, ExecuteWriteResponse, WriteResult,
+    ErrorDetail, ExecuteWriteRequest, ExecuteWriteResponse, WriteResult, WriteStatement,
     write_service_server::WriteService,
 };
 
-use crate::write_queue::WriteQueueHandle;
+use crate::error::CoreError;
+use crate::write_queue::{QueuedStatement, WriteQueueHandle};
 
 use super::dedup_cache::DedupCache;
 use super::param_conversion::write_param_to_duckdb_value;
@@ -45,6 +46,89 @@ impl WriteServiceImpl {
             poisoned.into_inner()
         })
     }
+
+    /// Apply each statement on its own, reporting one result per statement. A
+    /// failing statement does not stop the ones after it.
+    async fn apply_one_by_one(&self, req: &ExecuteWriteRequest) -> Vec<WriteResult> {
+        let mut results = Vec::with_capacity(req.statements.len());
+
+        for stmt in &req.statements {
+            let params = duckdb_params(stmt);
+            let result = self
+                .write_queue
+                .execute_with_params(stmt.sql.clone(), params)
+                .await;
+
+            match result {
+                Ok(rows_affected) => results.push(succeeded(rows_affected)),
+                Err(e) => {
+                    tracing::warn!(
+                        write_id = %req.write_id,
+                        shard_id = %stmt.shard_id,
+                        error = %e,
+                        "write statement failed"
+                    );
+                    results.push(failed(&e));
+                }
+            }
+        }
+
+        results
+    }
+
+    /// Apply every statement inside one transaction on the node. On success there
+    /// is one result per statement; on failure a single failed result, because
+    /// nothing was applied and no statement has an outcome of its own.
+    async fn apply_atomically(&self, req: &ExecuteWriteRequest) -> Vec<WriteResult> {
+        let statements: Vec<QueuedStatement> = req
+            .statements
+            .iter()
+            .map(|stmt| QueuedStatement {
+                sql: stmt.sql.clone(),
+                params: duckdb_params(stmt),
+            })
+            .collect();
+
+        match self.write_queue.execute_atomic_batch(statements).await {
+            Ok(rows_affected) => rows_affected.into_iter().map(succeeded).collect(),
+            Err(e) => {
+                tracing::warn!(
+                    write_id = %req.write_id,
+                    statements = req.statements.len(),
+                    error = %e,
+                    "atomic write batch rolled back"
+                );
+                vec![failed(&e)]
+            }
+        }
+    }
+}
+
+/// Convert a statement's protobuf bind parameters to DuckDB values.
+fn duckdb_params(stmt: &WriteStatement) -> Vec<Value> {
+    stmt.params
+        .iter()
+        .map(write_param_to_duckdb_value)
+        .collect()
+}
+
+fn succeeded(rows_affected: u64) -> WriteResult {
+    WriteResult {
+        success: true,
+        rows_affected: rows_affected as i64,
+        error: None,
+    }
+}
+
+fn failed(error: &CoreError) -> WriteResult {
+    WriteResult {
+        success: false,
+        rows_affected: 0,
+        error: Some(ErrorDetail {
+            code: error.vdb_error_code().into(),
+            message: vairedb_common::error::sanitize_message(&error.to_string()),
+        }),
+    }
 }
 
 #[cfg(test)]
@@ -76,46 +160,11 @@ impl WriteService for WriteServiceImpl {
             }
         }
 
-        let mut results = Vec::with_capacity(req.statements.len());
-
-        for stmt in &req.statements {
-            let params: Vec<Value> = stmt
-                .params
-                .iter()
-                .map(write_param_to_duckdb_value)
-                .collect();
-            let result = self
-                .write_queue
-                .execute_with_params(stmt.sql.clone(), params)
-                .await;
-
-            match result {
-                Ok(rows_affected) => {
-                    results.push(WriteResult {
-                        success: true,
-                        rows_affected: rows_affected as i64,
-                        error: None,
-                    });
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        write_id = %req.write_id,
-                        shard_id = %stmt.shard_id,
-                        error = %e,
-                        "write statement failed"
-                    );
-                    let code = e.vdb_error_code();
-                    results.push(WriteResult {
-                        success: false,
-                        rows_affected: 0,
-                        error: Some(ErrorDetail {
-                            code: code.into(),
-                            message: vairedb_common::error::sanitize_message(&e.to_string()),
-                        }),
-                    });
-                }
-            }
-        }
+        let results = if req.atomic {
+            self.apply_atomically(&req).await
+        } else {
+            self.apply_one_by_one(&req).await
+        };
 
         if !req.write_id.is_empty() {
             let mut cache = self.lock_dedup();
@@ -157,7 +206,28 @@ mod tests {
         Request::new(ExecuteWriteRequest {
             write_id: write_id.to_string(),
             statements,
+            atomic: false,
         })
+    }
+
+    fn make_atomic_request(
+        write_id: &str,
+        statements: Vec<WriteStatement>,
+    ) -> Request<ExecuteWriteRequest> {
+        Request::new(ExecuteWriteRequest {
+            write_id: write_id.to_string(),
+            statements,
+            atomic: true,
+        })
+    }
+
+    fn insert(sql: &str) -> WriteStatement {
+        WriteStatement {
+            sql: sql.to_string(),
+            shard_id: "orders_shard0".to_string(),
+            operation: WriteOperation::Insert.into(),
+            params: vec![],
+        }
     }
 
     #[tokio::test]
@@ -340,5 +410,96 @@ mod tests {
         let error = results[0].error.as_ref().unwrap();
         assert_eq!(error.code, VdbErrorCode::ShardNotFound as i32);
         assert!(!error.message.is_empty());
+    }
+
+    /// A service plus a second connection to the same in-memory database, for
+    /// reading back what the writer thread committed.
+    fn setup_service_with_reader() -> (WriteServiceImpl, Connection) {
+        let conn = Connection::open_in_memory().unwrap();
+        conn.execute("CREATE TABLE orders_shard0 (id INTEGER, amount DOUBLE)", [])
+            .unwrap();
+        let reader = conn.try_clone().unwrap();
+        let handle = WriteQueue::start(conn, 64);
+        (WriteServiceImpl::new(handle), reader)
+    }
+
+    fn row_count(reader: &Connection) -> i64 {
+        reader
+            .query_row("SELECT count(*) FROM orders_shard0", [], |row| row.get(0))
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn atomic_request_reports_every_statement_on_success() {
+        let (service, reader) = setup_service_with_reader();
+        let stmts = vec![
+            insert("INSERT INTO orders_shard0 VALUES (1, 10.0)"),
+            insert("INSERT INTO orders_shard0 VALUES (2, 20.0), (3, 30.0)"),
+        ];
+        let response = service
+            .execute_write(make_atomic_request("w-atomic-ok", stmts))
+            .await
+            .unwrap();
+        let results = response.into_inner().results;
+        assert_eq!(results.len(), 2);
+        assert!(results.iter().all(|r| r.success));
+        assert_eq!(results[0].rows_affected, 1);
+        assert_eq!(results[1].rows_affected, 2);
+        assert_eq!(row_count(&reader), 3);
+    }
+
+    #[tokio::test]
+    async fn atomic_request_applies_nothing_when_a_statement_fails() {
+        let (service, reader) = setup_service_with_reader();
+        let stmts = vec![
+            insert("INSERT INTO orders_shard0 VALUES (1, 10.0)"),
+            insert("INSERT INTO nonexistent_table VALUES (2)"),
+            insert("INSERT INTO orders_shard0 VALUES (3, 30.0)"),
+        ];
+        let response = service
+            .execute_write(make_atomic_request("w-atomic-fail", stmts))
+            .await
+            .unwrap();
+        let results = response.into_inner().results;
+
+        // One failed result stands for the whole batch: nothing was applied.
+        assert_eq!(results.len(), 1);
+        assert!(!results[0].success);
+        assert!(results[0].error.is_some());
+        assert_eq!(row_count(&reader), 0);
+    }
+
+    #[tokio::test]
+    async fn non_atomic_request_keeps_statements_before_a_failure() {
+        let (service, reader) = setup_service_with_reader();
+        let stmts = vec![
+            insert("INSERT INTO orders_shard0 VALUES (1, 10.0)"),
+            insert("INSERT INTO nonexistent_table VALUES (2)"),
+        ];
+        let response = service
+            .execute_write(make_request("w-non-atomic-fail", stmts))
+            .await
+            .unwrap();
+        let results = response.into_inner().results;
+        assert_eq!(results.len(), 2);
+        assert!(results[0].success);
+        assert!(!results[1].success);
+        assert_eq!(row_count(&reader), 1);
+    }
+
+    #[tokio::test]
+    async fn duplicate_atomic_write_id_is_not_reapplied() {
+        let (service, reader) = setup_service_with_reader();
+        let stmts = vec![insert("INSERT INTO orders_shard0 VALUES (1, 10.0)")];
+        service
+            .execute_write(make_atomic_request("w-atomic-dup", stmts.clone()))
+            .await
+            .unwrap();
+        let response = service
+            .execute_write(make_atomic_request("w-atomic-dup", stmts))
+            .await
+            .unwrap();
+        assert!(response.into_inner().results[0].success);
+        assert_eq!(row_count(&reader), 1);
     }
 }

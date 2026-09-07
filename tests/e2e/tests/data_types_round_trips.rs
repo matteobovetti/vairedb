@@ -1850,30 +1850,41 @@ async fn test_enum_column_ordering() {
 // Pseudo-types
 // ============================================================================
 
-// SERIAL is a PostgreSQL pseudo-type (auto-increment). It is not mapped to a
-// DuckDB sequence/identity type, so the per-shard CREATE fails at DuckDB.
+// SERIAL is a PostgreSQL pseudo-type: a column backed by a sequence. VaireDB has
+// no sequences **by decision**, not by omission — a per-shard counter hands out the
+// same numbers on every shard, and each replica of a shard would advance its own
+// copy — so this is a rejection test, not an xfail. See the "Decided limitation:
+// no sequences" section of `docs/specs/gap-analysis-command.md`.
 #[tokio::test]
-#[ignore = "known gap: SERIAL is not mapped to a DuckDB sequence/identity column. Take a look to https://duckdb.org/docs/current/sql/statements/create_sequence."]
-async fn test_serial_column() {
+async fn test_serial_column_is_refused_with_the_reason() {
     let client = ready_client().await;
-    let tbl = create_table(
+    let tbl = unique_table_name("tr_serial");
+
+    let err = execute_expect_err(
         &client,
-        "tr_serial",
-        &format!("(id INTEGER NOT NULL, seq SERIAL) {CREATE_OPTS}"),
+        &format!("CREATE TABLE {tbl} (id INTEGER NOT NULL, seq SERIAL) {CREATE_OPTS}"),
     )
     .await;
-    execute(&client, &format!("INSERT INTO {tbl} (id) VALUES (1)"))
-        .await
-        .unwrap();
-
-    let rows = simple_query_rows(&client, &format!("SELECT seq FROM {tbl}"))
-        .await
-        .unwrap();
     assert_eq!(
-        rows[0][0].as_deref(),
-        Some("1"),
-        "SERIAL should auto-assign 1"
+        err.code().code(),
+        SQLSTATE_FEATURE_NOT_SUPPORTED,
+        "SERIAL should be a feature rejection, not a storage-engine error (got {}: {})",
+        err.code().code(),
+        err.message()
+    );
+    // The rejection has to carry the reason and the alternative, or a client learns
+    // nothing it can act on.
+    assert!(
+        err.message().contains("no sequences") && err.message().contains("UUID"),
+        "message should explain why and name the alternative: {}",
+        err.message()
     );
 
-    drop_table(&client, &tbl).await;
+    // And the refusal is up front: no table was created under that name.
+    assert!(
+        simple_query_rows(&client, &format!("SELECT 1 FROM {tbl}"))
+            .await
+            .is_err(),
+        "the refused CREATE must not have registered {tbl}"
+    );
 }

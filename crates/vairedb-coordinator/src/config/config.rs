@@ -21,6 +21,12 @@ pub struct CoordinatorConfig {
     pub heartbeat_timeout_secs: u64,
     /// Number of replicas assigned to each new shard.
     pub default_replication_factor: u32,
+    /// Whether a transaction block whose writes span several shard groups may
+    /// commit. VaireDB has no cross-shard commit protocol, so such a `COMMIT` is
+    /// refused by default — nothing is written. Setting this to `true` applies the
+    /// groups one at a time instead: the transaction succeeds, but a failure
+    /// part-way through leaves the earlier groups applied.
+    pub allow_cross_shard_transactions: bool,
     /// Initial backoff before retrying a failed replication tail send.
     pub tail_retry_initial_ms: u64,
     /// Maximum backoff for replication tail retries.

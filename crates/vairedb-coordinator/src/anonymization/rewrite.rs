@@ -55,8 +55,10 @@ pub fn anonymize_statement(
                 return Ok(());
             };
             let SetExpr::Values(values) = source.body.as_mut() else {
-                // INSERT ... SELECT is rejected earlier for sharded tables; guard
-                // here too so a non-VALUES source is never silently un-anonymized.
+                // An `INSERT ... SELECT` has its rows materialized into literal
+                // `VALUES` before it reaches here, so a query source at this point
+                // means something new routed around that. Refuse rather than let a
+                // non-VALUES source pass through silently un-anonymized.
                 return Err("anonymized columns require an INSERT ... VALUES statement".to_string());
             };
 
@@ -159,7 +161,7 @@ mod tests {
     use std::cell::Cell;
 
     use super::*;
-    use crate::sql_compat;
+    use crate::write_sql_cl;
 
     struct StaticResolver {
         secrets: HashMap<String, Secret>,
@@ -192,7 +194,7 @@ mod tests {
     }
 
     fn parse_one(sql: &str) -> Statement {
-        sql_compat::parse_sql(sql)
+        crate::pgwire_handler::parser::parse_sql(sql)
             .unwrap()
             .into_iter()
             .next()
@@ -216,7 +218,7 @@ mod tests {
             &resolver,
         )
         .unwrap();
-        let sql = sql_compat::statement_to_sql(&stmt);
+        let sql = write_sql_cl::statement_to_sql(&stmt);
 
         let name_digest = hmac_sha256_hex("key", "Alice");
         let email_digest = hmac_sha256_hex("key", "a@x.com");
@@ -233,7 +235,7 @@ mod tests {
         let mut stmt = parse_one("INSERT INTO t (id, email) VALUES (1, 'a@x.com'), (2, 'b@x.com')");
         let resolver = StaticResolver::with("sid", HMAC_SHA256_ALGO, "key");
         anonymize_statement(&mut stmt, &anon_map(&[("email", "sid")]), &resolver).unwrap();
-        let sql = sql_compat::statement_to_sql(&stmt);
+        let sql = write_sql_cl::statement_to_sql(&stmt);
         assert!(
             sql.contains(&hmac_sha256_hex("key", "a@x.com")),
             "got: {sql}"
@@ -282,7 +284,7 @@ mod tests {
         .unwrap();
         assert_eq!(resolver.calls.get(), 1, "secret should be resolved once");
         // And every value is still hashed.
-        let sql = sql_compat::statement_to_sql(&stmt);
+        let sql = write_sql_cl::statement_to_sql(&stmt);
         assert!(!sql.contains("@x.com"), "plaintext leaked: {sql}");
     }
 
@@ -294,7 +296,7 @@ mod tests {
         let mut stmt = parse_one("INSERT INTO t (id, EMAIL) VALUES (1, 'a@x.com')");
         let resolver = StaticResolver::with("sid", HMAC_SHA256_ALGO, "key");
         anonymize_statement(&mut stmt, &anon_map(&[("email", "sid")]), &resolver).unwrap();
-        let sql = sql_compat::statement_to_sql(&stmt);
+        let sql = write_sql_cl::statement_to_sql(&stmt);
         assert!(
             sql.contains(&hmac_sha256_hex("key", "a@x.com")),
             "got: {sql}"
@@ -307,7 +309,7 @@ mod tests {
         let mut stmt = parse_one("UPDATE t SET EMAIL = 'new@x.com' WHERE id = 1");
         let resolver = StaticResolver::with("sid", HMAC_SHA256_ALGO, "key");
         anonymize_statement(&mut stmt, &anon_map(&[("email", "sid")]), &resolver).unwrap();
-        let sql = sql_compat::statement_to_sql(&stmt);
+        let sql = write_sql_cl::statement_to_sql(&stmt);
         assert!(
             sql.contains(&hmac_sha256_hex("key", "new@x.com")),
             "got: {sql}"
@@ -320,7 +322,7 @@ mod tests {
         let mut stmt = parse_one("UPDATE t SET email = 'new@x.com' WHERE id = 1");
         let resolver = StaticResolver::with("sid", HMAC_SHA256_ALGO, "key");
         anonymize_statement(&mut stmt, &anon_map(&[("email", "sid")]), &resolver).unwrap();
-        let sql = sql_compat::statement_to_sql(&stmt);
+        let sql = write_sql_cl::statement_to_sql(&stmt);
         assert!(
             sql.contains(&hmac_sha256_hex("key", "new@x.com")),
             "got: {sql}"
@@ -333,7 +335,7 @@ mod tests {
         let mut stmt = parse_one("INSERT INTO t (id, email) VALUES (1, NULL)");
         let resolver = StaticResolver::with("sid", HMAC_SHA256_ALGO, "key");
         anonymize_statement(&mut stmt, &anon_map(&[("email", "sid")]), &resolver).unwrap();
-        let sql = sql_compat::statement_to_sql(&stmt);
+        let sql = write_sql_cl::statement_to_sql(&stmt);
         assert!(sql.to_uppercase().contains("NULL"), "got: {sql}");
     }
 
@@ -369,7 +371,36 @@ mod tests {
         let mut stmt = parse_one("INSERT INTO t (id, email) VALUES (1, 'a@x.com')");
         let resolver = StaticResolver::empty();
         anonymize_statement(&mut stmt, &HashMap::new(), &resolver).unwrap();
-        let sql = sql_compat::statement_to_sql(&stmt);
+        let sql = write_sql_cl::statement_to_sql(&stmt);
         assert!(sql.contains("a@x.com"), "got: {sql}");
+    }
+
+    // This rewriter finds anonymized columns by their position in the INSERT's
+    // column list, so a positional INSERT — which has none — would hash nothing
+    // and ship plaintext. `handle_dml` resolves the list from the catalog first,
+    // for exactly this reason; the two steps are only correct in that order.
+    #[test]
+    fn positional_insert_is_hashed_once_its_columns_are_resolved() {
+        let mut stmt = parse_one("INSERT INTO t VALUES (1, 'a@x.com')");
+        let resolver = StaticResolver::with("sid", HMAC_SHA256_ALGO, "key");
+        let anonymized = anon_map(&[("email", "sid")]);
+
+        // Without the resolved list there is no column to match, and the
+        // plaintext survives the rewrite.
+        let mut untouched = stmt.clone();
+        anonymize_statement(&mut untouched, &anonymized, &resolver).unwrap();
+        assert!(
+            write_sql_cl::statement_to_sql(&untouched).contains("a@x.com"),
+            "the rewriter cannot match a column the statement does not name"
+        );
+
+        write_sql_cl::materialize_insert_columns(&mut stmt, &["id", "email"]).unwrap();
+        anonymize_statement(&mut stmt, &anonymized, &resolver).unwrap();
+        let sql = write_sql_cl::statement_to_sql(&stmt);
+        assert!(
+            sql.contains(&hmac_sha256_hex("key", "a@x.com")),
+            "got: {sql}"
+        );
+        assert!(!sql.contains("a@x.com"), "plaintext leaked: {sql}");
     }
 }

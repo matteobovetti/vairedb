@@ -13,12 +13,13 @@ core nodes that own the relevant shards.
 
 -   [:material-table-cog: __Tables & Schema__](tables.md)
 
-    `CREATE TABLE` with sharding, `ALTER TABLE`, `DROP TABLE`, and catalog
-    introspection.
+    `CREATE TABLE` with sharding, `ALTER TABLE`, `DROP TABLE`, constraints, indexes,
+    and catalog introspection.
 
 -   [:material-table-search: __Querying Data__](querying.md)
 
-    `INSERT` and `SELECT` against sharded tables.
+    `INSERT`, `MERGE INTO` and `SELECT` against sharded tables, plus bulk load
+    and export with `COPY`.
 
 -   [:material-shield-lock: __Column Pseudonymization__](pseudonymization.md)
 

@@ -20,21 +20,33 @@ pub const CREATE_OPTS: &str = "WITH (shards = 3, replication_factor = 3, shard_b
 /// bucketing rely on this matching the `shards` value above.
 pub const SHARD_COUNT: usize = 3;
 
-/// Mirror of the write router's shard hash: `xxh3_64(id_str) % shard_count`.
-/// Tests use this to pick ids that land on a known shard.
-pub fn bucket_of(id: i64) -> u64 {
-    xxh3_64(id.to_string().as_bytes()) % SHARD_COUNT as u64
+/// Mirror of the write router's shard hash for a table of `shard_count` shards:
+/// `xxh3_64(id_str) % shard_count`. Tests on a table not created with
+/// [`CREATE_OPTS`] use this to pick ids that land on a known bucket.
+pub fn bucket_of_in(id: i64, shard_count: usize) -> u64 {
+    xxh3_64(id.to_string().as_bytes()) % shard_count as u64
 }
 
-/// Smallest id `>= start` that hashes to `bucket`.
-pub fn id_for_bucket(bucket: u64, start: i64) -> i64 {
+/// Mirror of the write router's shard hash for a [`CREATE_OPTS`] table.
+pub fn bucket_of(id: i64) -> u64 {
+    bucket_of_in(id, SHARD_COUNT)
+}
+
+/// Smallest id `>= start` that hashes to `bucket` on a table of `shard_count`
+/// shards.
+pub fn id_for_bucket_in(bucket: u64, start: i64, shard_count: usize) -> i64 {
     let mut id = start;
     loop {
-        if bucket_of(id) == bucket {
+        if bucket_of_in(id, shard_count) == bucket {
             return id;
         }
         id += 1;
     }
+}
+
+/// Smallest id `>= start` that hashes to `bucket`.
+pub fn id_for_bucket(bucket: u64, start: i64) -> i64 {
+    id_for_bucket_in(bucket, start, SHARD_COUNT)
 }
 
 /// Collect `k` distinct ids (starting from `start`) that all hash to `bucket`.
@@ -186,6 +198,45 @@ pub const SQLSTATE_FEATURE_NOT_SUPPORTED: &str = "0A000";
 /// tokenizes with sqlparser's `PostgreSqlDialect`). This is where most
 /// DuckDB-only syntax fails.
 pub const SQLSTATE_SYNTAX_ERROR: &str = "42601";
+
+/// `WrongObjectType` — the name resolved, but to a different kind of object than
+/// the statement needs (a view where a table is required, or the reverse). This is
+/// what stops `DROP VIEW t` from dropping the table `t`.
+pub const SQLSTATE_WRONG_OBJECT_TYPE: &str = "42809";
+
+/// `TableAlreadyExists` — the relation namespace already holds the name, whether as
+/// a table, a view, an index, or the physical per-shard name another relation owns.
+pub const SQLSTATE_DUPLICATE_TABLE: &str = "42P07";
+
+/// `SchemaNotFound` — the relation's schema does not exist. One level up from a
+/// missing table: the table may well exist, just not there.
+pub const SQLSTATE_SCHEMA_NOT_FOUND: &str = "3F000";
+
+/// `SchemaAlreadyExists` — `CREATE SCHEMA` on a name that is taken, including
+/// `public` and the metadata schemas, which exist without being recorded.
+pub const SQLSTATE_SCHEMA_ALREADY_EXISTS: &str = "42P06";
+
+/// `DependentObjectsExist` — `DROP SCHEMA` on a schema that still holds relations.
+pub const SQLSTATE_DEPENDENT_OBJECTS_EXIST: &str = "2BP01";
+
+/// Assert `sql` fails with exactly `sqlstate`, and return the error. Stronger than
+/// [`assert_rejected`]: use it where the SQLSTATE is the contract, so a client can
+/// tell a missing schema from a missing table without reading the message.
+pub async fn assert_sqlstate(
+    client: &Client,
+    sql: &str,
+    sqlstate: &str,
+) -> tokio_postgres::error::DbError {
+    let err = execute_expect_err(client, sql).await;
+    assert_eq!(
+        err.code().code(),
+        sqlstate,
+        "`{sql}` should carry SQLSTATE {sqlstate} (got {}: {})",
+        err.code().code(),
+        err.message()
+    );
+    err
+}
 
 /// Assert `sql` is rejected by classification: SQLSTATE `0A000` with the
 /// `[VDB-1004]` FeatureNotSupported marker and a message naming the command.

@@ -5,7 +5,7 @@ use tokio_postgres::Client;
 // PostgreSQL -> DuckDB/DataFusion dialect gaps.
 //
 // Two execution backends apply DIFFERENT dialect translation:
-//   * Writes/DDL go through `sql_compat::transform_to_duckdb`, which rewrites
+//   * Writes/DDL go through `write_sql_cl::transform_to_duckdb`, which rewrites
 //     TO_CHAR->STRFTIME (incl. PG format string -> strftime specifiers),
 //     BYTEA->BLOB, JSONB->JSON.
 //   * SELECTs are planned by DataFusion and get a narrower transform
@@ -151,6 +151,56 @@ async fn test_to_char_in_projection() {
     )
     .await
     .unwrap();
+    assert_eq!(rows[0][0].as_deref(), Some("2024-01-15"));
+
+    drop_table(&client, &tbl).await;
+}
+
+// ---- Function translation (write path) ----
+//
+// A write ships SQL *text* to DuckDB, so every expression a write statement
+// carries must be translated — not just the one at the top of an assignment or a
+// VALUES row. DuckDB has no `to_char`, so anything the rewrite misses fails on the
+// storage node.
+
+// TO_CHAR in a DELETE predicate. A DELETE has no assignments and no VALUES rows,
+// so it is only reached by walking the statement's expressions as a whole.
+#[tokio::test]
+async fn test_to_char_in_delete_predicate() {
+    let client = ready_client().await;
+    let tbl = unique_table_name("dg_tochar_del");
+    setup_events(&client, &tbl).await;
+
+    let deleted = execute(
+        &client,
+        &format!("DELETE FROM {tbl} WHERE TO_CHAR(ts, 'YYYY-MM-DD') = '2024-01-15'"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(deleted, 1, "only the 2024-01-15 row matches");
+    assert_eq!(row_count(&client, &tbl).await, 2);
+
+    drop_table(&client, &tbl).await;
+}
+
+// TO_CHAR nested inside another expression rather than being the assignment's
+// outermost node.
+#[tokio::test]
+async fn test_to_char_nested_in_update_assignment() {
+    let client = ready_client().await;
+    let tbl = unique_table_name("dg_tochar_upd");
+    setup_events(&client, &tbl).await;
+
+    execute(
+        &client,
+        &format!("UPDATE {tbl} SET name = UPPER(TO_CHAR(ts, 'YYYY-MM-DD')) WHERE id = 1"),
+    )
+    .await
+    .unwrap();
+
+    let rows = simple_query_rows(&client, &format!("SELECT name FROM {tbl} WHERE id = 1"))
+        .await
+        .unwrap();
     assert_eq!(rows[0][0].as_deref(), Some("2024-01-15"));
 
     drop_table(&client, &tbl).await;
