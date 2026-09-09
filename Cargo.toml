@@ -48,7 +48,7 @@ duckdb = { version = "1.10503.1", features = ["bundled"] }
 redb = "4.1.0"
 
 # PostgreSQL wire protocol
-pgwire = "0.40"
+pgwire = "0.41"
 
 # PostgreSQL system catalog (pg_catalog) emulation for client compatibility
 datafusion-pg-catalog = "0.18.3"
