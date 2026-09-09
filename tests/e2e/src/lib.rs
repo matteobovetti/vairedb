@@ -3,6 +3,7 @@ use std::sync::OnceLock;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use tokio_postgres::types::Type;
 use tokio_postgres::{Client, NoTls, SimpleQueryMessage};
 use xxhash_rust::xxh3::xxh3_64;
 
@@ -219,6 +220,31 @@ pub const SQLSTATE_SCHEMA_ALREADY_EXISTS: &str = "42P06";
 /// `DependentObjectsExist` — `DROP SCHEMA` on a schema that still holds relations.
 pub const SQLSTATE_DEPENDENT_OBJECTS_EXIST: &str = "2BP01";
 
+/// `DivisionByZero` — `x / 0`, `x % 0`. PostgreSQL raises; an engine that folds
+/// the expression to NULL instead returns a wrong answer silently, which is why
+/// the read-path tests pin the SQLSTATE rather than just "some error".
+pub const SQLSTATE_DIVISION_BY_ZERO: &str = "22012";
+
+/// `NumericValueOutOfRange` — a value that does not fit the target type, whether
+/// from a cast, an overflowing arithmetic result, or a narrowing coercion. The
+/// alternative to raising is wrapping, which a client cannot detect.
+pub const SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE: &str = "22003";
+
+/// `InvalidParameterValue` — a syntactically valid argument the function refuses
+/// (`ntile(0)`, a negative `LIMIT`, an unrecognized `SET` value).
+pub const SQLSTATE_INVALID_PARAMETER_VALUE: &str = "22023";
+
+/// `UndefinedObject` — the name is not one the server has, and the client's mistake
+/// is the name itself rather than a missing feature. What `SET`/`SHOW`/`RESET`
+/// report for a configuration parameter VaireDB does not model, so a typo stays
+/// distinguishable from a refusal.
+pub const SQLSTATE_UNDEFINED_OBJECT: &str = "42704";
+
+/// `CantChangeRuntimeParam` — the parameter is reportable but was fixed when the
+/// server started (`server_version`, `is_superuser`). PostgreSQL reports the same
+/// for its `internal`-context settings.
+pub const SQLSTATE_CANT_CHANGE_RUNTIME_PARAM: &str = "55P02";
+
 /// Assert `sql` fails with exactly `sqlstate`, and return the error. Stronger than
 /// [`assert_rejected`]: use it where the SQLSTATE is the contract, so a client can
 /// tell a missing schema from a missing table without reading the message.
@@ -266,6 +292,44 @@ pub async fn assert_unsupported(client: &Client, sql: &str) {
 /// doing nothing.
 pub async fn assert_rejected(client: &Client, sql: &str) -> tokio_postgres::error::DbError {
     execute_expect_err(client, sql).await
+}
+
+/// Result-column PostgreSQL types as reported at Describe, without executing the
+/// query. This is the read path's type-metadata surface: a wrong Arrow target in
+/// `parse_data_type`, or a gap in `arrow_pg::into_pg_type`, shows up here as a
+/// wrong OID even when the values themselves come back fine.
+pub async fn describe_result_types(client: &Client, sql: &str) -> Vec<Type> {
+    let stmt = client
+        .prepare(sql)
+        .await
+        .unwrap_or_else(|e| panic!("Describe failed for `{sql}`: {e}"));
+    stmt.columns().iter().map(|c| c.type_().clone()).collect()
+}
+
+/// Bind-parameter PostgreSQL types as reported at Describe. Parameter OIDs are
+/// inferred from a DataFusion plan over the advertised schema, so they inherit
+/// every `parse_data_type` error.
+pub async fn describe_param_types(client: &Client, sql: &str) -> Vec<Type> {
+    let stmt = client
+        .prepare(sql)
+        .await
+        .unwrap_or_else(|e| panic!("Describe failed for `{sql}`: {e}"));
+    stmt.params().to_vec()
+}
+
+/// Result-column *names* as reported at Describe. The column label is part of the
+/// wire contract a client keys its result map on, and PostgreSQL's labels are not
+/// DataFusion's (`sum(t.b)` vs `sum`, and PG truncates at 63 bytes), so the label
+/// needs asserting separately from the type.
+pub async fn describe_result_labels(client: &Client, sql: &str) -> Vec<String> {
+    let stmt = client
+        .prepare(sql)
+        .await
+        .unwrap_or_else(|e| panic!("Describe failed for `{sql}`: {e}"));
+    stmt.columns()
+        .iter()
+        .map(|c| c.name().to_string())
+        .collect()
 }
 
 /// `SELECT COUNT(*)` on a table, as an integer.

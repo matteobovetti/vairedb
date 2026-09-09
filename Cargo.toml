@@ -30,11 +30,11 @@ arrow = "58"
 arrow-flight = "58"
 
 # DataFusion & Ballista
-datafusion = "53"
-datafusion-proto = "53"
-ballista-core = "53"
-ballista-scheduler = "53"
-ballista-executor = "53"
+datafusion = "54.1"
+datafusion-proto = "54.1"
+ballista-core = "54.1"
+ballista-scheduler = "54.1"
+ballista-executor = "54.1"
 
 # DuckDB
 duckdb = { version = "1.10503.1", features = ["bundled"] }
@@ -51,10 +51,13 @@ redb = "4.1.0"
 pgwire = "0.40"
 
 # PostgreSQL system catalog (pg_catalog) emulation for client compatibility
-datafusion-pg-catalog = "0.17"
+datafusion-pg-catalog = "0.18.3"
 
 # Arrow <-> PostgreSQL type mapping and typed parameter binding (sibling of datafusion-pg-catalog)
-arrow-pg = { version = "0.14", features = ["datafusion"] }
+arrow-pg = { version = "0.15", features = ["datafusion"] }
+
+# PostgreSQL built-in function emulation (sibling of datafusion-pg-catalog)
+datafusion-pg-functions = "0.1"
 
 # Logging
 tracing = "0.1"

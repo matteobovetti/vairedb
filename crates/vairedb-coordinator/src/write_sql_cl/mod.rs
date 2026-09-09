@@ -1,6 +1,8 @@
 //! Write-path SQL compatibility layer: PostgreSQL wire-protocol SQL → DuckDB,
 //! translated directly without DataFusion in the middle. Splits into:
 //! - `dialect` — rewrite a parsed statement to DuckDB-compatible form.
+//! - `reject` — refuse the expressions DuckDB would answer differently from PostgreSQL
+//!   and that `dialect` cannot rewrite.
 //! - `shard_routing` — decide which shard(s) a write targets.
 //! - `routing_value` — canonicalize a shard-key value for stable hashing.
 //! - `statement` — validate/split/renumber write statements for sharding.
@@ -18,6 +20,7 @@
 
 mod dialect;
 mod merge;
+mod reject;
 mod routing_value;
 mod rows;
 mod shard_routing;
@@ -29,6 +32,7 @@ pub use merge::{
     merge_has_not_matched_by_source, merge_key_column, merge_row_shard_keys, merge_shape,
     normalize_merge_column_qualifiers, split_merge_by_rows, validate_merge,
 };
+pub use reject::reject_duckdb_divergent;
 pub use rows::{ROWS_PER_STATEMENT, insert_statements_from_batches, insert_template};
 pub use shard_routing::{ShardRouting, extract_shard_key_value, route_target};
 pub use statement::{

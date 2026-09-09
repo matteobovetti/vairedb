@@ -18,6 +18,9 @@ use vairedb_core::heartbeat::HeartbeatClient;
 #[derive(Default)]
 struct MockState {
     registered_nodes: Vec<(String, String)>,
+    /// The shard list of each registration, in arrival order, so a re-registration
+    /// can be checked to carry the same shards as the first one.
+    registered_shards: Vec<Vec<String>>,
     heartbeat_count: u64,
 }
 
@@ -27,10 +30,23 @@ enum DrainBehavior {
     AfterFirstHeartbeat,
 }
 
+/// Whether the mock answers a heartbeat with `REGISTER`, which is what a real
+/// coordinator does when the heartbeat names a node its catalog has no record of.
+#[derive(Clone, Copy, PartialEq)]
+enum RegisterBehavior {
+    /// Always `NONE`: a coordinator that knows this node.
+    Never,
+    /// `REGISTER` on the first heartbeat and `NONE` after it, so the node registers
+    /// again and is then left alone — a coordinator that had lost the node and then
+    /// learned it back.
+    OnFirstHeartbeat,
+}
+
 struct MockNodeService {
     state: Arc<Mutex<MockState>>,
     reject_registration: bool,
     drain_behavior: DrainBehavior,
+    register_behavior: RegisterBehavior,
 }
 
 impl MockNodeService {
@@ -39,22 +55,28 @@ impl MockNodeService {
             state,
             reject_registration: false,
             drain_behavior: DrainBehavior::Never,
+            register_behavior: RegisterBehavior::Never,
         }
     }
 
     fn rejecting(state: Arc<Mutex<MockState>>) -> Self {
         Self {
-            state,
             reject_registration: true,
-            drain_behavior: DrainBehavior::Never,
+            ..Self::new(state)
         }
     }
 
     fn draining(state: Arc<Mutex<MockState>>) -> Self {
         Self {
-            state,
-            reject_registration: false,
             drain_behavior: DrainBehavior::AfterFirstHeartbeat,
+            ..Self::new(state)
+        }
+    }
+
+    fn demanding_registration(state: Arc<Mutex<MockState>>) -> Self {
+        Self {
+            register_behavior: RegisterBehavior::OnFirstHeartbeat,
+            ..Self::new(state)
         }
     }
 }
@@ -70,6 +92,9 @@ impl NodeService for MockNodeService {
         state
             .registered_nodes
             .push((req.node_id.clone(), req.advertised_address.clone()));
+        state
+            .registered_shards
+            .push(req.shards.iter().map(|s| s.shard_id.clone()).collect());
 
         if self.reject_registration {
             return Ok(Response::new(RegisterResponse {
@@ -92,6 +117,7 @@ impl NodeService for MockNodeService {
     ) -> Result<Response<Self::HeartbeatStream>, Status> {
         let state = Arc::clone(&self.state);
         let drain_behavior = self.drain_behavior;
+        let register_behavior = self.register_behavior;
         let mut stream = request.into_inner();
         let (tx, rx) = mpsc::channel(64);
 
@@ -104,6 +130,8 @@ impl NodeService for MockNodeService {
 
                 let action = if drain_behavior == DrainBehavior::AfterFirstHeartbeat && count >= 1 {
                     HeartbeatAction::Drain
+                } else if register_behavior == RegisterBehavior::OnFirstHeartbeat && count == 1 {
+                    HeartbeatAction::Register
                 } else {
                     HeartbeatAction::None
                 };
@@ -620,4 +648,172 @@ async fn ack_timeout_triggers_reconnect() {
         opens >= 2,
         "expected the ack timeout to trigger at least one reconnect (>= 2 stream opens), got {opens}"
     );
+}
+
+/// Poll until at least `want` registrations have arrived, returning however many
+/// there are once they have or `within` has elapsed — so a passing test is fast and
+/// a failing one reports the real count instead of timing out.
+async fn wait_for_registrations(
+    state: &Arc<Mutex<MockState>>,
+    want: usize,
+    within: Duration,
+) -> usize {
+    let deadline = tokio::time::Instant::now() + within;
+    loop {
+        let count = state.lock().await.registered_nodes.len();
+        if count >= want || tokio::time::Instant::now() >= deadline {
+            return count;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+#[tokio::test]
+async fn a_register_action_makes_the_node_register_again() {
+    // A coordinator whose catalog has no record of this node answers `REGISTER`
+    // rather than acking, and the node has to repair it without being restarted:
+    // an unregistered node is one no shard can be placed on, so `CREATE TABLE`
+    // fails for want of nodes while the cluster is in fact whole.
+    let state = Arc::new(Mutex::new(MockState::default()));
+    let addr = start_mock_server(MockNodeService::demanding_registration(Arc::clone(&state))).await;
+
+    let client = HeartbeatClient::new(
+        "node-reregister".to_string(),
+        "127.0.0.1:50075".to_string(),
+        format!("http://{}", addr),
+        1,
+    );
+
+    // Register up front, as `main` does. That clears the "needs register" flag, so
+    // any later registration is one the REGISTER action asked for.
+    client
+        .register(vec!["orders_shard0".to_string()])
+        .await
+        .unwrap();
+    assert_eq!(state.lock().await.registered_nodes.len(), 1);
+
+    let _drain_rx = client.spawn_with_reconnect();
+
+    let count = wait_for_registrations(&state, 2, Duration::from_secs(6)).await;
+    assert!(
+        count >= 2,
+        "expected a REGISTER action to produce a second registration, got {count}"
+    );
+
+    // The re-registration has to carry the same shards: the node is the only party
+    // that knows them, and a coordinator told about a node with no shards is barely
+    // better off than one that never heard of it.
+    let s = state.lock().await;
+    assert_eq!(s.registered_nodes[1].0, "node-reregister");
+    assert_eq!(s.registered_nodes[1].1, "127.0.0.1:50075");
+    assert_eq!(s.registered_shards[1], vec!["orders_shard0".to_string()]);
+}
+
+#[tokio::test]
+async fn a_reopened_stream_registers_again() {
+    // The coordinator on the other end of the next stream need not be the one this
+    // node registered with — a replaced container listens on the same address with an
+    // empty catalog and cannot ask for anything, because the node reconnects before
+    // it ever heartbeats. So registration is part of attaching, and every reopened
+    // stream is preceded by one.
+    struct OneAckService {
+        state: Arc<Mutex<MockState>>,
+    }
+
+    #[tonic::async_trait]
+    impl NodeService for OneAckService {
+        async fn register(
+            &self,
+            request: Request<RegisterRequest>,
+        ) -> Result<Response<RegisterResponse>, Status> {
+            let req = request.into_inner();
+            let mut state = self.state.lock().await;
+            state
+                .registered_nodes
+                .push((req.node_id.clone(), req.advertised_address.clone()));
+            state
+                .registered_shards
+                .push(req.shards.iter().map(|s| s.shard_id.clone()).collect());
+            Ok(Response::new(RegisterResponse {
+                accepted: true,
+                message: "registered".to_string(),
+            }))
+        }
+
+        type HeartbeatStream = ReceiverStream<Result<HeartbeatResponse, Status>>;
+
+        async fn heartbeat(
+            &self,
+            request: Request<Streaming<HeartbeatRequest>>,
+        ) -> Result<Response<Self::HeartbeatStream>, Status> {
+            let state = Arc::clone(&self.state);
+            let mut stream = request.into_inner();
+            let (tx, rx) = mpsc::channel(1);
+
+            tokio::spawn(async move {
+                if let Ok(Some(_hb)) = stream.message().await {
+                    state.lock().await.heartbeat_count += 1;
+                    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+                    let _ = tx
+                        .send(Ok(HeartbeatResponse {
+                            timestamp: Some(prost_types::Timestamp {
+                                seconds: now.as_secs() as i64,
+                                nanos: now.subsec_nanos() as i32,
+                            }),
+                            action: HeartbeatAction::None.into(),
+                        }))
+                        .await;
+                }
+                // Dropping `tx` closes the response stream, which is what the node
+                // sees when a coordinator goes away mid-session.
+            });
+
+            Ok(Response::new(ReceiverStream::new(rx)))
+        }
+
+        async fn report_failure(
+            &self,
+            _request: Request<ReportFailureRequest>,
+        ) -> Result<Response<ReportFailureResponse>, Status> {
+            Ok(Response::new(ReportFailureResponse { acknowledged: true }))
+        }
+    }
+
+    let state = Arc::new(Mutex::new(MockState::default()));
+    let state_clone = Arc::clone(&state);
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        Server::builder()
+            .add_service(NodeServiceServer::new(OneAckService { state: state_clone }))
+            .serve_with_incoming(tokio_stream::wrappers::TcpListenerStream::new(listener))
+            .await
+            .unwrap();
+    });
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    let client = HeartbeatClient::new(
+        "node-reattach".to_string(),
+        "127.0.0.1:50076".to_string(),
+        format!("http://{}", addr),
+        1,
+    );
+
+    client
+        .register(vec!["orders_shard0".to_string()])
+        .await
+        .unwrap();
+
+    let _drain_rx = client.spawn_with_reconnect();
+
+    // The first session ends as soon as its single ack is followed by the stream
+    // closing, and the reconnect loop backs off 1s before attaching again.
+    let count = wait_for_registrations(&state, 2, Duration::from_secs(8)).await;
+    assert!(
+        count >= 2,
+        "expected a reopened stream to be preceded by a registration, got {count}"
+    );
+
+    let s = state.lock().await;
+    assert_eq!(s.registered_shards[1], vec!["orders_shard0".to_string()]);
 }

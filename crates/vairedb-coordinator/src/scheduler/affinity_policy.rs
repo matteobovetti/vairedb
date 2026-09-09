@@ -8,6 +8,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use ballista_core::JobId;
 use ballista_core::serde::protobuf::{AvailableTaskSlots, job_status};
 use ballista_core::serde::scheduler::PartitionId;
 use ballista_scheduler::cluster::{BoundTask, DistributionPolicy};
@@ -29,7 +30,7 @@ impl DistributionPolicy for VaireAffinityPolicy {
     async fn bind_tasks(
         &self,
         mut slots: Vec<&mut AvailableTaskSlots>,
-        running_jobs: Arc<HashMap<String, JobInfoCache>>,
+        running_jobs: Arc<HashMap<JobId, JobInfoCache>>,
     ) -> datafusion::error::Result<Vec<BoundTask>> {
         let mut schedulable_tasks: Vec<BoundTask> = Vec::new();
 
@@ -128,7 +129,7 @@ fn bind_partition_task(
     running_stage: &mut RunningStage,
     task_id_gen: &mut usize,
     partition_id: usize,
-    job_id: &str,
+    job_id: &JobId,
     session_id: &str,
     executor_id: &str,
 ) -> BoundTask {
@@ -138,7 +139,7 @@ fn bind_partition_task(
         Some(create_task_info(executor_id.to_string(), task_id));
 
     let partition = PartitionId {
-        job_id: job_id.to_string(),
+        job_id: job_id.clone(),
         stage_id: running_stage.stage_id,
         partition_id,
     };
@@ -177,7 +178,7 @@ fn walk_plan_for_affinity(
     map: &mut HashMap<usize, AffinityTarget>,
     partition_offset: usize,
 ) -> usize {
-    if let Some(remote_scan) = plan.as_any().downcast_ref::<RemoteDuckDbScanExec>() {
+    if let Some(remote_scan) = plan.downcast_ref::<RemoteDuckDbScanExec>() {
         if let Some(target) = remote_scan.target_executor_id() {
             map.insert(
                 partition_offset,

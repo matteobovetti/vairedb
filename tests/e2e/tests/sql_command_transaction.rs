@@ -442,6 +442,40 @@ async fn test_reading_a_written_table_inside_the_block_is_refused() {
     drop_table(&client, &tbl).await;
 }
 
+// An EXPLAIN inherits its query's rule. The non-ANALYZE form runs nothing, but it
+// is still planned against a database the block's writes are not in, so the plan it
+// prints is a plan for the wrong state; the ANALYZE form runs the query outright.
+// A DESCRIBE is allowed: only DDL changes a relation's shape, and DDL is refused
+// inside a block, so the shape reported cannot be stale.
+#[tokio::test]
+async fn test_explaining_a_written_table_inside_the_block_is_refused() {
+    let client = ready_client().await;
+    let (tbl, ids) = table_and_ids(&client, "tx_explain", 1).await;
+
+    execute(&client, "BEGIN").await.unwrap();
+    insert(&client, &tbl, ids[0], "a").await.unwrap();
+    assert_fails_with(
+        &client,
+        &format!("EXPLAIN SELECT COUNT(*) FROM {tbl}"),
+        SQLSTATE_FEATURE_NOT_SUPPORTED,
+        "COMMIT",
+    )
+    .await;
+    execute(&client, "ROLLBACK").await.unwrap();
+
+    execute(&client, "BEGIN").await.unwrap();
+    insert(&client, &tbl, ids[0], "a").await.unwrap();
+    assert!(
+        simple_query_rows(&client, &format!("DESCRIBE {tbl}"))
+            .await
+            .is_ok(),
+        "a relation's shape is still readable inside a block"
+    );
+    execute(&client, "ROLLBACK").await.unwrap();
+
+    drop_table(&client, &tbl).await;
+}
+
 // How many rows an UPDATE or DELETE affects is only known once the shards run
 // it, and a buffered statement has not run. Rather than report a guess a client
 // might act on, the statement is refused with the reason.

@@ -127,6 +127,32 @@ fn test_transform_jsonb_to_json() {
     assert!(!result.contains("JSONB"));
 }
 
+// PostgreSQL accepts a declared array length and then ignores it; DuckDB would store a
+// fixed-size array, whose Arrow type cannot be encoded to the wire or rebuilt against the
+// advertised schema. The length goes, so the column is the one PostgreSQL would have made.
+#[test]
+fn test_transform_drops_a_declared_array_length() {
+    let sql = "CREATE TABLE t (tags INTEGER[3])";
+    let mut stmts = parse_sql(sql).unwrap();
+    transform_to_duckdb(&mut stmts[0]);
+    let result = statement_to_sql(&stmts[0]);
+    assert!(result.contains("INTEGER[]"), "got: {result}");
+    assert!(!result.contains("[3]"), "got: {result}");
+}
+
+// An array's element type is rewritten like a scalar column's.
+#[test]
+fn test_transform_rewrites_array_element_types() {
+    let sql = "CREATE TABLE t (blobs BYTEA[], docs JSONB[2])";
+    let mut stmts = parse_sql(sql).unwrap();
+    transform_to_duckdb(&mut stmts[0]);
+    let result = statement_to_sql(&stmts[0]);
+    assert!(result.contains("BLOB[]"), "got: {result}");
+    assert!(result.contains("JSON[]"), "got: {result}");
+    assert!(!result.contains("BYTEA"), "got: {result}");
+    assert!(!result.contains("JSONB"), "got: {result}");
+}
+
 #[test]
 fn test_transform_preserves_other_types() {
     let sql = "CREATE TABLE t (id INT, name VARCHAR)";
@@ -998,4 +1024,249 @@ fn test_rows_written_through_a_template_route_like_any_other_insert() {
     let sql = statement_to_sql(&shard_stmt);
     assert!(sql.contains("summary_shard0"), "got: {sql}");
     assert!(sql.contains("VALUES (2, NULL)"), "got: {sql}");
+}
+
+// ============================================================================
+// PostgreSQL expression semantics on the write path
+// ============================================================================
+//
+// A write is rendered back to SQL text and run verbatim by a shard's DuckDB, so these
+// assertions are about the text a shard receives. Each rewrite closes a case where the
+// predicate the client wrote and the predicate that ran were different predicates, and
+// the row count came back as though they were not. The DuckDB behaviours they compensate
+// for were measured against 1.5.5, the bundled version.
+
+/// The rendered SQL a shard would be sent for `sql`.
+fn rendered(sql: &str) -> String {
+    let mut stmts = parse_sql(sql).unwrap_or_else(|e| panic!("`{sql}` should parse: {e}"));
+    transform_to_duckdb(&mut stmts[0]);
+    statement_to_sql(&stmts[0])
+}
+
+// PostgreSQL's `~` is a partial match; DuckDB's is a full one, so `'abcd' ~ '^ab'` was
+// false and an UPDATE's predicate silently matched no rows at all. `regexp_matches` is
+// DuckDB's partial match.
+#[test]
+fn test_regex_match_becomes_a_partial_match() {
+    let out = rendered("UPDATE t SET x = 1 WHERE s ~ '^a'");
+    assert!(out.contains("regexp_matches(s, '^a')"), "got: {out}");
+    assert!(!out.contains(" ~ "), "the operator is gone: {out}");
+}
+
+#[test]
+fn test_negated_and_case_insensitive_regex_matches() {
+    let out = rendered("UPDATE t SET x = 1 WHERE s !~ '^a'");
+    assert!(out.contains("NOT regexp_matches(s, '^a')"), "got: {out}");
+
+    // The `i` flag is DuckDB's third argument, not a different function.
+    let out = rendered("UPDATE t SET x = 1 WHERE s ~* '^a'");
+    assert!(out.contains("regexp_matches(s, '^a', 'i')"), "got: {out}");
+
+    let out = rendered("UPDATE t SET x = 1 WHERE s !~* '^a'");
+    assert!(
+        out.contains("NOT regexp_matches(s, '^a', 'i')"),
+        "got: {out}"
+    );
+}
+
+// DuckDB has no default `LIKE` escape, so `'a\_b'` matched on a wildcard where PostgreSQL
+// matched a literal underscore. Naming the escape explicitly is what makes DuckDB read
+// the pattern PostgreSQL's way — and it works for a pattern that arrives as a parameter,
+// where the backslash is in the value and invisible to any parse-time check.
+#[test]
+fn test_like_gets_postgres_default_escape() {
+    let out = rendered("UPDATE t SET x = 1 WHERE s LIKE 'a\\_b'");
+    assert!(out.contains("ESCAPE '\\'"), "got: {out}");
+
+    let out = rendered("UPDATE t SET x = 1 WHERE s ILIKE 'a\\%b'");
+    assert!(out.contains("ESCAPE '\\'"), "got: {out}");
+
+    // The parameter case, which is the one an ORM emits and no refusal could catch.
+    let out = rendered("UPDATE t SET x = 1 WHERE s LIKE $1");
+    assert!(out.contains("ESCAPE '\\'"), "got: {out}");
+
+    let out = rendered("DELETE FROM t WHERE s NOT LIKE 'a\\_b'");
+    assert!(out.contains("ESCAPE '\\'"), "got: {out}");
+}
+
+// An escape the client chose is the client's, and must not be replaced.
+#[test]
+fn test_an_explicit_like_escape_is_kept() {
+    let out = rendered("UPDATE t SET x = 1 WHERE s LIKE 'a!_b' ESCAPE '!'");
+    assert!(out.contains("ESCAPE '!'"), "got: {out}");
+    assert!(!out.contains("ESCAPE '\\'"), "got: {out}");
+}
+
+// `SIMILAR TO` is its own wildcard language and DuckDB hands the pattern to a regex
+// engine unchanged — wrong in both directions at once. The translation is the read path's,
+// so both paths answer from one implementation of PostgreSQL's rules, and the regex it
+// produces is anchored, which is what makes DuckDB's partial-match function give the
+// whole-string answer `SIMILAR TO` promises.
+#[test]
+fn test_similar_to_becomes_an_anchored_regex() {
+    // `%` is the wildcard, so it becomes `.*` — a regex engine would have read it as a
+    // literal percent sign.
+    let out = rendered("UPDATE t SET x = 1 WHERE s SIMILAR TO 'a%'");
+    assert!(out.contains("regexp_matches(s, '^(?:a.*)$')"), "got: {out}");
+
+    // `.` is a literal to SIMILAR TO, so it is escaped — a regex engine would have read
+    // it as "any character".
+    let out = rendered("UPDATE t SET x = 1 WHERE s SIMILAR TO 'a.c'");
+    assert!(
+        out.contains("regexp_matches(s, '^(?:a\\.c)$')"),
+        "got: {out}"
+    );
+
+    let out = rendered("DELETE FROM t WHERE s NOT SIMILAR TO 'a_c'");
+    assert!(
+        out.contains("NOT regexp_matches(s, '^(?:a.c)$')"),
+        "got: {out}"
+    );
+}
+
+// The refusals are the other half of the same fix, and they are enforced by `parse_sql` —
+// before `transform_to_duckdb` ever sees the statement, which is what lets the
+// translation above be infallible.
+#[test]
+fn test_untranslatable_write_expressions_are_refused() {
+    for sql in [
+        "UPDATE t SET x = 1 WHERE s COLLATE \"en_US\" < 'a'",
+        "UPDATE t SET s = CAST(s AS VARCHAR(3))",
+        "UPDATE t SET x = 1 WHERE s SIMILAR TO other_col",
+    ] {
+        let err = parse_sql(sql)
+            .err()
+            .unwrap_or_else(|| panic!("`{sql}` should be refused"));
+        assert!(err.to_string().contains("not supported"), "`{sql}`: {err}");
+    }
+}
+
+// A SELECT is not touched by any of this: the read path hands its AST to DataFusion,
+// which speaks PostgreSQL, so a rewrite there would break what already works. The
+// asymmetry is the whole point of the statement-kind gate.
+#[test]
+fn test_a_select_keeps_its_postgres_expressions() {
+    let mut stmts = parse_sql("SELECT * FROM t WHERE s ~ '^a' AND s LIKE 'a\\_b'").unwrap();
+    transform_to_duckdb(&mut stmts[0]);
+    let out = statement_to_sql(&stmts[0]);
+    assert!(!out.contains("regexp_matches"), "got: {out}");
+    assert!(!out.contains("ESCAPE"), "got: {out}");
+}
+
+// A byte-order collation asks for the comparison DuckDB performs with no collation named
+// at all, so the clause is dropped — the same thing the read path does with it. Not
+// cosmetic: measured on DuckDB 1.5.5, `ucs_basic` and `pg_catalog.default` are a
+// `Catalog Error` ("Collation with name ... does not exist"), so passing them through
+// would have a shard reject a statement the coordinator had already accepted, and
+// `pg_catalog.default` is the spelling a driver sends.
+#[test]
+fn test_a_byte_order_collation_is_stripped() {
+    for sql in [
+        r#"UPDATE t SET a = 1 WHERE name COLLATE "C" < 'x'"#,
+        r#"DELETE FROM t WHERE name COLLATE "POSIX" < 'x'"#,
+        "UPDATE t SET a = 1 WHERE name COLLATE ucs_basic < 'x'",
+        "DELETE FROM t WHERE name COLLATE pg_catalog.default < 'x'",
+    ] {
+        let out = rendered(sql);
+        assert!(
+            !out.to_uppercase().contains("COLLATE"),
+            "`{sql}` reaches a shard without the clause, got: {out}"
+        );
+        // The comparison it decorated survives.
+        assert!(out.contains("name < 'x'"), "got: {out}");
+    }
+}
+
+// A zero divisor is the one silently-wrong row the write path's own rewrites introduced:
+// PostgreSQL raises `22012` and writes nothing, while DuckDB under the `integer_division`
+// setting the shards run — the setting that makes `7/2` answer `3` — answers NULL for
+// `7/0`, `7.0/0` and `7 % 0` alike, so the statement stored a NULL and reported success.
+// DuckDB has no setting that turns a zero divisor into an error, and `error()` inside a
+// `CASE` is its only way to raise one from an expression.
+#[test]
+fn test_a_division_is_guarded_against_a_zero_divisor() {
+    let out = rendered("UPDATE t SET x = 7 / 0");
+    assert_eq!(
+        out,
+        "UPDATE t SET x = CASE WHEN 0 = 0 THEN error('division by zero') ELSE 7 / 0 END"
+    );
+
+    // Modulo divides too, and DuckDB answers NULL for `7 % 0` on the same terms.
+    let out = rendered("UPDATE t SET x = a % b");
+    assert_eq!(
+        out,
+        "UPDATE t SET x = CASE WHEN b = 0 THEN error('division by zero') ELSE a % b END"
+    );
+
+    // A float divisor is guarded as well: `7.0 / 0` is NULL in DuckDB, where PostgreSQL
+    // raises `22012` for it too.
+    let out = rendered("UPDATE t SET x = 7.0 / 0.0");
+    assert!(
+        out.contains("WHEN 0.0 = 0 THEN error('division by zero')"),
+        "got: {out}"
+    );
+}
+
+// The guard has to reach every expression of a write, not only an assignment — a WHERE
+// clause that divides decides which rows change, and an INSERT's value row decides what is
+// stored.
+#[test]
+fn test_the_guard_reaches_every_write_expression() {
+    let out = rendered("DELETE FROM t WHERE a / b > 1");
+    assert!(
+        out.contains("CASE WHEN b = 0 THEN error('division by zero') ELSE a / b END > 1"),
+        "got: {out}"
+    );
+
+    let out = rendered("INSERT INTO t (x) VALUES (7 / 2)");
+    assert!(
+        out.contains("VALUES (CASE WHEN 2 = 0 THEN error('division by zero') ELSE 7 / 2 END)"),
+        "got: {out}"
+    );
+
+    let out =
+        rendered("MERGE INTO t USING u ON t.id = u.id WHEN MATCHED THEN UPDATE SET x = u.a / u.b");
+    assert!(
+        out.contains("CASE WHEN u.b = 0 THEN error('division by zero') ELSE u.a / u.b END"),
+        "got: {out}"
+    );
+}
+
+// A parameter divisor is the case no parse-time check could catch — the value is not here —
+// and the one that makes duplicating the divisor safe rather than merely cheap: DuckDB binds
+// a repeated `$n` once, and `renumber_placeholders` maps each original index to exactly one
+// new one, so the two mentions stay the same parameter.
+#[test]
+fn test_a_placeholder_divisor_is_named_twice_as_the_same_parameter() {
+    let out = rendered("UPDATE t SET x = a / $1 WHERE id = $2");
+    assert_eq!(
+        out,
+        "UPDATE t SET x = CASE WHEN $1 = 0 THEN error('division by zero') ELSE a / $1 END \
+         WHERE id = $2"
+    );
+}
+
+// A division nested in the *dividend* is not the refused shape: only the divisor is
+// duplicated, so `(a / b) / c` renders one guard per division and grows linearly.
+#[test]
+fn test_a_division_in_the_dividend_is_guarded_once_per_division() {
+    let out = rendered("UPDATE t SET x = (a / b) / c");
+    assert_eq!(
+        out.matches("error('division by zero')").count(),
+        2,
+        "got: {out}"
+    );
+    assert!(out.contains("WHEN b = 0"), "got: {out}");
+    assert!(out.contains("WHEN c = 0"), "got: {out}");
+}
+
+// A SELECT keeps its own division: the read path hands the AST to DataFusion, which raises
+// `22012` for a zero divisor itself, so guarding here would only obscure it.
+#[test]
+fn test_a_select_keeps_its_own_division() {
+    let mut stmts = parse_sql("SELECT a / b FROM t WHERE c % d = 0").unwrap();
+    transform_to_duckdb(&mut stmts[0]);
+    let out = statement_to_sql(&stmts[0]);
+    assert!(!out.contains("error("), "got: {out}");
+    assert!(out.contains("a / b"), "got: {out}");
 }

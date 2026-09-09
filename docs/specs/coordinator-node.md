@@ -20,7 +20,7 @@ The Ballista scheduler leverages [DataFusion](https://datafusion.apache.org/)'s 
 - The logical plan is optimized by DataFusion's built-in optimizer rules (predicate push-down, projection pruning, constant folding).
 - The optimized logical plan is converted into a **physical plan**, which the Ballista scheduler partitions into **query stages** — units of work that can execute independently on core node executors.
 - The scheduler inserts **exchange operators** (repartition, broadcast, gather) between stages to manage data shuffling across executors via Arrow Flight (gRPC).
-- Applies push-down optimizations (filters, projections, partial aggregations) to minimize data movement between core nodes.
+- Column projections, and the predicates and row limits both engines read the same way, are carried into the shard's own `SELECT` so a shard streams the rows the query wants rather than its whole table. The coordinator keeps its own filter and its own `LIMIT` over the union, so this reduces data movement without being trusted for correctness. See [Query Optimization](distributed-query-processing.md#query-optimization).
 - Each stage is assigned to one or more core node executors based on data locality (shard map) and executor availability. Ballista's default scheduling policy does not support hard placement constraints, so VaireDB implements a custom `DistributionPolicy` that integrates with the metadata catalog to pin stages to the executor hosting the required shard. The executor then runs the custom `ExecutionPlan` operator that bridges DataFusion to the local DuckDB instance (see [Query Execution](core-node.md#query-execution)).
 
 ## Metadata Catalog (Database catalog)

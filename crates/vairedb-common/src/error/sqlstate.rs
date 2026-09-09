@@ -23,6 +23,14 @@ pub fn sqlstate_for_code(code: VdbErrorCode) -> &'static str {
         VdbErrorCode::SchemaNotFound => "3F000",
         VdbErrorCode::SchemaAlreadyExists => "42P06",
         VdbErrorCode::DependentObjectsExist => "2BP01",
+        VdbErrorCode::UndefinedObject => "42704",
+        VdbErrorCode::InvalidParameterValue => "22023",
+        VdbErrorCode::CantChangeRuntimeParam => "55P02",
+        VdbErrorCode::NumericValueOutOfRange => "22003",
+        VdbErrorCode::DivisionByZero => "22012",
+        VdbErrorCode::InvalidTextRepresentation => "22P02",
+        VdbErrorCode::GroupingError => "42803",
+        VdbErrorCode::WindowingError => "42P20",
         VdbErrorCode::ShardNotFound => "42P01",
         VdbErrorCode::WriteConflict => "40001",
         VdbErrorCode::EngineError => "XX000",
@@ -97,5 +105,81 @@ mod tests {
             sqlstate_for_code(VdbErrorCode::DependentObjectsExist),
             "2BP01"
         );
+    }
+
+    // `SET`/`SHOW`/`RESET` have three distinct failures a client should be able to
+    // tell apart without reading the message: the parameter name is not one the
+    // server has (`42704`), the name is fine but the value is not one it can take
+    // (`22023`), and the parameter is reportable but fixed at startup (`55P02`).
+    // Collapsing any of them into `0A000` would tell a driver that `SET` itself is
+    // unsupported and stop it retrying with a value that would have worked.
+    #[test]
+    fn maps_session_parameter_failures_to_their_own_sqlstates() {
+        assert_eq!(sqlstate_for_code(VdbErrorCode::UndefinedObject), "42704");
+        assert_eq!(
+            sqlstate_for_code(VdbErrorCode::InvalidParameterValue),
+            "22023"
+        );
+        assert_eq!(
+            sqlstate_for_code(VdbErrorCode::CantChangeRuntimeParam),
+            "55P02"
+        );
+    }
+
+    // A value the type it must be reported as cannot hold is a data error, not an
+    // internal one: `22003` tells the client the query and the server are both fine
+    // and one value was out of range, which is what distinguishes it from the `XX000`
+    // that would otherwise swallow it.
+    #[test]
+    fn maps_an_unrepresentable_value_to_the_data_error_sqlstate() {
+        assert_eq!(
+            sqlstate_for_code(VdbErrorCode::NumericValueOutOfRange),
+            "22003"
+        );
+    }
+
+    // The four codes added for v0.2, each of which used to arrive as `XX000` — a class
+    // that tells a client the *server* broke. Two are data errors the client caused and
+    // can fix in the value (`22012`, `22P02`) and two are syntax errors it can fix in
+    // the query (`42803`, `42P20`); reporting any of them as internal invites a retry
+    // that cannot succeed, or a bug report against the wrong component.
+    #[test]
+    fn maps_the_four_v02_codes_off_the_internal_class() {
+        assert_eq!(sqlstate_for_code(VdbErrorCode::DivisionByZero), "22012");
+        assert_eq!(
+            sqlstate_for_code(VdbErrorCode::InvalidTextRepresentation),
+            "22P02"
+        );
+        assert_eq!(sqlstate_for_code(VdbErrorCode::GroupingError), "42803");
+        assert_eq!(sqlstate_for_code(VdbErrorCode::WindowingError), "42P20");
+    }
+
+    // A guard on the map itself rather than on any one code: `sqlstate_for_code`
+    // matches exhaustively, so a new proto variant cannot be forgotten here — but it
+    // *can* be mapped to `XX000` by copying a neighbouring arm, which is the mistake
+    // this catches. Every code whose class is knowable should have left the internal
+    // class behind.
+    #[test]
+    fn only_genuinely_internal_codes_report_the_internal_class() {
+        let internal = [
+            VdbErrorCode::Unspecified,
+            VdbErrorCode::EngineError,
+            VdbErrorCode::CatalogAccessError,
+            VdbErrorCode::SerializationError,
+            VdbErrorCode::InternalError,
+        ];
+        for code in [
+            VdbErrorCode::DivisionByZero,
+            VdbErrorCode::InvalidTextRepresentation,
+            VdbErrorCode::GroupingError,
+            VdbErrorCode::WindowingError,
+        ] {
+            assert!(!internal.contains(&code));
+            assert_ne!(
+                sqlstate_for_code(code),
+                "XX000",
+                "{code:?} still reports the internal class"
+            );
+        }
     }
 }

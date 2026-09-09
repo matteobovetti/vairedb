@@ -75,6 +75,12 @@ enum HeartbeatAction {
   HEARTBEAT_ACTION_UNSPECIFIED = 0;
   HEARTBEAT_ACTION_NONE = 1;
   HEARTBEAT_ACTION_DRAIN = 2;
+  // The coordinator has no record of this node: it is heartbeating against a
+  // catalog that does not know it, so it must call Register again before it can
+  // be given any shards. Sent when the heartbeat's node_id is not in the
+  // catalog, which is what a coordinator started over a fresh store sees from
+  // every core that is still running.
+  HEARTBEAT_ACTION_REGISTER = 3;
 }
 
 // ---------------------------------------------------------------------------

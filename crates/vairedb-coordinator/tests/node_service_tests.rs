@@ -6,8 +6,8 @@ use tokio_stream::StreamExt;
 use tonic::Request;
 
 use vairedb_common::proto::vairedb::v1::{
-    FailureType, HeartbeatRequest, NodeStatus, RegisterRequest, ReportFailureRequest, ShardInfo,
-    node_service_server::NodeService,
+    FailureType, HeartbeatAction, HeartbeatRequest, NodeStatus, RegisterRequest,
+    ReportFailureRequest, ShardInfo, node_service_server::NodeService,
 };
 
 use vairedb_coordinator::catalog::{MetadataCatalog, NodeState};
@@ -237,4 +237,63 @@ async fn test_heartbeat_stream_multiple_messages() {
 
     let final_msg = resp_stream.next().await;
     assert!(final_msg.is_none());
+}
+
+#[tokio::test]
+async fn test_heartbeat_from_unknown_node_asks_it_to_register() {
+    // A heartbeat naming a node this catalog has no record of is not a lost update
+    // to shrug at: the node is running and healthy, but no shard can be placed on a
+    // node the catalog does not list, so `CREATE TABLE` fails for want of nodes. A
+    // coordinator started over a fresh store sees exactly this from every core that
+    // never stopped, and answering REGISTER is the only way out that does not need
+    // the cores restarted.
+    let catalog = make_catalog();
+    let addr = start_test_server(Arc::clone(&catalog)).await;
+    let channel = Channel::from_shared(addr).unwrap().connect().await.unwrap();
+    let mut client = NodeServiceClient::new(channel);
+
+    let (tx, rx) = tokio::sync::mpsc::channel(16);
+    let outbound = tokio_stream::wrappers::ReceiverStream::new(rx);
+    let resp = client.heartbeat(outbound).await.unwrap();
+    let mut resp_stream = resp.into_inner();
+
+    let heartbeat = || {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+        HeartbeatRequest {
+            node_id: "stranger-node".to_string(),
+            timestamp: Some(prost_types::Timestamp {
+                seconds: now.as_secs() as i64,
+                nanos: now.subsec_nanos() as i32,
+            }),
+            status: NodeStatus::Healthy.into(),
+        }
+    };
+
+    tx.send(heartbeat()).await.unwrap();
+    let msg = resp_stream.next().await.unwrap().unwrap();
+    assert_eq!(
+        HeartbeatAction::try_from(msg.action).unwrap(),
+        HeartbeatAction::Register,
+        "an unknown node must be told to register"
+    );
+
+    // Once it has registered, the same stream must go back to plain acks — a node
+    // that keeps being told to register would reconnect forever.
+    let svc_direct = NodeServiceImpl::new(Arc::clone(&catalog));
+    svc_direct
+        .register(Request::new(RegisterRequest {
+            node_id: "stranger-node".to_string(),
+            advertised_address: "10.0.0.9:50041".to_string(),
+            shards: vec![],
+        }))
+        .await
+        .unwrap();
+
+    tx.send(heartbeat()).await.unwrap();
+    let msg = resp_stream.next().await.unwrap().unwrap();
+    assert_eq!(
+        HeartbeatAction::try_from(msg.action).unwrap(),
+        HeartbeatAction::None,
+        "a registered node must be acked, not asked to register again"
+    );
 }

@@ -7,6 +7,8 @@
 use std::fmt::Display;
 use std::sync::Arc;
 
+use datafusion::arrow::error::ArrowError;
+use datafusion::error::DataFusionError;
 use pgwire::error::{ErrorInfo, PgWireError};
 use vairedb_common::error::{VaireDbError, sanitize_message, sqlstate_for_code};
 use vairedb_common::proto::vairedb::v1::VdbErrorCode;
@@ -90,6 +92,215 @@ pub fn enrich_generic_error(e: &dyn Display, ctx: &ErrorContext) -> PgWireError 
     PgWireError::UserError(Box::new(info))
 }
 
+/// Enrich a `DataFusionError` whose type is still in hand, classifying it from its
+/// **variant** rather than from the text its `Display` happens to produce.
+///
+/// Prefer this to [`enrich_generic_error`] everywhere the concrete error survives.
+/// The substring classifier cannot be made to work here, and not merely because
+/// message text drifts: `DataFusionError::Context` and `Diagnostic` have an empty
+/// `error_prefix`, so the variant that matters is the *inner* one, and a scan of the
+/// flattened string sees whichever phrase happens to appear first. Matching the
+/// variant also means a DataFusion upgrade that rewords an error cannot silently
+/// reclassify it — the compiler reports a new variant instead.
+pub fn enrich_datafusion_error(e: &DataFusionError, ctx: &ErrorContext) -> PgWireError {
+    let code = reclassify_transported_data_error(e, classify_datafusion_error_code(e));
+    let sqlstate = sqlstate_for_code(code).to_string();
+    let sanitized = sanitize_message(&e.to_string());
+
+    let vdb_error = VaireDbError::new(code, &sanitized);
+    let mut info = ErrorInfo::new("ERROR".to_string(), sqlstate, vdb_error.formatted_message());
+    info.table = ctx.table_name.clone();
+    PgWireError::UserError(Box::new(info))
+}
+
+/// Classify a [`DataFusionError`] by variant, refining within a variant only where
+/// PostgreSQL draws a distinction DataFusion carries in the message.
+///
+/// The wrapper variants recurse, which is the point: `Context`, `Diagnostic` and
+/// `Shared` exist to annotate an error without replacing it, so the classification
+/// belongs to what they wrap. `Collection` takes its first error, matching
+/// DataFusion's own `error_prefix`.
+///
+/// The catch-all arm is deliberate rather than lazy. `ParquetError`, `ObjectStore`
+/// and `Ffi` are behind cargo features, so naming them here would make this module's
+/// compilation depend on DataFusion's feature resolution; all three are engine
+/// failures and `EngineError` is what they would map to anyway.
+pub(crate) fn classify_datafusion_error_code(e: &DataFusionError) -> VdbErrorCode {
+    match e {
+        // Annotation wrappers — classify what is inside.
+        DataFusionError::Context(_, inner) | DataFusionError::Diagnostic(_, inner) => {
+            classify_datafusion_error_code(inner)
+        }
+        DataFusionError::Shared(inner) => classify_datafusion_error_code(inner),
+        DataFusionError::Collection(errs) => {
+            errs.first().map_or(VdbErrorCode::InternalError, |first| {
+                classify_datafusion_error_code(first)
+            })
+        }
+
+        // An honest refusal, and the class a client can act on.
+        DataFusionError::NotImplemented(_) | DataFusionError::Substrait(_) => {
+            VdbErrorCode::FeatureNotSupported
+        }
+
+        // A parse failure is the client's syntax, whoever noticed it.
+        DataFusionError::SQL(_, _) => VdbErrorCode::SqlSyntaxError,
+
+        // The name resolution errors, already typed by DataFusion — all four are a
+        // column the query named and the schema does not have.
+        DataFusionError::SchemaError(_, _) => VdbErrorCode::ColumnNotFound,
+
+        // Planning covers several PostgreSQL classes; the message is the only thing
+        // that separates them, but scoped to this variant rather than scanned globally.
+        DataFusionError::Plan(msg) => classify_plan_message(msg),
+
+        // Execution reached a row it could not process. Divide-by-zero and overflow are
+        // data errors PostgreSQL names; the rest is genuinely the engine.
+        DataFusionError::Execution(msg) => classify_execution_message(msg),
+        DataFusionError::ArrowError(arrow, _) => classify_arrow_error(arrow),
+
+        DataFusionError::ResourcesExhausted(_) => VdbErrorCode::WriteQueueFull,
+
+        // Text that already crossed a process boundary: the type is gone, so this is
+        // the one place the substring classifier is the best available answer.
+        DataFusionError::External(inner) => match inner.downcast_ref::<DataFusionError>() {
+            Some(df) => classify_datafusion_error_code(df),
+            None => classify_generic_error_code(&inner.to_string()),
+        },
+
+        DataFusionError::IoError(_) | DataFusionError::ExecutionJoin(_) => {
+            VdbErrorCode::EngineError
+        }
+        DataFusionError::Internal(_) | DataFusionError::Configuration(_) => {
+            VdbErrorCode::InternalError
+        }
+
+        _ => VdbErrorCode::EngineError,
+    }
+}
+
+/// Split a `DataFusionError::Plan` message into the PostgreSQL classes it covers.
+///
+/// Everything here is a defect in the statement rather than in the server, so the
+/// fallback is `42601` and not `XX000`: a planning error means the query was read and
+/// rejected, which is exactly what the syntax-error class tells a client.
+fn classify_plan_message(msg: &str) -> VdbErrorCode {
+    let lower = msg.to_lowercase();
+    if lower.contains("aggregate function calls cannot be nested")
+        || lower.contains("aggregate functions cannot be nested")
+    {
+        VdbErrorCode::GroupingError
+    } else if lower.contains("window function") || lower.contains("over clause") {
+        VdbErrorCode::WindowingError
+    } else if lower.contains("no function matches")
+        || lower.contains("invalid function")
+        || lower.contains("not supported")
+    {
+        VdbErrorCode::FeatureNotSupported
+    } else if lower.contains("no field named") || lower.contains("ambiguous") {
+        VdbErrorCode::ColumnNotFound
+    } else if (lower.contains("table") && lower.contains("not found"))
+        || lower.contains("no table named")
+    {
+        VdbErrorCode::TableNotFound
+    } else if lower.contains("cannot cast") || lower.contains("type mismatch") {
+        VdbErrorCode::TypeMismatch
+    } else {
+        VdbErrorCode::SqlSyntaxError
+    }
+}
+
+/// Split a `DataFusionError::Execution` message into the data errors PostgreSQL names.
+///
+/// `22012` and `22003` matter more than they look: both used to arrive as `XX000`,
+/// which tells a client the server broke and invites a retry that cannot succeed. The
+/// statement and the server were both fine and one row's data was not.
+fn classify_execution_message(msg: &str) -> VdbErrorCode {
+    let lower = msg.to_lowercase();
+    if is_divide_by_zero(&lower) {
+        VdbErrorCode::DivisionByZero
+    } else if lower.contains("overflow") {
+        VdbErrorCode::NumericValueOutOfRange
+    } else if lower.contains("cannot cast string")
+        || lower.contains("invalid input syntax")
+        || lower.contains("error parsing")
+    {
+        VdbErrorCode::InvalidTextRepresentation
+    } else {
+        VdbErrorCode::EngineError
+    }
+}
+
+/// Rescue a data error that lost its type crossing the Ballista scheduler boundary.
+///
+/// The variant-based classifier is the right default: it cannot rot when DataFusion
+/// rewords a message. But it only works while there is a variant to read, and an error
+/// raised inside an executor does not keep one. The scheduler formats the whole failure
+/// into a string, and Ballista returns it under whichever wrapper the call site
+/// happened to use — `Execution` from `DistributedQueryExec`, but wrapped again by
+/// `collect()` on the way out. Depending on which wrapper is on top is depending on an
+/// implementation detail of a dependency; the *rendered message* is the one part of a
+/// transported error that is stable.
+///
+/// So this runs only when classification already gave up — `EngineError` or
+/// `InternalError`, the two "we do not know" answers — and only for divide-by-zero,
+/// where the cost of the wrong answer is concrete: `XX000` tells a driver the server
+/// broke and the statement is worth retrying, and `1 / 0` will fail identically every
+/// time. Widening this to more codes would erode the reason the classifier is
+/// variant-based, so it stays a named exception rather than a general fallback.
+fn reclassify_transported_data_error(e: &DataFusionError, code: VdbErrorCode) -> VdbErrorCode {
+    if !matches!(
+        code,
+        VdbErrorCode::EngineError | VdbErrorCode::InternalError
+    ) {
+        return code;
+    }
+    if is_divide_by_zero(&e.to_string().to_lowercase()) {
+        return VdbErrorCode::DivisionByZero;
+    }
+    code
+}
+
+/// Recognize divide-by-zero in an already-lowercased message, in prose or in Rust's
+/// `Debug` spelling.
+///
+/// The `Debug` spelling is not a nicety. An error raised inside a Ballista executor is
+/// serialized by the scheduler before the coordinator ever sees it, and what comes back
+/// is the `Debug` rendering nested a few layers deep:
+///
+/// ```text
+/// Job abc failed: … DataFusionError(Execution("ArrowError(DivideByZero)"))
+/// ```
+///
+/// `ArrowError::DivideByZero`'s typed arm in [`classify_arrow_error`] cannot fire on
+/// that, because there is no longer an `ArrowError` to match — only text. Since scans
+/// and projections run distributed, this is the spelling most arithmetic errors on a
+/// real table actually arrive in, so missing it meant `1 / 0` reported `XX000` and
+/// invited a retry that could not succeed. Matching without the spaces covers both.
+fn is_divide_by_zero(lower: &str) -> bool {
+    lower.contains("divide by zero")
+        || lower.contains("division by zero")
+        || lower.contains("dividebyzero")
+}
+
+/// Classify an [`ArrowError`] reached through `DataFusionError::ArrowError`.
+///
+/// Arrow types the two cases PostgreSQL cares about most, so unlike the string
+/// variants above these need no message inspection at all: a failed cast or parse of
+/// a text value is `22P02`, and its dedicated divide-by-zero variant is `22012`.
+fn classify_arrow_error(e: &ArrowError) -> VdbErrorCode {
+    match e {
+        ArrowError::DivideByZero => VdbErrorCode::DivisionByZero,
+        ArrowError::ArithmeticOverflow(_) => VdbErrorCode::NumericValueOutOfRange,
+        ArrowError::CastError(_) | ArrowError::ParseError(_) => {
+            VdbErrorCode::InvalidTextRepresentation
+        }
+        ArrowError::NotYetImplemented(_) => VdbErrorCode::FeatureNotSupported,
+        ArrowError::SchemaError(_) => VdbErrorCode::ColumnNotFound,
+        _ => VdbErrorCode::EngineError,
+    }
+}
+
 /// Infer a `VdbErrorCode` from an untyped error message via case-insensitive
 /// substring matching against known engine/driver phrasings, falling back to
 /// `InternalError`. The first matching rule wins, so order is significant.
@@ -109,7 +320,12 @@ pub(crate) fn classify_generic_error_code(msg: &str) -> VdbErrorCode {
         VdbErrorCode::TypeMismatch
     } else if lower.contains("syntax error") || lower.contains("unexpected token") {
         VdbErrorCode::SqlSyntaxError
-    } else if lower.contains("not yet implemented")
+    // `"this feature is not implemented"` and `"not supported"` are the phrases
+    // DataFusion has emitted since 53 (`DataFusionError::error_prefix`); the two that
+    // preceded them are kept because DuckDB and Ballista still use them.
+    } else if lower.contains("this feature is not implemented")
+        || lower.contains("not yet implemented")
+        || lower.contains("not supported")
         || lower.contains("unsupported")
         || lower.contains("no function matches")
         || lower.contains("invalid function")
@@ -117,11 +333,10 @@ pub(crate) fn classify_generic_error_code(msg: &str) -> VdbErrorCode {
         VdbErrorCode::FeatureNotSupported
     } else if lower.contains("resources exhausted") || lower.contains("memory limit") {
         VdbErrorCode::WriteQueueFull
-    } else if lower.contains("divide by zero")
-        || lower.contains("division by zero")
-        || lower.contains("overflow")
-    {
-        VdbErrorCode::EngineError
+    } else if is_divide_by_zero(&lower) {
+        VdbErrorCode::DivisionByZero
+    } else if lower.contains("overflow") {
+        VdbErrorCode::NumericValueOutOfRange
     } else if lower.contains("unique constraint")
         || lower.contains("duplicate key")
         || lower.contains("primary key constraint")
@@ -176,6 +391,8 @@ pub(crate) fn classify_error(err: &CoordinatorError) -> (VdbErrorCode, String) {
             "failed to communicate with storage node".to_string()
         }
         CoordinatorError::SqlParse(e) => format!("SQL syntax error: {}", e),
+        // Already written for the client, and already naming what to write instead.
+        CoordinatorError::Unsupported(msg) => msg.clone(),
         CoordinatorError::NodeExecFailed(node_err) => {
             tracing::error!(
                 node_id = %node_err.node_id,
@@ -679,8 +896,24 @@ mod tests {
                 "unexpected token in expression",
                 VdbErrorCode::SqlSyntaxError,
             ),
-            ("divide by zero", VdbErrorCode::EngineError),
-            ("integer overflow in computation", VdbErrorCode::EngineError),
+            // Both used to be `EngineError`, i.e. `XX000`. They are data errors the
+            // client caused, and reporting them as internal tells a driver to retry
+            // something that cannot succeed.
+            ("divide by zero", VdbErrorCode::DivisionByZero),
+            (
+                "integer overflow in computation",
+                VdbErrorCode::NumericValueOutOfRange,
+            ),
+            // The phrasings DataFusion has used since 53, which the two rules above
+            // this line did not match — so these reached clients as `XX000` too.
+            (
+                "This feature is not implemented: window EXCLUDE",
+                VdbErrorCode::FeatureNotSupported,
+            ),
+            (
+                "Sort expression is not supported",
+                VdbErrorCode::FeatureNotSupported,
+            ),
             (
                 "NOT NULL constraint failed: column 'name' cannot be null",
                 VdbErrorCode::EngineError,
@@ -782,6 +1015,230 @@ mod tests {
                 assert!(info.message.contains("[VDB-5001]"));
             }
             other => panic!("expected UserError, got: {:?}", other),
+        }
+    }
+
+    // --- enrich_datafusion_error / classify_datafusion_error_code ---
+
+    /// One case per variant this classifies deliberately, so an upstream reshuffle of
+    /// `DataFusionError` shows up as a failure here rather than as a class silently
+    /// falling back to `EngineError`.
+    #[test]
+    fn classifies_each_datafusion_variant_by_its_variant() {
+        let cases: Vec<(DataFusionError, VdbErrorCode)> = vec![
+            (
+                DataFusionError::NotImplemented("window EXCLUDE".into()),
+                VdbErrorCode::FeatureNotSupported,
+            ),
+            (
+                DataFusionError::Substrait("nope".into()),
+                VdbErrorCode::FeatureNotSupported,
+            ),
+            (
+                DataFusionError::Internal("broke".into()),
+                VdbErrorCode::InternalError,
+            ),
+            (
+                DataFusionError::Configuration("bad setting".into()),
+                VdbErrorCode::InternalError,
+            ),
+            (
+                DataFusionError::ResourcesExhausted("no memory".into()),
+                VdbErrorCode::WriteQueueFull,
+            ),
+            (
+                DataFusionError::ArrowError(Box::new(ArrowError::DivideByZero), None),
+                VdbErrorCode::DivisionByZero,
+            ),
+            (
+                DataFusionError::ArrowError(
+                    Box::new(ArrowError::CastError("'x' -> i32".into())),
+                    None,
+                ),
+                VdbErrorCode::InvalidTextRepresentation,
+            ),
+            (
+                DataFusionError::ArrowError(
+                    Box::new(ArrowError::ArithmeticOverflow("i64".into())),
+                    None,
+                ),
+                VdbErrorCode::NumericValueOutOfRange,
+            ),
+            (
+                DataFusionError::Execution("Divide by zero error".into()),
+                VdbErrorCode::DivisionByZero,
+            ),
+            // The shape a divide-by-zero actually has after it crosses the Ballista
+            // scheduler: the typed `ArrowError` is gone and only its `Debug` spelling
+            // survives, with no spaces to match on. Copied from a live 5-node cluster.
+            (
+                DataFusionError::Execution(
+                    "Job MUwZj9P failed: Job failed due to stage 1 failed: Task failed due to \
+                     runtime execution error: DataFusionError(Execution(\"ArrowError(DivideByZero)\"))"
+                        .into(),
+                ),
+                VdbErrorCode::DivisionByZero,
+            ),
+            (
+                DataFusionError::Execution("Overflow happened".into()),
+                VdbErrorCode::NumericValueOutOfRange,
+            ),
+            (
+                DataFusionError::Execution("some engine trouble".into()),
+                VdbErrorCode::EngineError,
+            ),
+            (
+                DataFusionError::Plan("No function matches the given name".into()),
+                VdbErrorCode::FeatureNotSupported,
+            ),
+            (
+                DataFusionError::Plan("Aggregate function calls cannot be nested".into()),
+                VdbErrorCode::GroupingError,
+            ),
+            (
+                DataFusionError::Plan("window function is not allowed in WHERE".into()),
+                VdbErrorCode::WindowingError,
+            ),
+            (
+                DataFusionError::Plan("No field named foo".into()),
+                VdbErrorCode::ColumnNotFound,
+            ),
+            (
+                DataFusionError::Plan("something else entirely".into()),
+                VdbErrorCode::SqlSyntaxError,
+            ),
+        ];
+
+        for (err, expected) in cases {
+            assert_eq!(
+                classify_datafusion_error_code(&err),
+                expected,
+                "misclassified {err:?}"
+            );
+        }
+    }
+
+    /// The reason a substring scan cannot do this job. `Context` has an empty
+    /// `error_prefix`, so the flattened text of this error begins with the *annotation*
+    /// — and the annotation here names planning while the error underneath is a
+    /// division by zero. Only the inner variant is the truth.
+    #[test]
+    fn a_wrapped_error_is_classified_by_what_it_wraps() {
+        let inner = DataFusionError::ArrowError(Box::new(ArrowError::DivideByZero), None);
+        let wrapped = DataFusionError::Context(
+            "while evaluating projection during planning".into(),
+            Box::new(inner),
+        );
+        assert_eq!(
+            classify_datafusion_error_code(&wrapped),
+            VdbErrorCode::DivisionByZero
+        );
+    }
+
+    #[test]
+    fn a_shared_and_a_collection_error_classify_by_their_contents() {
+        let shared = DataFusionError::Shared(Arc::new(DataFusionError::NotImplemented("x".into())));
+        assert_eq!(
+            classify_datafusion_error_code(&shared),
+            VdbErrorCode::FeatureNotSupported
+        );
+
+        let collection = DataFusionError::Collection(vec![
+            DataFusionError::Execution("Divide by zero".into()),
+            DataFusionError::Internal("noise".into()),
+        ]);
+        assert_eq!(
+            classify_datafusion_error_code(&collection),
+            VdbErrorCode::DivisionByZero
+        );
+    }
+
+    /// A `DataFusionError` boxed inside `External` is what a Ballista stage failure
+    /// looks like once it has crossed gRPC, so unwrapping it keeps the typed answer
+    /// rather than falling back to the substring scan.
+    #[test]
+    fn an_external_error_unwraps_a_datafusion_error_inside_it() {
+        let external = DataFusionError::External(Box::new(DataFusionError::NotImplemented(
+            "something".into(),
+        )));
+        assert_eq!(
+            classify_datafusion_error_code(&external),
+            VdbErrorCode::FeatureNotSupported
+        );
+    }
+
+    /// `SchemaError` is already typed by DataFusion, so no message reading is needed.
+    #[test]
+    fn a_schema_error_is_a_missing_column() {
+        let err = DataFusionError::SchemaError(
+            Box::new(datafusion::common::SchemaError::AmbiguousReference {
+                field: Box::new(datafusion::common::Column::new_unqualified("id")),
+            }),
+            Box::new(None),
+        );
+        assert_eq!(
+            classify_datafusion_error_code(&err),
+            VdbErrorCode::ColumnNotFound
+        );
+    }
+
+    /// The end-to-end shape a client sees: the right SQLSTATE, and no `Signature { … }`
+    /// debug dump surviving into the message.
+    #[test]
+    fn enriching_reports_the_sqlstate_and_elides_a_signature_dump() {
+        let err = DataFusionError::Plan(
+            "No function matches 'lpad': Signature { type_signature: OneOf([Exact([Utf8])]), \
+             volatility: Immutable }"
+                .into(),
+        );
+        match enrich_datafusion_error(&err, &ErrorContext::for_table("t")) {
+            pgwire::error::PgWireError::UserError(info) => {
+                assert_eq!(info.code, "0A000");
+                assert!(!info.message.contains("type_signature"), "{}", info.message);
+                assert!(info.message.contains("Signature { … }"), "{}", info.message);
+            }
+            other => panic!("expected UserError, got: {other:?}"),
+        }
+    }
+
+    /// A division by zero used to reach clients as `XX000`, which says the server broke.
+    #[test]
+    fn a_division_by_zero_reports_the_data_error_sqlstate() {
+        let err = DataFusionError::ArrowError(Box::new(ArrowError::DivideByZero), None);
+        match enrich_datafusion_error(&err, &ErrorContext::default()) {
+            pgwire::error::PgWireError::UserError(info) => assert_eq!(info.code, "22012"),
+            other => panic!("expected UserError, got: {other:?}"),
+        }
+    }
+
+    /// The same division by zero, but as it actually arrives from a five-node cluster:
+    /// raised in an executor, formatted into a string by the scheduler, and handed back
+    /// under a wrapper variant that carries no type information. Every one of these
+    /// shapes was observed or is a plausible re-wrap of one that was, and all of them
+    /// have to answer `22012` — which is the reason
+    /// [`reclassify_transported_data_error`] reads the rendered message rather than
+    /// trusting the wrapper.
+    #[test]
+    fn a_transported_division_by_zero_reports_the_data_error_sqlstate() {
+        const BALLISTA: &str = "Job 3QdcFzH failed: Job failed due to stage 1 failed: Task \
+                                failed due to runtime execution error: \
+                                DataFusionError(Execution(\"ArrowError(DivideByZero)\"))";
+
+        for err in [
+            DataFusionError::Execution(BALLISTA.into()),
+            DataFusionError::Internal(BALLISTA.into()),
+            DataFusionError::Context(
+                "collect".into(),
+                Box::new(DataFusionError::Execution(BALLISTA.into())),
+            ),
+            DataFusionError::External(Box::new(std::io::Error::other(BALLISTA))),
+        ] {
+            match enrich_datafusion_error(&err, &ErrorContext::default()) {
+                pgwire::error::PgWireError::UserError(info) => {
+                    assert_eq!(info.code, "22012", "for {err:?}");
+                }
+                other => panic!("expected UserError, got: {other:?}"),
+            }
         }
     }
 

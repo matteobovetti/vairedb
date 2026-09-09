@@ -13,6 +13,9 @@ tokio = { version = "1", features = ["full"] }
 # DATE / TIME / TIMESTAMP / TIMESTAMPTZ parameters over the extended protocol —
 # required by the data-type suite (tests/data_types_round_trips.rs).
 tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
+# The payload type `tokio-postgres`' `copy_in` sink takes (`T: Buf`). Needed by the
+# COPY streaming tests, which send a CSV in pieces that ignore row boundaries.
+bytes = "1"
 xxhash-rust = { version = "0.8", features = ["xxh3"] }
 hmac = "0.12"
 sha2 = "0.10"

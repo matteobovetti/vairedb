@@ -13,6 +13,7 @@ prost-types = { workspace = true }
 duckdb = { workspace = true }
 datafusion = { workspace = true }
 datafusion-proto = { workspace = true }
+datafusion-pg-functions = { workspace = true }
 ballista-executor = { workspace = true }
 ballista-core = { workspace = true }
 arrow = { workspace = true }

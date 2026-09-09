@@ -26,7 +26,7 @@ use datafusion::arrow::datatypes::DataType;
 
 use crate::pgwire_handler::encoding::arrow_array_value_to_string;
 use crate::pgwire_handler::parser::parse_sql;
-use crate::sqlparser::ast::{Expr, Insert, Query, SetExpr, Statement, Value, Values};
+use crate::sqlparser::ast::{Expr, Insert, Parens, Query, SetExpr, Statement, Value, Values};
 
 /// Rows per synthesized `INSERT`. The whole result is materialized either way
 /// (the read path already collects it to encode a response), so this does not
@@ -104,7 +104,7 @@ fn literal_kind(dt: &DataType) -> std::result::Result<LiteralKind, String> {
 /// Render the cell at `row` of `col` as the SQL literal expression that stores
 /// the same value.
 fn cell_literal(col: &dyn Array, row: usize, kind: LiteralKind) -> Expr {
-    if col.is_null(row) {
+    if crate::pgwire_handler::encoding::is_null_on_the_wire(col, row) {
         return Expr::Value(Value::Null.into());
     }
     let text = arrow_array_value_to_string(col, row);
@@ -232,7 +232,9 @@ fn values_query(rows: Vec<Vec<Expr>>) -> Query {
         body: Box::new(SetExpr::Values(Values {
             explicit_row: false,
             value_keyword: false,
-            rows,
+            // sqlparser carries each row's parenthesis tokens; these rows are
+            // synthesized, so they get an empty span and render as plain `(...)`.
+            rows: rows.into_iter().map(Parens::with_empty_span).collect(),
         })),
         order_by: None,
         limit_clause: None,

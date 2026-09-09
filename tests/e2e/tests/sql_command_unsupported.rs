@@ -24,9 +24,10 @@ use tokio_postgres::Client;
 //     behavior, written so it fails by construction until the gap closes.
 //
 // Sections follow the doc's "Open gaps, ranked" order, then the statements it
-// leaves unranked, then the ones it declares out of scope. Statements in the last group get NO xfail: they are single-node DuckDB
-// concerns that should stay rejected, and their test is there to keep them
-// rejected.
+// leaves unranked, then the two groups it declares 🚫 not planned — the ones with
+// a PostgreSQL rewrite, and the single-node DuckDB concerns. Statements in those
+// last two groups get NO xfail: there is no target behavior to write, and their
+// test exists to keep them rejected.
 //
 // Some rows are covered by their sibling files instead, because they belong to
 // a statement family that file already owns:
@@ -68,71 +69,20 @@ async fn setup_rows(client: &Client, tbl: &str) -> Vec<i64> {
 // 1. Session configuration — rows 28-31 (SET / RESET / SHOW / SET VARIABLE)
 // ============================================================================
 //
-// The doc's open gap 1: drivers send `SET` (client_encoding, search_path,
-// application_name, extra_float_digits, …) at connect time, so a rejection here
-// can break a client before it runs a single query.
+// The doc's open gap 1, now closed for rows 28/29/31: drivers send `SET`
+// (client_encoding, application_name, extra_float_digits, …) at connect time, so a
+// rejection here breaks a client before it runs a single query.
+//
+// What VaireDB accepts is not "everything": a parameter is accepted only where the
+// coordinator's own behaviour already matches the value, and refused by name or by
+// value otherwise. Recording a value nothing honours would have `SHOW` promise a
+// rendering or a resolution rule the read path never applies, which is a wrong
+// answer rather than a missing feature. So these tests come in two halves — the
+// values a client can rely on, and the ones that must keep failing.
 
+// The specific compatibility shape the doc calls out: the SETs a driver issues on
+// connect must not fail the session.
 #[tokio::test]
-async fn test_set_and_show_currently_rejected() {
-    let client = ready_client().await;
-    // SET and SHOW parse, so they reach classification: 0A000, labelled "SET" /
-    // "SHOW" (`SHOW ALL` included).
-    assert_unsupported(&client, "SET search_path TO myschema").await;
-    assert_unsupported(&client, "SET client_encoding TO 'UTF8'").await;
-    assert_unsupported(&client, "SET application_name = 'vairedb-e2e'").await;
-    assert_unsupported(&client, "SHOW search_path").await;
-    assert_unsupported(&client, "SHOW ALL").await;
-    // RESET does NOT parse under sqlparser's PostgreSqlDialect, so it fails one
-    // step earlier, at 42601 — as does DuckDB's `SET VARIABLE` (row 30).
-    assert_rejected(&client, "RESET search_path").await;
-    assert_rejected(&client, "RESET ALL").await;
-    assert_rejected(&client, "SET VARIABLE my_var = 42").await;
-}
-
-#[tokio::test]
-#[ignore = "gap (rows 29/31): SET and SHOW are rejected 0A000 — the coordinator tracks no session runtime parameters"]
-async fn test_set_then_show_round_trips() {
-    let client = ready_client().await;
-
-    execute(&client, "SET search_path TO myschema")
-        .await
-        .unwrap();
-
-    let rows = simple_query_rows(&client, "SHOW search_path")
-        .await
-        .unwrap();
-    assert_eq!(rows.len(), 1, "SHOW must return exactly one row");
-    assert_eq!(
-        rows[0][0].as_deref(),
-        Some("myschema"),
-        "SHOW must report the value SET on this session"
-    );
-}
-
-#[tokio::test]
-#[ignore = "gap (row 28): RESET is rejected at parse (42601) — sqlparser's PostgreSqlDialect has no RESET, and session config is not modeled anyway"]
-async fn test_reset_restores_the_default() {
-    let client = ready_client().await;
-
-    execute(&client, "SET search_path TO myschema")
-        .await
-        .unwrap();
-    execute(&client, "RESET search_path").await.unwrap();
-
-    let rows = simple_query_rows(&client, "SHOW search_path")
-        .await
-        .unwrap();
-    assert_ne!(
-        rows[0][0].as_deref(),
-        Some("myschema"),
-        "RESET must discard the session value"
-    );
-}
-
-// The specific compatibility shape the doc calls out: the SETs a driver issues
-// on connect should be accepted (no-op is fine) rather than failing the session.
-#[tokio::test]
-#[ignore = "gap (row 29): every SET is rejected 0A000, including the no-op-safe parameters drivers send at connect time"]
 async fn test_driver_startup_sets_are_accepted() {
     let client = ready_client().await;
 
@@ -141,6 +91,13 @@ async fn test_driver_startup_sets_are_accepted() {
         "SET application_name = 'vairedb-e2e'",
         "SET extra_float_digits = 3",
         "SET DateStyle TO 'ISO'",
+        "SET DateStyle TO 'ISO, MDY'",
+        "SET IntervalStyle = 'postgres'",
+        "SET standard_conforming_strings = on",
+        "SET TimeZone TO 'UTC'",
+        "SET TIME ZONE 'Etc/UTC'",
+        "SET client_min_messages TO warning",
+        "SET statement_timeout = 0",
     ] {
         execute(&client, sql)
             .await
@@ -148,28 +105,245 @@ async fn test_driver_startup_sets_are_accepted() {
     }
 }
 
+#[tokio::test]
+async fn test_set_then_show_round_trips() {
+    let client = ready_client().await;
+
+    execute(&client, "SET application_name = 'vairedb-e2e'")
+        .await
+        .unwrap();
+
+    let rows = simple_query_rows(&client, "SHOW application_name")
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1, "SHOW must return exactly one row");
+    assert_eq!(
+        rows[0][0].as_deref(),
+        Some("vairedb-e2e"),
+        "SHOW must report the value SET on this session"
+    );
+}
+
+#[tokio::test]
+async fn test_reset_restores_the_default() {
+    let client = ready_client().await;
+
+    let default = simple_query_rows(&client, "SHOW application_name")
+        .await
+        .unwrap()[0][0]
+        .clone();
+
+    execute(&client, "SET application_name = 'vairedb-e2e'")
+        .await
+        .unwrap();
+    execute(&client, "RESET application_name").await.unwrap();
+
+    let rows = simple_query_rows(&client, "SHOW application_name")
+        .await
+        .unwrap();
+    assert_eq!(
+        rows[0][0], default,
+        "RESET must restore the value the session started with"
+    );
+
+    // `RESET ALL` is what a connection pooler issues on checkout, so it has to work
+    // as a whole-session reset rather than as one more unrecognized statement.
+    execute(&client, "SET application_name = 'vairedb-e2e'")
+        .await
+        .unwrap();
+    execute(&client, "RESET ALL").await.unwrap();
+    let rows = simple_query_rows(&client, "SHOW application_name")
+        .await
+        .unwrap();
+    assert_eq!(rows[0][0], default, "RESET ALL must discard session values");
+}
+
+// The column label is part of the wire contract: a client keys its result map on
+// the name `SHOW` sends, and PostgreSQL sends the parameter's canonical spelling
+// however the client spelled it in the statement.
+#[tokio::test]
+async fn test_show_labels_its_column_with_the_canonical_parameter_name() {
+    let client = ready_client().await;
+
+    assert_eq!(
+        describe_result_labels(&client, "SHOW datestyle").await,
+        vec!["DateStyle".to_string()],
+    );
+    assert_eq!(
+        describe_result_labels(&client, "SHOW ALL").await,
+        vec![
+            "name".to_string(),
+            "setting".to_string(),
+            "description".to_string()
+        ],
+    );
+}
+
+#[tokio::test]
+async fn test_show_all_lists_every_parameter() {
+    let client = ready_client().await;
+
+    let rows = simple_query_rows(&client, "SHOW ALL").await.unwrap();
+    assert!(
+        rows.len() > 10,
+        "SHOW ALL should report the whole registry, got {} rows",
+        rows.len()
+    );
+    for row in &rows {
+        assert_eq!(row.len(), 3, "SHOW ALL has name/setting/description");
+    }
+    assert!(
+        rows.iter().any(|r| r[0].as_deref() == Some("DateStyle")),
+        "SHOW ALL should include DateStyle"
+    );
+}
+
+// JDBC calls this from `getTransactionIsolation()` before it runs anything, so an
+// error here fails a connection outright. The answer is the weakest level because
+// that is the one a multi-shard commit can stand behind: it is applied one node
+// set at a time, so a concurrent reader can see it half-applied.
+#[tokio::test]
+async fn test_show_transaction_isolation_level_answers_the_jdbc_probe() {
+    let client = ready_client().await;
+
+    let rows = simple_query_rows(&client, "SHOW TRANSACTION ISOLATION LEVEL")
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_deref(), Some("read uncommitted"));
+}
+
+// A runtime parameter touches no relation, so a block has nothing for it to be
+// inconsistent with — PostgreSQL allows it, and refusing it would break any ORM
+// that configures the session after opening one.
+#[tokio::test]
+async fn test_set_is_allowed_inside_a_transaction_block() {
+    let client = ready_client().await;
+
+    execute(&client, "BEGIN").await.unwrap();
+    execute(&client, "SET application_name = 'in-a-block'")
+        .await
+        .unwrap();
+    let rows = simple_query_rows(&client, "SHOW application_name")
+        .await
+        .unwrap();
+    assert_eq!(rows[0][0].as_deref(), Some("in-a-block"));
+    execute(&client, "COMMIT").await.unwrap();
+}
+
+// The other half of the contract. A value the coordinator does not honour is
+// refused, and refused with the SQLSTATE that says which of three things went
+// wrong — a driver told `0A000` ("SET is unsupported") would stop retrying with a
+// value that would have worked.
+#[tokio::test]
+async fn test_a_value_the_coordinator_does_not_honour_is_refused() {
+    let client = ready_client().await;
+
+    // `22023` — the parameter is real, this value is not one VaireDB can honour.
+    for sql in [
+        // The result encoder emits UTF-8 only.
+        "SET client_encoding TO 'LATIN1'",
+        // Timestamps are stored and rendered in UTC throughout.
+        "SET TimeZone TO 'Europe/Rome'",
+        // Nothing cancels a running statement, so a client that set a timeout would
+        // wait forever on the query it expected to be aborted.
+        "SET statement_timeout = 5000",
+        // Both parsers read a backslash in a '...' literal literally.
+        "SET standard_conforming_strings = off",
+        // Dates are always rendered ISO.
+        "SET DateStyle TO 'German'",
+        "SET IntervalStyle = 'iso_8601'",
+        // Nothing consults a session default when a block opens, so every new
+        // transaction would stay writable while the session claimed otherwise.
+        "SET default_transaction_read_only = on",
+    ] {
+        assert_sqlstate(&client, sql, SQLSTATE_INVALID_PARAMETER_VALUE).await;
+    }
+
+    // `42704` — no such parameter. The client's mistake is the name, which is what
+    // PostgreSQL reports too, so a typo stays distinguishable from a refusal.
+    for sql in [
+        "SET work_mem = '64MB'",
+        "SET searchpath TO public",
+        "SHOW work_mem",
+        "RESET work_mem",
+    ] {
+        assert_sqlstate(&client, sql, SQLSTATE_UNDEFINED_OBJECT).await;
+    }
+
+    // `55P02` — reportable, but fixed when the server started, as in PostgreSQL.
+    for sql in ["SET server_version = '9.5'", "SET is_superuser = off"] {
+        assert_sqlstate(&client, sql, SQLSTATE_CANT_CHANGE_RUNTIME_PARAM).await;
+    }
+}
+
+// `search_path` is the one parameter refused by name rather than by value: VaireDB
+// resolves an unqualified relation to the default schema and nothing else — the
+// catalog key *is* the qualified name. Recording a search path would leave every
+// unqualified name resolving against `public` while the session reported
+// otherwise, which is a wrong answer, not a missing feature.
+#[tokio::test]
+async fn test_search_path_stays_refused() {
+    let client = ready_client().await;
+
+    // Refused even for `public`: accepting it would mean accepting the parameter,
+    // and the next statement would set something else.
+    for sql in ["SET search_path TO myschema", "SET search_path TO public"] {
+        assert_unsupported(&client, sql).await;
+    }
+
+    // Reportable, though, so a client can see what it is going to get.
+    let rows = simple_query_rows(&client, "SHOW search_path")
+        .await
+        .unwrap();
+    assert_eq!(rows[0][0].as_deref(), Some("public"));
+
+    // And resettable: `RESET` asks for the default, and the default is the
+    // behaviour VaireDB has, so the OK is true. A pooler that resets on checkout
+    // keeps working while `SET` still cannot lie.
+    execute(&client, "RESET search_path").await.unwrap();
+}
+
+// The SET forms that name something the coordinator does not implement at all —
+// an identity, an isolation level, a character set, a transaction-scoped value.
+// Each is refused by name, so a client is never left guessing which part of the
+// statement was the problem.
+#[tokio::test]
+async fn test_unmodelled_set_forms_stay_rejected() {
+    let client = ready_client().await;
+
+    for sql in [
+        // Scoped to the enclosing transaction, which the coordinator's buffered
+        // block cannot roll a parameter back with.
+        "SET LOCAL application_name = 'x'",
+        "SET ROLE readonly",
+        "SET SESSION AUTHORIZATION 'someone'",
+        "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE",
+        "SET NAMES 'UTF8'",
+    ] {
+        assert_unsupported(&client, sql).await;
+    }
+
+    // DuckDB's `SET VARIABLE` (row 30) has no PostgreSQL equivalent, so it is not
+    // a gap to close — it fails at parse.
+    assert_rejected(&client, "SET VARIABLE my_var = 42").await;
+}
+
 // ============================================================================
 // 2. COPY — row 14
 // ============================================================================
 //
-// No longer a blanket gap: the file-based CSV forms work in both directions, the
-// file living on the *coordinator's* filesystem. What is still refused is
-// everything that is not a coordinator-side CSV file — and it is refused by name,
+// No longer a gap: all four forms work — CSV to and from a file on the
+// *coordinator's* filesystem, and CSV to and from the client over the copy
+// sub-protocol, which is what `psql \copy` and every driver's bulk loader use.
+// What is still refused is everything that is not CSV, and it is refused by name,
 // so a client is never left guessing which part of the statement was the problem.
-//
-// `COPY … FROM STDIN` / `TO STDOUT` would put the connection into the copy
-// sub-protocol, which the Noop copy handler does not drive, so they stay refused;
-// a client-side test of the sub-protocol belongs with the protocol work.
 
 #[tokio::test]
-async fn test_copy_outside_coordinator_side_csv_is_rejected() {
+async fn test_copy_outside_csv_is_rejected() {
     let client = ready_client().await;
     let tbl = unique_table_name("un_copy");
     setup_rows(&client, &tbl).await;
-
-    // The copy sub-protocol. `FROM STDIN` only parses with the trailing semicolon.
-    assert_unsupported(&client, &format!("COPY {tbl} FROM STDIN (FORMAT CSV);")).await;
-    assert_unsupported(&client, &format!("COPY {tbl} TO STDOUT (FORMAT CSV)")).await;
 
     // Piping through a shell on the coordinator.
     assert_unsupported(
@@ -235,6 +409,228 @@ async fn test_copy_to_file_then_back_round_trips() {
 
     drop_table(&client, &src).await;
     drop_table(&client, &dst).await;
+}
+
+// The streaming forms, which are the ones a client can actually reach: the file
+// forms need a path on the coordinator's own container, so `psql \copy` and every
+// driver's bulk loader use `STDIN`/`STDOUT` instead.
+//
+// The data is deliberately sent in pieces that do not line up with its rows —
+// which is what a real client does, since a `CopyData` message boundary falls
+// wherever its buffer ended. The import must not care.
+#[tokio::test]
+async fn test_copy_from_stdin_streams_rows_to_every_shard() {
+    use futures::SinkExt;
+
+    let client = ready_client().await;
+    let tbl = unique_table_name("un_copyin");
+    execute(&client, &format!("DROP TABLE IF EXISTS {tbl}"))
+        .await
+        .unwrap();
+    execute(
+        &client,
+        &format!("CREATE TABLE {tbl} (id INTEGER NOT NULL, v VARCHAR) {CREATE_OPTS}"),
+    )
+    .await
+    .unwrap();
+
+    // Enough rows to land on all three shards, with a quoted value carrying the
+    // delimiter so the split cannot be a naive one.
+    let ids: Vec<i64> = (0..SHARD_COUNT as u64)
+        .flat_map(|b| ids_in_bucket(b, 4, 1))
+        .collect();
+    let mut csv = String::from("id,v\n");
+    for id in &ids {
+        csv.push_str(&format!("{id},\"v,{id}\"\n"));
+    }
+
+    let sink = client
+        .copy_in(&format!("COPY {tbl} FROM STDIN (FORMAT CSV, HEADER)"))
+        .await
+        .expect("the copy must open");
+    let mut sink = Box::pin(sink);
+    // 7 bytes at a time: every boundary lands mid-row, and some land inside the
+    // quoted field.
+    for piece in csv.as_bytes().chunks(7) {
+        sink.send(bytes::Bytes::copy_from_slice(piece))
+            .await
+            .expect("a CopyData message must be accepted");
+    }
+    let written = sink
+        .as_mut()
+        .finish()
+        .await
+        .expect("the copy must complete");
+    assert_eq!(
+        written,
+        ids.len() as u64,
+        "COPY must report the rows it wrote"
+    );
+
+    let rows = simple_query_rows(&client, &format!("SELECT id, v FROM {tbl} ORDER BY id"))
+        .await
+        .unwrap();
+    let mut got: Vec<i64> = rows
+        .iter()
+        .map(|r| r[0].as_deref().unwrap().parse().unwrap())
+        .collect();
+    got.sort_unstable();
+    let mut want = ids.clone();
+    want.sort_unstable();
+    assert_eq!(
+        got, want,
+        "every row must be routed to its shard and stored exactly once"
+    );
+    assert!(
+        rows.iter()
+            .all(|r| r[1].as_deref().unwrap().starts_with("v,")),
+        "the quoted delimiter must survive the import: {rows:?}"
+    );
+
+    drop_table(&client, &tbl).await;
+}
+
+// `TO STDOUT` gathers every shard through the read path and streams the result to
+// the client, which is the export half of the same round trip.
+#[tokio::test]
+async fn test_copy_to_stdout_streams_every_shards_rows() {
+    use futures::TryStreamExt;
+
+    let client = ready_client().await;
+    let tbl = unique_table_name("un_copyout");
+    let ids = setup_rows(&client, &tbl).await;
+
+    let stream = client
+        .copy_out(&format!("COPY {tbl} TO STDOUT (FORMAT CSV, HEADER)"))
+        .await
+        .expect("the copy must open");
+    let chunks: Vec<bytes::Bytes> = stream.try_collect().await.expect("the copy must complete");
+    let csv = chunks.concat();
+    let csv = String::from_utf8(csv).expect("CSV is text");
+
+    let mut lines = csv.lines();
+    assert_eq!(
+        lines.next(),
+        Some("id,v"),
+        "HEADER must name the columns: {csv:?}"
+    );
+    let mut got: Vec<i64> = lines
+        .map(|l| l.split(',').next().unwrap().parse().unwrap())
+        .collect();
+    got.sort_unstable();
+    let mut want = ids;
+    want.sort_unstable();
+    assert_eq!(got, want, "the export must gather every shard's rows once");
+
+    drop_table(&client, &tbl).await;
+}
+
+// The round trip a client can drive on its own, with no coordinator-side path
+// involved: out of one table over the wire and back into another.
+#[tokio::test]
+async fn test_copy_stdout_to_stdin_round_trips() {
+    use futures::{SinkExt, TryStreamExt};
+
+    let client = ready_client().await;
+    let src = unique_table_name("un_copyrt_src");
+    let ids = setup_rows(&client, &src).await;
+
+    let stream = client
+        .copy_out(&format!("COPY {src} TO STDOUT (FORMAT CSV, HEADER)"))
+        .await
+        .unwrap();
+    let exported: Vec<bytes::Bytes> = stream.try_collect().await.unwrap();
+
+    let dst = create_table(
+        &client,
+        "un_copyrt_dst",
+        &format!("(id INTEGER NOT NULL, v VARCHAR) {CREATE_OPTS}"),
+    )
+    .await;
+    let sink = client
+        .copy_in(&format!("COPY {dst} FROM STDIN (FORMAT CSV, HEADER)"))
+        .await
+        .unwrap();
+    let mut sink = Box::pin(sink);
+    for chunk in exported {
+        sink.send(chunk).await.unwrap();
+    }
+    let written = sink.as_mut().finish().await.unwrap();
+    assert_eq!(written, ids.len() as u64);
+
+    let rows = simple_query_rows(&client, &format!("SELECT id FROM {dst} ORDER BY id"))
+        .await
+        .unwrap();
+    let mut got: Vec<i64> = rows
+        .iter()
+        .map(|r| r[0].as_deref().unwrap().parse().unwrap())
+        .collect();
+    got.sort_unstable();
+    let mut want = ids;
+    want.sort_unstable();
+    assert_eq!(got, want, "a client-side round trip must lose nothing");
+
+    drop_table(&client, &src).await;
+    drop_table(&client, &dst).await;
+}
+
+// A streaming import is refused before the client is invited to send anything: a
+// bulk loader should not upload a gigabyte for a copy that could never work.
+#[tokio::test]
+async fn test_a_streaming_import_that_cannot_work_is_refused_up_front() {
+    let client = ready_client().await;
+    let tbl = unique_table_name("un_copyrej");
+    setup_rows(&client, &tbl).await;
+
+    for sql in [
+        // Every row is routed by its shard key, so data without it has nowhere to go.
+        format!("COPY {tbl} (v) FROM STDIN (FORMAT CSV)"),
+        format!("COPY {tbl} (id, nope) FROM STDIN (FORMAT CSV)"),
+        format!("COPY {tbl} FROM STDIN"),
+    ] {
+        assert!(
+            client.copy_in::<str, bytes::Bytes>(&sql).await.is_err(),
+            "`{sql}` must be refused before any data is sent"
+        );
+    }
+
+    // The connection is still usable: a refused COPY must not leave it in copy mode.
+    let rows = simple_query_rows(&client, &format!("SELECT count(*) FROM {tbl}"))
+        .await
+        .expect("the connection must survive a refused COPY");
+    assert_eq!(rows[0][0].as_deref(), Some("3"));
+
+    drop_table(&client, &tbl).await;
+}
+
+// An empty transfer is an empty import, which is what PostgreSQL answers too.
+#[tokio::test]
+async fn test_an_empty_streaming_import_writes_nothing() {
+    let client = ready_client().await;
+    let tbl = unique_table_name("un_copyempty");
+    execute(&client, &format!("DROP TABLE IF EXISTS {tbl}"))
+        .await
+        .unwrap();
+    execute(
+        &client,
+        &format!("CREATE TABLE {tbl} (id INTEGER NOT NULL, v VARCHAR) {CREATE_OPTS}"),
+    )
+    .await
+    .unwrap();
+
+    // Nothing is ever sent, so the payload type has to be named outright.
+    let sink = client
+        .copy_in::<str, bytes::Bytes>(&format!("COPY {tbl} FROM STDIN (FORMAT CSV, HEADER)"))
+        .await
+        .unwrap();
+    let mut sink = Box::pin(sink);
+    assert_eq!(
+        sink.as_mut().finish().await.unwrap(),
+        0,
+        "a copy that sent nothing writes nothing"
+    );
+
+    drop_table(&client, &tbl).await;
 }
 
 // ============================================================================
@@ -610,52 +1006,77 @@ async fn test_alter_view_renames_the_view() {
 }
 
 // ============================================================================
-// 4. EXPLAIN and DESCRIBE — rows 27 and 22
+// 4. EXPLAIN and DESCRIBE — rows 27 and 22 (CLOSED)
 // ============================================================================
 //
-// The doc's open gap 2: widely used by tooling and humans for query inspection and
-// schema exploration. `DESCRIBE` parses to the same sqlparser node family as
-// EXPLAIN, so both carry the "EXPLAIN" label today.
+// The doc's open gap 2, now closed: both are answered on the read path, because a
+// SELECT already builds the DataFusion `LogicalPlan` an `EXPLAIN` reports and
+// already resolves the schema a `DESCRIBE` reports.
+//
+// What matters here is that the answer is *true*: the query inside an `EXPLAIN`
+// goes through the same preparation a bare SELECT does, so the plan shown is the
+// plan VaireDB would run, per-shard scans included. So these tests come in two
+// halves, like the SET ones — what a client is told, and the forms that must keep
+// failing because they would be a plausible answer to something VaireDB never does.
 
 #[tokio::test]
-async fn test_explain_describe_pragma_currently_rejected() {
+async fn test_profiling_pragmas_stay_rejected() {
     let client = ready_client().await;
-    let tbl = unique_table_name("un_explain");
-    setup_rows(&client, &tbl).await;
 
-    assert_unsupported(&client, &format!("EXPLAIN SELECT * FROM {tbl}")).await;
-    assert_unsupported(&client, &format!("EXPLAIN ANALYZE SELECT * FROM {tbl}")).await;
-    assert_unsupported(&client, &format!("DESCRIBE {tbl}")).await;
-    // Profiling PRAGMAs share row 27.
+    // Profiling PRAGMAs share row 27 with EXPLAIN, and stay refused: a PRAGMA is a
+    // DuckDB-only statement, and one accepted here would configure a single shard's
+    // engine while the client believes it configured the database.
     assert_rejected(&client, "PRAGMA enable_profiling").await;
     assert_rejected(&client, "PRAGMA database_list").await;
+}
+
+/// The forms that would answer with something VaireDB cannot know. Each names what
+/// it refused, so a client can tell a missing form from a missing feature.
+#[tokio::test]
+async fn test_untruthful_explain_forms_are_refused() {
+    let client = ready_client().await;
+    let tbl = unique_table_name("un_explainr");
+    setup_rows(&client, &tbl).await;
+
+    // A write is not planned in the coordinator at all — it is rendered back to SQL
+    // and planned by DuckDB on each shard — so a DataFusion plan for one would
+    // describe execution that never happens.
+    assert_unsupported(
+        &client,
+        &format!("EXPLAIN INSERT INTO {tbl} (id, v) VALUES (1, 'a')"),
+    )
+    .await;
+    assert_unsupported(&client, &format!("EXPLAIN UPDATE {tbl} SET v = 'a'")).await;
+    assert_unsupported(&client, &format!("EXPLAIN DELETE FROM {tbl}")).await;
+
+    // Options that would change the output a client parses. Accepting and ignoring
+    // one would return an indent-format plan to a client that asked for JSON.
+    assert_unsupported(
+        &client,
+        &format!("EXPLAIN (FORMAT JSON) SELECT id FROM {tbl}"),
+    )
+    .await;
+    assert_unsupported(
+        &client,
+        &format!("EXPLAIN (COSTS false) SELECT id FROM {tbl}"),
+    )
+    .await;
+    assert_unsupported(&client, &format!("EXPLAIN (BUFFERS) SELECT id FROM {tbl}")).await;
 
     drop_table(&client, &tbl).await;
 }
 
 #[tokio::test]
-#[ignore = "gap (row 27): EXPLAIN is rejected 0A000 — the coordinator has no plan-rendering path, although SELECTs already build a DataFusion LogicalPlan"]
 async fn test_explain_returns_a_plan() {
     let client = ready_client().await;
     let tbl = unique_table_name("un_explainx");
     setup_rows(&client, &tbl).await;
 
-    let rows = simple_query_rows(
+    let plan = plan_text(
         &client,
         &format!("EXPLAIN SELECT id FROM {tbl} WHERE id > 0"),
     )
-    .await
-    .unwrap();
-    assert!(
-        !rows.is_empty(),
-        "EXPLAIN must return at least one plan row"
-    );
-
-    let plan: String = rows
-        .iter()
-        .filter_map(|r| r[r.len() - 1].as_deref())
-        .collect::<Vec<_>>()
-        .join("\n");
+    .await;
     assert!(
         plan.contains(&tbl),
         "the plan should name the relation being scanned, got:\n{plan}"
@@ -664,26 +1085,109 @@ async fn test_explain_returns_a_plan() {
     drop_table(&client, &tbl).await;
 }
 
+/// The plan a client is shown must be the one the read path builds, which means it
+/// has to name the distributed scan — an `EXPLAIN` that reported a plain table scan
+/// would hide the only interesting thing about how VaireDB runs a query.
 #[tokio::test]
-#[ignore = "gap (row 27): EXPLAIN ANALYZE is rejected 0A000 — no per-shard execution metrics are collected or aggregated"]
+async fn test_explain_shows_the_distributed_scan() {
+    let client = ready_client().await;
+    let tbl = unique_table_name("un_explaind");
+    setup_rows(&client, &tbl).await;
+
+    let plan = plan_text(
+        &client,
+        &format!("EXPLAIN SELECT id FROM {tbl} WHERE id > 0"),
+    )
+    .await;
+    assert!(
+        plan.contains("physical_plan"),
+        "the plan should report a physical stage, got:\n{plan}"
+    );
+    assert!(
+        plan.contains("logical_plan"),
+        "the plan should report a logical stage, got:\n{plan}"
+    );
+
+    drop_table(&client, &tbl).await;
+}
+
+/// The column label is part of the wire contract: a client's plan display keys on
+/// PostgreSQL's `QUERY PLAN`, not on DataFusion's `plan_type`/`plan` pair.
+#[tokio::test]
+async fn test_explain_uses_the_postgres_column_shape() {
+    let client = ready_client().await;
+    let tbl = unique_table_name("un_explainl");
+    setup_rows(&client, &tbl).await;
+
+    assert_eq!(
+        describe_result_labels(&client, &format!("EXPLAIN SELECT id FROM {tbl}")).await,
+        vec!["QUERY PLAN".to_string()],
+        "EXPLAIN must return PostgreSQL's single QUERY PLAN column"
+    );
+    // Describe and Execute have to agree: the label is derived from the plan at
+    // Parse and the rows are reshaped at Execute, and a client that was told one
+    // column and sent two would fail to decode the row.
+    let rows = simple_query_rows(&client, &format!("EXPLAIN SELECT id FROM {tbl}"))
+        .await
+        .unwrap();
+    assert!(!rows.is_empty(), "EXPLAIN must return plan rows");
+    for row in &rows {
+        assert_eq!(row.len(), 1, "every plan row has exactly one column");
+    }
+
+    drop_table(&client, &tbl).await;
+}
+
+/// A view is not a relation any shard holds — it is a definition the coordinator
+/// inlines while preparing the query — so explaining one is the test that the
+/// *prepared* query is what gets planned.
+#[tokio::test]
+async fn test_explain_expands_a_view() {
+    let client = ready_client().await;
+    let tbl = unique_table_name("un_explainv");
+    let view = unique_table_name("un_explainvv");
+    setup_rows(&client, &tbl).await;
+    execute(
+        &client,
+        &format!("CREATE VIEW {view} AS SELECT id FROM {tbl} WHERE id > 0"),
+    )
+    .await
+    .unwrap();
+
+    let plan = plan_text(&client, &format!("EXPLAIN SELECT id FROM {view}")).await;
+    assert!(
+        plan.contains(&tbl),
+        "the plan should name the table the view reads, not just the view: got\n{plan}"
+    );
+
+    execute(&client, &format!("DROP VIEW {view}"))
+        .await
+        .unwrap();
+    drop_table(&client, &tbl).await;
+}
+
+/// `EXPLAIN ANALYZE` runs the query, which is the whole point of it: it is the one
+/// form that reports what execution actually did rather than what it would do.
+#[tokio::test]
 async fn test_explain_analyze_reports_execution() {
     let client = ready_client().await;
     let tbl = unique_table_name("un_explainax");
     setup_rows(&client, &tbl).await;
 
-    let rows = simple_query_rows(&client, &format!("EXPLAIN ANALYZE SELECT id FROM {tbl}"))
-        .await
-        .unwrap();
+    let plan = plan_text(&client, &format!("EXPLAIN ANALYZE SELECT id FROM {tbl}")).await;
     assert!(
-        !rows.is_empty(),
+        !plan.is_empty(),
         "EXPLAIN ANALYZE must return execution output"
+    );
+    assert!(
+        plan.contains("metrics") || plan.contains("Plan with Metrics"),
+        "EXPLAIN ANALYZE should report execution metrics, got:\n{plan}"
     );
 
     drop_table(&client, &tbl).await;
 }
 
 #[tokio::test]
-#[ignore = "gap (row 22): DESCRIBE is rejected 0A000 — schema introspection is only reachable through the emulated pg_catalog SELECTs"]
 async fn test_describe_lists_the_columns() {
     let client = ready_client().await;
     let tbl = unique_table_name("un_describex");
@@ -704,6 +1208,68 @@ async fn test_describe_lists_the_columns() {
     );
 
     drop_table(&client, &tbl).await;
+}
+
+/// `DESCRIBE <relation>` is answered by describing `SELECT * FROM <relation>`, so a
+/// view — which no shard holds — is described by the query it stands for, and a
+/// `DESCRIBE <query>` reaches the same path directly.
+#[tokio::test]
+async fn test_describe_reaches_a_view_and_a_query() {
+    let client = ready_client().await;
+    let tbl = unique_table_name("un_describev");
+    let view = unique_table_name("un_describevv");
+    setup_rows(&client, &tbl).await;
+    execute(
+        &client,
+        &format!("CREATE VIEW {view} AS SELECT id FROM {tbl}"),
+    )
+    .await
+    .unwrap();
+
+    let rows = simple_query_rows(&client, &format!("DESCRIBE {view}"))
+        .await
+        .unwrap();
+    let names: Vec<String> = rows
+        .iter()
+        .filter_map(|r| r[0].as_deref().map(|s| s.to_string()))
+        .collect();
+    assert_eq!(
+        names,
+        vec!["id".to_string()],
+        "DESCRIBE of a view must report the view's own columns"
+    );
+
+    let rows = simple_query_rows(&client, &format!("DESCRIBE SELECT v FROM {tbl}"))
+        .await
+        .unwrap();
+    let names: Vec<String> = rows
+        .iter()
+        .filter_map(|r| r[0].as_deref().map(|s| s.to_string()))
+        .collect();
+    assert_eq!(
+        names,
+        vec!["v".to_string()],
+        "DESCRIBE of a query must report the query's columns"
+    );
+
+    execute(&client, &format!("DROP VIEW {view}"))
+        .await
+        .unwrap();
+    drop_table(&client, &tbl).await;
+}
+
+/// Every plan row joined into one string, which is how a plan is read: PostgreSQL
+/// returns it one line per row, so an assertion about the plan as a whole has to
+/// reassemble it.
+async fn plan_text(client: &Client, sql: &str) -> String {
+    let rows = simple_query_rows(client, sql)
+        .await
+        .unwrap_or_else(|e| panic!("`{sql}` should return a plan: {e}"));
+    assert!(!rows.is_empty(), "`{sql}` must return at least one row");
+    rows.iter()
+        .filter_map(|r| r[r.len() - 1].as_deref())
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 // ============================================================================
@@ -1367,65 +1933,29 @@ async fn test_a_plain_column_is_the_documented_alternative() {
 }
 
 // ============================================================================
-// 10. VACUUM — row 36
+// 10. Statements with a PostgreSQL rewrite — rows 26, 32, 34, 36 and 9
 // ============================================================================
 //
-// VACUUM's scope is the doc's one undecided row: either distributed vacuum
-// management is in scope, or it belongs with CHECKPOINT and the other per-shard
-// storage concerns. This section keeps an xfail pending that decision. If VACUUM is
-// settled as out of scope, delete the xfail and move the rejection test down to
-// section 13 — that test holds either way.
+// Settled as not planned. Each of these is either DuckDB-only syntax or a
+// single-node storage concern, and each has a PostgreSQL form that already works
+// here, so accepting the DuckDB spelling would add a dialect VaireDB's clients do
+// not otherwise speak:
 //
-// VACUUM also fails at PARSE rather than classification: sqlparser's
-// PostgreSqlDialect does not implement it, so support starts one layer lower than
-// the other rows in this file.
-
-#[tokio::test]
-async fn test_vacuum_currently_rejected() {
-    let client = ready_client().await;
-    let tbl = unique_table_name("un_vacuum");
-    setup_rows(&client, &tbl).await;
-
-    assert_rejected(&client, "VACUUM").await;
-    assert_rejected(&client, &format!("VACUUM {tbl}")).await;
-    assert_rejected(&client, &format!("VACUUM ANALYZE {tbl}")).await;
-
-    drop_table(&client, &tbl).await;
-}
-
-#[tokio::test]
-#[ignore = "gap (row 36, scope undecided): VACUUM is rejected at parse (42601) — sqlparser's PostgreSqlDialect has no VACUUM, and per-shard storage maintenance is not exposed through the coordinator"]
-async fn test_vacuum_is_accepted_and_preserves_rows() {
-    let client = ready_client().await;
-    let tbl = unique_table_name("un_vacuumx");
-    let ids = setup_rows(&client, &tbl).await;
-
-    // Churn some rows so a vacuum has something to reclaim.
-    execute(&client, &format!("DELETE FROM {tbl} WHERE id = {}", ids[0]))
-        .await
-        .unwrap();
-
-    execute(&client, &format!("VACUUM {tbl}")).await.unwrap();
-
-    assert_eq!(
-        row_count(&client, &tbl).await,
-        (ids.len() - 1) as i64,
-        "VACUUM must not change visible rows"
-    );
-
-    drop_table(&client, &tbl).await;
-}
-
-// ============================================================================
-// 11. PIVOT / UNPIVOT — rows 26 and 34
-// ============================================================================
+//   * row 26 — PIVOT      → `CASE` inside aggregates with `GROUP BY`
+//   * row 34 — UNPIVOT    → `UNION ALL`, or `LATERAL` over a `VALUES` list
+//   * row 32 — SUMMARIZE  → the aggregates it wraps, written out
+//   * row 36 — VACUUM     → nothing: per-shard storage maintenance is not a
+//                           coordinator statement, same as CHECKPOINT
+//   * row 9  — ANALYZE    → nothing: there is no planner statistics surface for
+//                           it to populate, so it could only report a fake `OK`
 //
-// The doc's open gap 5. DuckDB-only syntax, so unlike the rest of this file these
-// fail at parse (`42601`) under `PostgreSqlDialect` rather than at classification:
-// supporting them means teaching the parser the statement first.
+// So this is a guard section, not a pending gap: it holds no xfail, and what it
+// pins is that none of these is ever quietly accepted. PIVOT, UNPIVOT, SUMMARIZE
+// and VACUUM fail at parse (`42601`) because `PostgreSqlDialect` has no such
+// statement; ANALYZE parses and is refused by classification (`0A000`).
 
 #[tokio::test]
-async fn test_pivot_and_unpivot_currently_rejected() {
+async fn test_statements_with_a_postgres_rewrite_stay_rejected() {
     let client = ready_client().await;
     let tbl = create_table(
         &client,
@@ -1442,85 +1972,42 @@ async fn test_pivot_and_unpivot_currently_rejected() {
     .await
     .unwrap();
 
-    assert_rejected(&client, &format!("PIVOT {tbl} ON cat USING SUM(amt)")).await;
-    assert_rejected(
-        &client,
-        &format!("UNPIVOT {tbl} ON amt INTO NAME measure VALUE val"),
-    )
-    .await;
+    // The table exists and every column named below is real, so a refusal here can
+    // only be about the statement itself.
+    let statements = [
+        format!("PIVOT {tbl} ON cat USING SUM(amt)"),
+        format!("UNPIVOT {tbl} ON amt INTO NAME measure VALUE val"),
+        format!("SUMMARIZE {tbl}"),
+        "VACUUM".to_string(),
+        format!("VACUUM {tbl}"),
+        format!("VACUUM ANALYZE {tbl}"),
+        format!("ANALYZE {tbl}"),
+    ];
 
-    drop_table(&client, &tbl).await;
-}
+    for sql in &statements {
+        assert_rejected(&client, sql).await;
+    }
 
-#[tokio::test]
-#[ignore = "gap (row 26): PIVOT is DuckDB-only syntax that sqlparser's PostgreSqlDialect does not parse (42601)"]
-async fn test_pivot_reshapes_rows_into_columns() {
-    let client = ready_client().await;
-    let tbl = create_table(
-        &client,
-        "un_pivotx",
-        &format!("(id INTEGER NOT NULL, cat VARCHAR, amt INTEGER) {CREATE_OPTS}"),
-    )
-    .await;
-    execute(
+    // The other half of the decision: the PostgreSQL rewrite of that PIVOT is not
+    // refused, so nothing is lost by declining the DuckDB spelling.
+    let rows = simple_query_rows(
         &client,
         &format!(
-            "INSERT INTO {tbl} (id, cat, amt) VALUES (1, 'a', 10), (2, 'b', 20), (3, 'a', 30)"
+            "SELECT SUM(CASE WHEN cat = 'a' THEN amt END) AS a, \
+             SUM(CASE WHEN cat = 'b' THEN amt END) AS b FROM {tbl}"
         ),
     )
     .await
-    .unwrap();
-
-    // One row: category 'a' sums to 40, 'b' to 20.
-    let rows = simple_query_rows(&client, &format!("PIVOT {tbl} ON cat USING SUM(amt)"))
-        .await
-        .unwrap();
-    assert_eq!(rows.len(), 1, "PIVOT must collapse the rows into one");
-    let mut values: Vec<String> = rows[0].iter().filter_map(|c| c.clone()).collect();
-    values.sort();
-    assert!(
-        values.contains(&"40".to_string()) && values.contains(&"20".to_string()),
-        "PIVOT must aggregate per category, got {values:?}"
-    );
-
-    drop_table(&client, &tbl).await;
-}
-
-#[tokio::test]
-#[ignore = "gap (row 34): UNPIVOT is DuckDB-only syntax that sqlparser's PostgreSqlDialect does not parse (42601)"]
-async fn test_unpivot_reshapes_columns_into_rows() {
-    let client = ready_client().await;
-    let tbl = create_table(
-        &client,
-        "un_unpivotx",
-        &format!("(id INTEGER NOT NULL, q1 INTEGER, q2 INTEGER) {CREATE_OPTS}"),
-    )
-    .await;
-    execute(
-        &client,
-        &format!("INSERT INTO {tbl} (id, q1, q2) VALUES (1, 10, 20)"),
-    )
-    .await
-    .unwrap();
-
-    // The single row becomes one row per unpivoted column.
-    let rows = simple_query_rows(
-        &client,
-        &format!("UNPIVOT {tbl} ON q1, q2 INTO NAME quarter VALUE amount"),
-    )
-    .await
-    .unwrap();
-    assert_eq!(rows.len(), 2, "UNPIVOT must emit one row per column");
-
-    let mut amounts: Vec<String> = rows.iter().filter_map(|r| r[r.len() - 1].clone()).collect();
-    amounts.sort();
-    assert_eq!(amounts, vec!["10".to_string(), "20".to_string()]);
+    .expect("the CASE rewrite of a PIVOT must be answerable");
+    assert_eq!(rows.len(), 1, "the rewrite aggregates to a single row");
+    assert_eq!(rows[0][0].as_deref(), Some("40"));
+    assert_eq!(rows[0][1].as_deref(), Some("20"));
 
     drop_table(&client, &tbl).await;
 }
 
 // ============================================================================
-// 12. Unranked ❌ statements — rejection contract only
+// 11. Unranked ❌ statements — rejection contract only
 // ============================================================================
 //
 // Rows the doc marks ❌ but does not rank in its open-gaps list. They get no
@@ -1539,16 +2026,12 @@ async fn test_unranked_statements_are_rejected() {
     setup_rows(&client, &tbl).await;
 
     let statements = [
-        // row 9 — ANALYZE (no planner statistics surface)                 0A000
-        format!("ANALYZE {tbl}"),
         // row 11 — CALL (no stored/table procedures)                      0A000
         "CALL my_procedure()".to_string(),
         // row 13 — COMMENT ON (no catalog comment storage)                0A000
         format!("COMMENT ON TABLE {tbl} IS 'a comment'"),
         // row 16 — CREATE MACRO (DuckDB-only)                             42601
         "CREATE MACRO one() AS 1".to_string(),
-        // row 32 — SUMMARIZE (DuckDB-only)                                42601
-        format!("SUMMARIZE {tbl}"),
     ];
 
     for sql in &statements {
@@ -1559,19 +2042,20 @@ async fn test_unranked_statements_are_rejected() {
 }
 
 // ============================================================================
-// 13. Intentionally out of scope — must STAY rejected
+// 12. Intentionally out of scope — must STAY rejected
 // ============================================================================
 //
 // The doc's closing list: single-node DuckDB concerns that do not map onto a
 // sharded coordinator. These deliberately have no xfail — this test is the guard
 // that they are never quietly accepted, since accepting one would mean it ran on
-// an arbitrary single node.
+// an arbitrary single node. Section 10 holds the other half of that list, the
+// statements declined because PostgreSQL already expresses them another way.
 
 #[tokio::test]
 async fn test_out_of_scope_statements_stay_rejected() {
     let client = ready_client().await;
 
-    // Same convention as section 12: the trailing code is the observed rejection
+    // Same convention as section 11: the trailing code is the observed rejection
     // point. These are split across both layers, which is why the assertion is the
     // tolerant one — what matters is only that none of them is ever accepted.
     let statements = [
@@ -1600,7 +2084,7 @@ async fn test_out_of_scope_statements_stay_rejected() {
 }
 
 // ============================================================================
-// 14. A rejection names the command it refused
+// 13. A rejection names the command it refused
 // ============================================================================
 //
 // `0A000` alone is not actionable: a client that sends several statements, or a
@@ -1631,13 +2115,17 @@ async fn test_rejection_names_the_refused_command() {
     let tbl = unique_table_name("un_named");
     setup_rows(&client, &tbl).await;
 
+    // `SET`, `SHOW`, `EXPLAIN` and `DESCRIBE` are absent on purpose: they are routed
+    // now, so there is no statement-level refusal left to name. What a client can still
+    // be refused for is a specific form or a specific parameter, and those name
+    // themselves — see `test_unmodelled_set_forms_stay_rejected`,
+    // `test_search_path_stays_refused` and `test_untruthful_explain_forms_are_refused`.
+    // `COPY` is absent for the same reason: every direction of it is routed now,
+    // including the two that drive the copy sub-protocol, so the only refusals left
+    // are about a form or an option and they name themselves — see
+    // `test_copy_outside_csv_is_rejected` and
+    // `test_a_streaming_import_that_cannot_work_is_refused_up_front`.
     let cases: Vec<(String, &str)> = vec![
-        ("SET client_encoding = 'UTF8'".to_string(), "SET"),
-        ("SHOW client_encoding".to_string(), "SHOW"),
-        (format!("EXPLAIN SELECT id FROM {tbl}"), "EXPLAIN"),
-        // COPY itself is supported; the form that hands the connection to the copy
-        // sub-protocol is not, and says so by name.
-        (format!("COPY {tbl} TO STDOUT (FORMAT CSV)"), "COPY"),
         (
             "CREATE SEQUENCE un_named_seq".to_string(),
             "CREATE SEQUENCE",

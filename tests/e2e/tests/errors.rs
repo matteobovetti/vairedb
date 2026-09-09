@@ -368,3 +368,77 @@ async fn test_drop_column_shard_key_rejected() {
 
     drop_table(&client, &tbl).await;
 }
+
+// The presentation contract, asserted as an absence: whatever an error is about, the
+// reply must not contain the machinery that carried it. Three shapes had leaked one at a
+// time, each found by a different probe rather than by a test:
+//
+//   * a tonic `Status { code: …, message: …, metadata: MetadataMap { … } }` — the whole
+//     `Debug` rendering of a gRPC status, which is what any failure past the Ballista
+//     scheduler arrives as;
+//   * a `Signature { type_signature: OneOf([…]) }` dump, ~1.5 KB of it, on an honest
+//     argument-coercion rejection;
+//   * an executor's `http://host:port`.
+//
+// So this is one test over a spread of failing statements rather than an assertion added
+// to each: the classification each of them deserves is pinned in its own test above, and
+// what is pinned here is that none of them reports it in the transport's words. The
+// statements are deliberately mixed — one refused on the coordinator, one failing on a
+// core node, one failing at argument coercion — because the leaks differed by layer.
+#[tokio::test]
+async fn test_no_error_reply_leaks_transport_internals() {
+    let client = ready_client().await;
+    let tbl = create_table(
+        &client,
+        "ep_no_leak",
+        &format!("(id INTEGER NOT NULL, name VARCHAR NOT NULL) {CREATE_OPTS}"),
+    )
+    .await;
+    execute(&client, &format!("INSERT INTO {tbl} VALUES (1, 'a')"))
+        .await
+        .unwrap();
+
+    let statements = [
+        // Coordinator-local: a name nothing resolves.
+        "SELECT * FROM a_table_that_is_not_there".to_string(),
+        // Coordinator-local: argument coercion, which is what dumps a `Signature`.
+        format!("SELECT lpad(name, name) FROM {tbl}"),
+        // Distributed: raised while a core node is running the stage.
+        format!("SELECT id / (id - 1) FROM {tbl}"),
+        // Distributed: a cast that fails on the rows rather than at plan time.
+        format!("SELECT CAST(name AS INTEGER) FROM {tbl}"),
+        // A form the coordinator refuses by name rather than plans.
+        format!("SELECT CAST(name AS VARCHAR(3)) FROM {tbl}"),
+    ];
+
+    for sql in statements {
+        // Not `execute_expect_err`: a statement that answers instead of failing has
+        // nothing to leak, and pinning *which* of these fails belongs to the tests that
+        // own each class. Only the replies that are errors are examined.
+        let Err(failure) = client.simple_query(&sql).await else {
+            continue;
+        };
+        let Some(err) = failure.as_db_error() else {
+            panic!("`{sql}` failed without a server error reply: {failure}");
+        };
+        let message = err.message().to_string();
+        for leaked in [
+            "Status {",
+            "MetadataMap",
+            "type_signature",
+            "http://",
+            "content-type",
+        ] {
+            assert!(
+                !message.contains(leaked),
+                "`{sql}` leaked {leaked:?}: {message}"
+            );
+        }
+        assert!(
+            message.contains("[VDB-"),
+            "`{sql}` should be enriched: {message}"
+        );
+    }
+
+    drop_table(&client, &tbl).await;
+}

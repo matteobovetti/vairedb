@@ -17,6 +17,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::catalog::ShardMeta;
 
+use super::filter_pushdown::OpaqueTextColumns;
 use super::scheduler::SchedulerTableProvider;
 
 /// Wire form of a `SchedulerTableProvider`: the table name plus, per shard, its
@@ -37,6 +38,16 @@ struct EncodedTableProvider {
     primary_node_ids: Vec<String>,
     #[serde(default)]
     replica_node_ids_per_shard: Vec<Vec<String>>,
+    /// The columns advertised as text that the shard does not store as text — see
+    /// [`OpaqueTextColumns`]. Carried rather than recomputed because the declared type
+    /// strings live in the catalog, which the decoding side reads no schema from: it is
+    /// handed the Arrow schema, where these columns are indistinguishable from real text.
+    ///
+    /// `None` (an encoding from before this field existed) means *not known*, and is read as
+    /// "treat every text column as opaque" rather than as an empty set, so a rolling upgrade
+    /// loses push-down on text columns instead of pushing a predicate that could error.
+    #[serde(default)]
+    opaque_text_columns: Option<Vec<String>>,
 }
 
 /// Logical extension codec for distributed query planning. Encodes/decodes
@@ -102,11 +113,12 @@ impl LogicalExtensionCodec for VaireLogicalCodec {
             })
             .collect();
 
-        Ok(Arc::new(SchedulerTableProvider::new(
-            encoded.table_name,
-            shards,
-            schema,
-        )))
+        Ok(Arc::new(
+            SchedulerTableProvider::new(encoded.table_name, shards, schema)
+                .with_opaque_text_columns(OpaqueTextColumns::from_names(
+                    encoded.opaque_text_columns,
+                )),
+        ))
     }
 
     fn try_encode_table_provider(
@@ -116,7 +128,6 @@ impl LogicalExtensionCodec for VaireLogicalCodec {
         buf: &mut Vec<u8>,
     ) -> Result<()> {
         let provider = node
-            .as_any()
             .downcast_ref::<SchedulerTableProvider>()
             .ok_or_else(|| {
                 DataFusionError::Internal(
@@ -150,6 +161,7 @@ impl LogicalExtensionCodec for VaireLogicalCodec {
             hash_buckets,
             primary_node_ids,
             replica_node_ids_per_shard,
+            opaque_text_columns: provider.opaque_text_columns().names(),
         };
 
         let bytes = serde_json::to_vec(&encoded).map_err(|e| {

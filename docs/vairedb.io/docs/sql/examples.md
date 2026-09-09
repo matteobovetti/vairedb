@@ -60,7 +60,7 @@ SELECT * FROM users ORDER BY id;
 -- Point lookup routed to the owning shard
 SELECT id, name FROM users WHERE id = 1;
 
--- Aggregation pushed down to shards, finalized on the coordinator
+-- Aggregated in two phases: partially per shard's rows, finalized on the coordinator
 SELECT count(*) AS total, min(created_at) AS first_signup
 FROM users;
 ```

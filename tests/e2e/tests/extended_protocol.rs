@@ -143,7 +143,9 @@ async fn test_parameterized_insert_typed_columns() {
     .unwrap();
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0][0].as_deref(), Some("19.95"));
-    assert_eq!(rows[0][1].as_deref(), Some("true"));
+    // `t`, not `true`: PostgreSQL's text wire format for `boolean`, which is what a
+    // simple query returns every column in.
+    assert_eq!(rows[0][1].as_deref(), Some("t"));
     assert_eq!(rows[0][2].as_deref(), None, "NULL note should round-trip");
 
     drop_table(&client, &tbl).await;

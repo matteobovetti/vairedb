@@ -89,12 +89,27 @@ core nodes hosting shards of the affected table:
 - `ALTER TABLE` and `DROP TABLE` are applied **best-effort** — the command fails
   only if a target node is unreachable.
 
-## Query optimization (delegated to Ballista + DataFusion)
+## Query optimization
 
-Distributed query optimization — join strategies (co-located, broadcast,
-shuffle), aggregation (two-phase, multi-level), and push-down (filters,
-projections, partial aggregations) — is handled entirely by
+Join strategies (co-located, broadcast, shuffle), two-phase aggregation, and the
+logical rewrites that come before them — constant folding, projection pruning,
+moving a predicate down the plan — come from
 [Apache Ballista](https://github.com/apache/datafusion-ballista) and
-[DataFusion](https://datafusion.apache.org/). VaireDB does not implement custom
-logic for these concerns; it relies on the built-in optimizer rules and
-execution strategies of the scheduler and engine.
+[DataFusion](https://datafusion.apache.org/). VaireDB does not reimplement any of
+that.
+
+The one piece VaireDB owns is the last hop: what the shard's own `SELECT` contains.
+A shard runs DuckDB, not the engine that planned the query, so the coordinator
+decides predicate by predicate whether both engines would read it the same way, and
+sends only those to the shard. Comparisons, `AND`/`OR`/`NOT`, `IS NULL`, `IN`,
+`BETWEEN` and `LIKE` over columns and literals qualify; function calls, casts and
+arithmetic stay at the coordinator. Two shapes are held back on purpose: an ordering
+comparison (`<`, `>`, `BETWEEN`) on a text column, and any predicate at all on a
+column whose type VaireDB reports as `text` without the shard storing it as text —
+`uuid` and `json` are the everyday examples. A `LIMIT` with no filter under it
+travels too, as a per-shard cap.
+
+Both are bandwidth optimizations only. The coordinator keeps its own copy of every
+pushed predicate and applies the query's real `LIMIT` over the union of the shards'
+answers, so a shard that returns more rows than asked costs network traffic and
+nothing else.

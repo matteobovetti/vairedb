@@ -17,6 +17,7 @@ use crate::sqlparser::ast::{
 use vairedb_common::proto::vairedb::v1::VdbErrorCode;
 
 use crate::catalog::{ColumnDef, ConstraintMeta, TableMeta};
+use crate::column_types::unserviceable_type_reason;
 use crate::pgwire_handler::constraints;
 use crate::pgwire_handler::constraints::constraints_from_create;
 use crate::pgwire_handler::error_enrichment::make_vdb_error;
@@ -80,6 +81,37 @@ pub(super) fn reject_unsupported_create_table_form(create: &CreateTable) -> PgWi
              WITH (shard_by = '<column>'), then load the rows with INSERT"
         ),
     ))
+}
+
+/// Reject a column whose declared type cannot be read back, naming the column and what
+/// to declare instead.
+///
+/// The check belongs at DDL and not at the first read for the reason
+/// [`unserviceable_type_reason`] gives: the loss happens below the coordinator, so no
+/// later stage can undo it, and every stage after this one has already accepted rows.
+/// Applied wherever a type enters a table — `CREATE TABLE`, `ALTER TABLE ... ADD COLUMN`
+/// and `ALTER COLUMN ... TYPE` — because a column added later is read by the same code
+/// as one declared up front.
+pub(super) fn reject_unserviceable_column_type(
+    column_name: &str,
+    data_type: &DataType,
+) -> PgWireResult<()> {
+    let declared = data_type.to_string();
+    match unserviceable_type_reason(&declared) {
+        None => Ok(()),
+        Some(reason) => Err(make_vdb_error(
+            VdbErrorCode::FeatureNotSupported,
+            format!("column \"{column_name}\" of type {declared} is not supported: {reason}"),
+        )),
+    }
+}
+
+/// [`reject_unserviceable_column_type`] for every column of a `CREATE TABLE`.
+pub(super) fn reject_unserviceable_column_types(create: &CreateTable) -> PgWireResult<()> {
+    for col in &create.columns {
+        reject_unserviceable_column_type(&col.name.value, &col.data_type)?;
+    }
+    Ok(())
 }
 
 /// Parse the `WITH (...)` options and column list of a `CREATE TABLE` into a
@@ -274,10 +306,14 @@ pub(super) fn column_defs_from_result_schema(
 
 /// The DuckDB column type that stores a value of Arrow type `dt`.
 ///
-/// Unsigned integers widen to the next signed type that holds their whole range:
-/// DuckDB spells its own unsigned types `UTINYINT`/`USMALLINT`/`UBIGINT` with no
-/// `UINTEGER` in between, and widening keeps every value representable without
-/// depending on which of those a dialect renders.
+/// The narrower unsigned integers widen to the next signed type that holds their
+/// whole range: sqlparser can render `UTINYINT`, `USMALLINT` and `UBIGINT` but has
+/// no `UINTEGER`, and widening keeps every value representable without depending on
+/// which of those a dialect renders. `UInt64` is the one that cannot widen — no
+/// signed type holds it — so it keeps DuckDB's own `UBIGINT`. The read path then
+/// advertises that column as `numeric` rather than `bigint`
+/// ([`crate::column_types::parse_data_type`]), which is the price of keeping values
+/// above `i64::MAX`: they are the reason the column was not declared `BIGINT` here.
 fn duckdb_type_for(dt: &ArrowType) -> std::result::Result<DataType, String> {
     Ok(match dt {
         ArrowType::Boolean => DataType::Boolean,
@@ -288,7 +324,7 @@ fn duckdb_type_for(dt: &ArrowType) -> std::result::Result<DataType, String> {
         ArrowType::UInt8 => DataType::SmallInt(None),
         ArrowType::UInt16 => DataType::Integer(None),
         ArrowType::UInt32 => DataType::BigInt(None),
-        ArrowType::UInt64 => DataType::HugeInt,
+        ArrowType::UInt64 => DataType::UBigInt,
         ArrowType::Float16 | ArrowType::Float32 => DataType::Real,
         ArrowType::Float64 => DataType::DoublePrecision,
         ArrowType::Decimal128(precision, scale) | ArrowType::Decimal256(precision, scale) => {
@@ -482,6 +518,7 @@ pub(super) fn apply_alter_operation(
                     format!("column \"{}\" of relation already exists", col_name),
                 ));
             }
+            reject_unserviceable_column_type(&column_def.name.value, &column_def.data_type)?;
             table_meta.columns.push(column_def_from_ast(column_def));
         }
         AlterTableOperation::DropColumn {
@@ -559,7 +596,8 @@ pub(super) fn apply_alter_operation(
             // does, and each for its own reason — see
             // [`crate::pgwire_handler::constraints`].
             match op {
-                AlterColumnOperation::SetDataType { .. } => {
+                AlterColumnOperation::SetDataType { data_type, .. } => {
+                    reject_unserviceable_column_type(name, data_type)?;
                     constraints::reject_retype_of_constrained_column(table_meta, name)?;
                 }
                 AlterColumnOperation::DropNotNull => {
@@ -852,6 +890,60 @@ mod tests {
     fn create_table_with_a_column_list_is_accepted() {
         let create = parse_create("CREATE TABLE t (id INT, v TEXT) WITH (shards = 3)");
         assert!(reject_unsupported_create_table_form(&create).is_ok());
+    }
+
+    // --- reject_unserviceable_column_types tests ---
+
+    #[test]
+    fn a_column_that_cannot_be_read_back_is_refused_at_create_table() {
+        let create = parse_create("CREATE TABLE t (id INT, big HUGEINT)");
+        let err = reject_unserviceable_column_types(&create)
+            .expect_err("a HUGEINT column cannot be read back, so CREATE TABLE must refuse it")
+            .to_string();
+        // The column, the type and the way out all have to be in the message: the client
+        // has to know which of its columns to change and to what.
+        assert!(err.contains("\"big\""), "got: {err}");
+        assert!(err.contains("HUGEINT"), "got: {err}");
+        assert!(err.contains("DECIMAL(38,0)"), "got: {err}");
+    }
+
+    #[test]
+    fn a_table_of_serviceable_columns_is_accepted() {
+        let create = parse_create(
+            "CREATE TABLE t (id INT, amount NUMERIC(10,2), ts TIMESTAMPTZ, t TIME, \
+             i INTERVAL, u UBIGINT, b BLOB, tags TEXT[])",
+        );
+        assert!(reject_unserviceable_column_types(&create).is_ok());
+    }
+
+    #[test]
+    fn adding_or_retyping_a_column_is_held_to_the_same_rule() {
+        let mut table = sample_table();
+        let added = apply_alter_operation(
+            &mut table,
+            &parse_alter_ops("ALTER TABLE t ADD COLUMN m MAP(VARCHAR, INTEGER)")[0],
+        )
+        .expect_err("a MAP column cannot be read back")
+        .to_string();
+        assert!(added.contains("MAP"), "got: {added}");
+
+        let retyped = apply_alter_operation(
+            &mut table,
+            &parse_alter_ops("ALTER TABLE t ALTER COLUMN amount TYPE BIT(8)")[0],
+        )
+        .expect_err("a BIT column cannot be read back")
+        .to_string();
+        assert!(retyped.contains("BIT"), "got: {retyped}");
+        // Refused means unchanged, not half-applied.
+        assert!(table.columns.iter().all(|c| c.name != "m"));
+        assert_eq!(
+            table
+                .columns
+                .iter()
+                .find(|c| c.name == "amount")
+                .map(|c| c.data_type.as_str()),
+            Some("DECIMAL(10,2)")
+        );
     }
 
     #[test]
@@ -1666,7 +1758,9 @@ mod tests {
     }
 
     // Unsigned widths widen to a signed type that holds them: DuckDB spells its own
-    // unsigned types differently and the value has to round-trip as a literal.
+    // unsigned types differently and the value has to round-trip as a literal. The
+    // exception is UInt64, which no signed type holds — and which must not fall back to
+    // HUGEINT, because a HUGEINT column cannot be read back at all.
     #[test]
     fn unsigned_result_columns_widen_to_a_signed_type_that_holds_them() {
         let columns = derived(vec![
@@ -1681,9 +1775,18 @@ mod tests {
                 "\"a\" SMALLINT".to_string(),
                 "\"b\" INTEGER".to_string(),
                 "\"c\" BIGINT".to_string(),
-                "\"d\" HUGEINT".to_string(),
+                "\"d\" UBIGINT".to_string(),
             ]
         );
+        // And what it derives has to be a type the table can then be created with.
+        for column in &columns {
+            let declared = column.rsplit(' ').next().unwrap();
+            assert_eq!(
+                unserviceable_type_reason(declared),
+                None,
+                "a derived column of type {declared} could not be created"
+            );
+        }
     }
 
     // A dictionary is an encoding, not a type: the table stores what it decodes to.

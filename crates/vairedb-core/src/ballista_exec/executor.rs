@@ -136,9 +136,29 @@ fn build_session_state(
     let session_state = SessionState::new_ballista_state(scheduler_url)
         .map_err(|e| CoreError::engine("failed to create Ballista session state", e))?;
 
-    Ok(SessionStateBuilder::new_from_existing(session_state)
+    let mut state = SessionStateBuilder::new_from_existing(session_state)
         .with_config(session_config)
-        .build())
+        .build();
+
+    // A stage arrives as a plan referring to its functions by name, so the executor
+    // has to hold the same set the coordinator planned against — a UDF missing here
+    // fails the stage at deserialization, after the query was accepted. Kept in step
+    // with `vairedb_coordinator::scheduler::register_postgres_functions`.
+    let count = datafusion_pg_functions::register_all(&mut state);
+    tracing::debug!(count, "registered PostgreSQL built-in functions");
+
+    // Same reasoning for the `pg_catalog` scalar functions: a stage projecting
+    // `format_type(oid, NULL)` resolves that name from *this* registry.
+    vairedb_common::pg_udf::register_pg_catalog_scalar_functions(&mut state)
+        .map_err(|e| CoreError::engine("failed to register the pg_catalog scalar functions", e))?;
+
+    // Same reasoning for the ordered-set aggregates: a stage naming `percentile_cont`
+    // is resolved from *this* registry, so an executor without them would fail a query
+    // the coordinator had already accepted.
+    vairedb_common::udaf::register_ordered_set_aggregates(&mut state)
+        .map_err(|e| CoreError::engine("failed to register the ordered-set aggregates", e))?;
+
+    Ok(state)
 }
 
 /// Build the registration metadata the scheduler stores for this executor:

@@ -6,6 +6,13 @@ license.workspace = true
 rust-version.workspace = true
 
 [dependencies]
+# `udaf` defines the aggregate functions both node kinds must register, so this
+# crate needs the engine they are written against.
+datafusion = { workspace = true }
+# `pg_udf` re-registers the `pg_catalog` scalar functions on both node kinds, so the
+# crate that defines them is needed on both sides of the wire too.
+datafusion-pg-catalog = { workspace = true }
+arrow = { workspace = true }
 tonic = { workspace = true }
 tonic-prost = { workspace = true }
 prost = { workspace = true }

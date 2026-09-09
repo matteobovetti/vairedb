@@ -4,6 +4,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use vairedb_common::proto::vairedb::v1::NodeState;
 
+use crate::sqlparser::ast::{Ident, ObjectName};
+
 /// Current wall-clock time as whole seconds since the Unix epoch. Centralizes
 /// the `SystemTime::now()` → epoch-duration conversion used wherever the
 /// coordinator stamps heartbeats, registration times, and `created_at`.
@@ -63,6 +65,25 @@ pub fn node_state_str(value: i32) -> &'static str {
     }
 }
 
+/// The single identifier naming an INSERT column-list entry, or `None` if the
+/// entry is not one plain identifier.
+///
+/// sqlparser models an INSERT column list as `Vec<ObjectName>`, so it accepts
+/// dotted and function-valued forms (`INSERT INTO t (addr.city) …`) that
+/// PostgreSQL reads as writing into a composite field. VaireDB does not
+/// implement those, and a caller that took only the last part would silently
+/// target the wrong column — so this returns `None` and the caller refuses the
+/// statement.
+///
+/// Returns the [`Ident`] rather than its text so callers keep the quoting needed
+/// by `pgwire_handler::query_router::canonicalize_ident`.
+pub fn insert_column_ident(column: &ObjectName) -> Option<&Ident> {
+    match column.0.as_slice() {
+        [part] => part.as_ident(),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -92,6 +113,23 @@ mod tests {
     #[test]
     fn node_state_str_unknown_value() {
         assert_eq!(node_state_str(99), "UNSPECIFIED");
+    }
+
+    #[test]
+    fn insert_column_ident_accepts_a_bare_identifier() {
+        let plain = ObjectName::from(vec![Ident::new("email")]);
+        assert_eq!(
+            insert_column_ident(&plain).map(|i| i.value.as_str()),
+            Some("email")
+        );
+    }
+
+    // A dotted entry is a composite-field target in PostgreSQL. Returning the
+    // last part would hash/route the wrong column, so it must not resolve.
+    #[test]
+    fn insert_column_ident_rejects_a_dotted_entry() {
+        let dotted = ObjectName::from(vec![Ident::new("addr"), Ident::new("city")]);
+        assert!(insert_column_ident(&dotted).is_none());
     }
 
     #[test]

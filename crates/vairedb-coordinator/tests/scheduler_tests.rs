@@ -11,9 +11,10 @@ use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use vairedb_coordinator::catalog::{
     ColumnDef, MetadataCatalog, ShardMeta, ShardStrategy, TableMeta,
 };
+use vairedb_coordinator::column_types::parse_data_type;
 use vairedb_coordinator::scheduler::{
-    RemoteDuckDbScanExec, SchedulerTableProvider, VaireLogicalCodec, VairePhysicalCodec,
-    parse_data_type, refresh_ballista_catalog_tables, register_vairedb_catalog_schema,
+    OpaqueTextColumns, RemoteDuckDbScanExec, SchedulerTableProvider, VaireLogicalCodec,
+    VairePhysicalCodec, refresh_catalog_tables, register_vairedb_catalog_schema,
 };
 
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -126,15 +127,15 @@ fn parse_data_type_json() {
 
 #[test]
 fn parse_data_type_decimal() {
+    // The declared precision and scale are the type: widening every decimal to a fixed
+    // (38,10) both mis-rendered the scale and NULLified values that would not rescale.
     assert_eq!(
         parse_data_type("DECIMAL(10,2)"),
-        DataType::Decimal128(38, 10)
+        DataType::Decimal128(10, 2)
     );
-    assert_eq!(
-        parse_data_type("NUMERIC(5,3)"),
-        DataType::Decimal128(38, 10)
-    );
-    assert_eq!(parse_data_type("DECIMAL"), DataType::Decimal128(38, 10));
+    assert_eq!(parse_data_type("NUMERIC(5,3)"), DataType::Decimal128(5, 3));
+    // Undeclared falls back to DuckDB's own default, which is what the shard stores.
+    assert_eq!(parse_data_type("DECIMAL"), DataType::Decimal128(18, 3));
 }
 
 #[test]
@@ -215,7 +216,6 @@ async fn scheduler_table_provider_scan_single_shard() {
     let plan = provider.scan(&state, None, &[], None).await.unwrap();
 
     let remote_scan = plan
-        .as_any()
         .downcast_ref::<RemoteDuckDbScanExec>()
         .expect("single shard should produce RemoteDuckDbScanExec");
 
@@ -240,10 +240,7 @@ async fn scheduler_table_provider_scan_single_shard_with_projection() {
         .await
         .unwrap();
 
-    let remote_scan = plan
-        .as_any()
-        .downcast_ref::<RemoteDuckDbScanExec>()
-        .unwrap();
+    let remote_scan = plan.downcast_ref::<RemoteDuckDbScanExec>().unwrap();
 
     assert_eq!(remote_scan.projected_schema().fields().len(), 2);
     assert_eq!(remote_scan.projected_schema().field(0).name(), "id");
@@ -270,10 +267,7 @@ async fn scheduler_table_provider_scan_multiple_shards_produces_union() {
     assert_eq!(plan.children().len(), 3);
 
     for (i, child) in plan.children().iter().enumerate() {
-        let remote_scan = child
-            .as_any()
-            .downcast_ref::<RemoteDuckDbScanExec>()
-            .unwrap();
+        let remote_scan = child.downcast_ref::<RemoteDuckDbScanExec>().unwrap();
         assert_eq!(remote_scan.shard_table_name(), format!("events_shard{}", i));
     }
 }
@@ -288,10 +282,7 @@ async fn scheduler_table_provider_scan_empty_shards() {
 
     let plan = provider.scan(&state, None, &[], None).await.unwrap();
 
-    let remote_scan = plan
-        .as_any()
-        .downcast_ref::<RemoteDuckDbScanExec>()
-        .unwrap();
+    let remote_scan = plan.downcast_ref::<RemoteDuckDbScanExec>().unwrap();
     assert_eq!(remote_scan.shard_table_name(), "empty_table");
 }
 
@@ -310,14 +301,69 @@ async fn scheduler_table_provider_scan_propagates_filters() {
 
     let plan = provider.scan(&state, None, &filters, None).await.unwrap();
 
-    let remote_scan = plan
-        .as_any()
-        .downcast_ref::<RemoteDuckDbScanExec>()
-        .unwrap();
+    let remote_scan = plan.downcast_ref::<RemoteDuckDbScanExec>().unwrap();
 
     assert_eq!(remote_scan.filter_exprs().len(), 1);
     assert!(remote_scan.filter_exprs()[0].contains("id"));
     assert!(remote_scan.filter_exprs()[0].contains("10"));
+}
+
+// A filter only reaches `scan` if the provider said it could handle it, so the two have
+// to agree — and the answer is never `Exact`, because the shard's engine is not the one
+// that planned the predicate. See `scheduler::filter_pushdown` for the reasoning.
+#[test]
+fn scheduler_table_provider_offers_inexact_pushdown_for_predicates_a_shard_can_evaluate() {
+    use datafusion::logical_expr::{TableProviderFilterPushDown, col, lit};
+
+    let schema = sample_schema();
+    let provider = SchedulerTableProvider::new(
+        "orders".to_string(),
+        vec![sample_shard("orders", 0)],
+        schema,
+    );
+
+    let simple = col("id").eq(lit(1i32));
+    let with_a_function = datafusion::functions::expr_fn::upper(col("name")).eq(lit("X"));
+
+    assert_eq!(
+        provider
+            .supports_filters_pushdown(&[&simple, &with_a_function])
+            .unwrap(),
+        vec![
+            TableProviderFilterPushDown::Inexact,
+            TableProviderFilterPushDown::Unsupported,
+        ]
+    );
+}
+
+// A pushed limit is per shard: each one returns at most `limit` rows and the coordinator
+// takes the query's limit from the union, so the answer cannot lose a row it needed.
+#[tokio::test]
+async fn scheduler_table_provider_pushes_the_limit_to_every_shard() {
+    let schema = sample_schema();
+    let shards = vec![sample_shard("events", 0), sample_shard("events", 1)];
+    let provider = SchedulerTableProvider::new("events".to_string(), shards, schema);
+
+    let ctx = SessionContext::new();
+    let state = ctx.state();
+
+    let plan = provider.scan(&state, None, &[], Some(25)).await.unwrap();
+
+    for child in plan.children() {
+        let remote_scan = child.downcast_ref::<RemoteDuckDbScanExec>().unwrap();
+        assert_eq!(
+            remote_scan.limit(),
+            Some(25),
+            "every shard needs the limit, not just the first"
+        );
+    }
+
+    // And a query with no limit still asks for the whole shard.
+    let plan = provider.scan(&state, None, &[], None).await.unwrap();
+    for child in plan.children() {
+        let remote_scan = child.downcast_ref::<RemoteDuckDbScanExec>().unwrap();
+        assert_eq!(remote_scan.limit(), None);
+    }
 }
 
 // =============================================================================
@@ -371,10 +417,7 @@ fn remote_scan_exec_with_new_children_returns_self() {
     ));
 
     let new_exec = exec.clone().with_new_children(vec![]).unwrap();
-    let downcasted = new_exec
-        .as_any()
-        .downcast_ref::<RemoteDuckDbScanExec>()
-        .unwrap();
+    let downcasted = new_exec.downcast_ref::<RemoteDuckDbScanExec>().unwrap();
     assert_eq!(downcasted.shard_table_name(), "t_shard0");
 }
 
@@ -434,14 +477,17 @@ fn remote_scan_exec_display() {
 #[test]
 fn physical_codec_roundtrip() {
     let schema = sample_schema();
-    let exec = Arc::new(RemoteDuckDbScanExec::new(
-        "orders_shard2".to_string(),
-        schema,
-        Some(vec![0, 2]),
-        vec!["id > 100".to_string()],
-        None,
-        vec![],
-    )) as Arc<dyn ExecutionPlan>;
+    let exec = Arc::new(
+        RemoteDuckDbScanExec::new(
+            "orders_shard2".to_string(),
+            schema,
+            Some(vec![0, 2]),
+            vec!["id > 100".to_string()],
+            None,
+            vec![],
+        )
+        .with_limit(Some(10)),
+    ) as Arc<dyn ExecutionPlan>;
 
     let codec = VairePhysicalCodec::new();
     let mut buf = Vec::new();
@@ -453,7 +499,6 @@ fn physical_codec_roundtrip() {
     let decoded = codec.try_decode(&buf, &[], &ctx).unwrap();
 
     let remote_scan = decoded
-        .as_any()
         .downcast_ref::<RemoteDuckDbScanExec>()
         .expect("decoded plan should be RemoteDuckDbScanExec");
 
@@ -461,6 +506,8 @@ fn physical_codec_roundtrip() {
     assert_eq!(remote_scan.projection(), &Some(vec![0, 2]));
     assert_eq!(remote_scan.filter_exprs(), &["id > 100"]);
     assert_eq!(remote_scan.projected_schema().fields().len(), 3);
+    // A limit that did not survive the trip would make the shard scan its whole table.
+    assert_eq!(remote_scan.limit(), Some(10));
 }
 
 #[test]
@@ -482,14 +529,12 @@ fn physical_codec_roundtrip_no_projection_no_filters() {
     let ctx = datafusion::execution::TaskContext::default();
     let decoded = codec.try_decode(&buf, &[], &ctx).unwrap();
 
-    let remote_scan = decoded
-        .as_any()
-        .downcast_ref::<RemoteDuckDbScanExec>()
-        .unwrap();
+    let remote_scan = decoded.downcast_ref::<RemoteDuckDbScanExec>().unwrap();
 
     assert_eq!(remote_scan.shard_table_name(), "minimal_shard0");
     assert!(remote_scan.projection().is_none());
     assert!(remote_scan.filter_exprs().is_empty());
+    assert_eq!(remote_scan.limit(), None);
 }
 
 #[test]
@@ -532,15 +577,161 @@ fn logical_codec_table_provider_roundtrip() {
         .try_decode_table_provider(&buf, &table_ref, schema.clone(), &ctx)
         .unwrap();
 
-    let stp = decoded
-        .as_any()
-        .downcast_ref::<SchedulerTableProvider>()
-        .unwrap();
+    let stp = decoded.downcast_ref::<SchedulerTableProvider>().unwrap();
 
     assert_eq!(stp.table_name(), "events");
     assert_eq!(stp.shards().len(), 2);
     assert_eq!(stp.shards()[0].hash_bucket, 0);
     assert_eq!(stp.shards()[1].hash_bucket, 1);
+}
+
+// Which columns are text in name only is decided from the catalog's declared type strings,
+// and the decoding side has no catalog to read — it is handed an Arrow schema in which a
+// `UUID` column and a `VARCHAR` column are the same `Utf8`. So the set has to travel with
+// the plan, or push-down on the far side would be more permissive than on the near side.
+#[test]
+fn logical_codec_carries_which_columns_are_text_in_name_only() {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int32, false),
+        Field::new("name", DataType::Utf8, true),
+        Field::new("token", DataType::Utf8, true),
+    ]));
+    let provider = Arc::new(
+        SchedulerTableProvider::new(
+            "sessions".to_string(),
+            vec![sample_shard("sessions", 0)],
+            schema.clone(),
+        )
+        .with_opaque_text_columns(OpaqueTextColumns::from_declared_types([
+            ("id", "INTEGER"),
+            ("name", "VARCHAR"),
+            ("token", "UUID"),
+        ])),
+    ) as Arc<dyn TableProvider>;
+
+    let codec = VaireLogicalCodec;
+    let table_ref = datafusion::common::TableReference::bare("sessions");
+
+    let mut buf = Vec::new();
+    codec
+        .try_encode_table_provider(&table_ref, provider, &mut buf)
+        .unwrap();
+
+    let ctx = datafusion::execution::TaskContext::default();
+    let decoded = codec
+        .try_decode_table_provider(&buf, &table_ref, schema, &ctx)
+        .unwrap();
+    let stp = decoded.downcast_ref::<SchedulerTableProvider>().unwrap();
+
+    assert_eq!(
+        stp.opaque_text_columns().names(),
+        Some(vec!["token".to_string()]),
+        "the UUID column, and only it, must arrive marked as text in name only"
+    );
+}
+
+// An encoding that never carried the set — what a rolling upgrade decodes. "Not known" has
+// to be read as "assume every text column is opaque", never as "nothing is".
+#[test]
+fn logical_codec_treats_a_missing_opaque_set_as_unknown() {
+    let codec = VaireLogicalCodec;
+    let table_ref = datafusion::common::TableReference::bare("events");
+    let ctx = datafusion::execution::TaskContext::default();
+
+    let older = br#"{"table_name":"events","shard_names":["events_shard0"]}"#;
+    let decoded = codec
+        .try_decode_table_provider(older, &table_ref, sample_schema(), &ctx)
+        .unwrap();
+    let stp = decoded.downcast_ref::<SchedulerTableProvider>().unwrap();
+
+    assert_eq!(
+        stp.opaque_text_columns().names(),
+        None,
+        "an absent list must decode as unknown, not as an empty set"
+    );
+
+    // And unknown must actually suppress the push-down, not merely record itself.
+    use datafusion::logical_expr::{TableProviderFilterPushDown, col, lit};
+    let on_text = col("name").eq(lit("a"));
+    let on_int = col("id").eq(lit(1i32));
+    assert_eq!(
+        stp.supports_filters_pushdown(&[&on_text, &on_int]).unwrap(),
+        vec![
+            TableProviderFilterPushDown::Unsupported,
+            TableProviderFilterPushDown::Inexact,
+        ]
+    );
+}
+
+// The end-to-end wiring: the declared types only exist in the catalog, so a provider built
+// from it is the one place the distinction can be established.
+#[test]
+fn refresh_catalog_tables_marks_columns_that_are_text_in_name_only() {
+    let catalog = make_catalog();
+
+    let column = |name: &str, data_type: &str| ColumnDef {
+        name: name.to_string(),
+        data_type: data_type.to_string(),
+        nullable: true,
+        default_expr: String::new(),
+    };
+
+    let table_meta = TableMeta {
+        anonymized_columns: std::collections::HashMap::new(),
+        indexes: Vec::new(),
+        constraints: Vec::new(),
+        table_name: "docs".to_string(),
+        columns: vec![
+            column("id", "INTEGER"),
+            column("title", "VARCHAR(255)"),
+            column("code", "CHAR(3)"),
+            column("body", "JSON"),
+            column("uid", "UUID"),
+        ],
+        shard_strategy: ShardStrategy::Hash as i32,
+        shard_key: "id".to_string(),
+        shard_count: 1,
+        replication_factor: 1,
+        created_at: None,
+    };
+    catalog.put_table(&table_meta).unwrap();
+    catalog.put_shard(&sample_shard("docs", 0)).unwrap();
+
+    let ctx = SessionContext::new();
+    refresh_catalog_tables(&ctx, &catalog).unwrap();
+
+    let rt = tokio::runtime::Runtime::new().unwrap();
+    rt.block_on(async {
+        let provider = ctx.table_provider("docs").await.unwrap();
+
+        // Every one of these is advertised as text to the client.
+        for name in ["title", "code", "body", "uid"] {
+            let field = provider.schema().field_with_name(name).unwrap().clone();
+            assert_eq!(field.data_type(), &DataType::Utf8, "{name}");
+        }
+
+        use datafusion::logical_expr::{TableProviderFilterPushDown, col, lit};
+        let on_varchar = col("title").eq(lit("a"));
+        let on_char = col("code").eq(lit("abc"));
+        let on_json = col("body").eq(lit("{}"));
+        let on_uuid = col("uid").eq(lit("x"));
+
+        assert_eq!(
+            provider
+                .supports_filters_pushdown(&[&on_varchar, &on_char, &on_json, &on_uuid])
+                .unwrap(),
+            vec![
+                // The shard stores these two as VARCHAR, so it evaluates them as the
+                // coordinator would.
+                TableProviderFilterPushDown::Inexact,
+                TableProviderFilterPushDown::Inexact,
+                // These two it does not, and a literal it cannot convert is an error there
+                // rather than an empty result.
+                TableProviderFilterPushDown::Unsupported,
+                TableProviderFilterPushDown::Unsupported,
+            ]
+        );
+    });
 }
 
 #[test]
@@ -613,7 +804,7 @@ fn refresh_catalog_tables_empty_catalog() {
     let catalog = make_catalog();
     let ctx = SessionContext::new();
 
-    refresh_ballista_catalog_tables(&ctx, &catalog).unwrap();
+    refresh_catalog_tables(&ctx, &catalog).unwrap();
 
     // No tables registered
     let tables = ctx.catalog_names();
@@ -658,7 +849,7 @@ fn refresh_catalog_tables_single_table() {
     catalog.put_shard(&p1).unwrap();
 
     let ctx = SessionContext::new();
-    refresh_ballista_catalog_tables(&ctx, &catalog).unwrap();
+    refresh_catalog_tables(&ctx, &catalog).unwrap();
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
@@ -698,7 +889,7 @@ fn refresh_catalog_tables_multiple_tables() {
     }
 
     let ctx = SessionContext::new();
-    refresh_ballista_catalog_tables(&ctx, &catalog).unwrap();
+    refresh_catalog_tables(&ctx, &catalog).unwrap();
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
@@ -755,7 +946,7 @@ fn refresh_catalog_tables_maps_column_types_correctly() {
     catalog.put_shard(&sample_shard("typed_table", 0)).unwrap();
 
     let ctx = SessionContext::new();
-    refresh_ballista_catalog_tables(&ctx, &catalog).unwrap();
+    refresh_catalog_tables(&ctx, &catalog).unwrap();
 
     let rt = tokio::runtime::Runtime::new().unwrap();
     rt.block_on(async {
@@ -770,7 +961,8 @@ fn refresh_catalog_tables_maps_column_types_correctly() {
             schema.field(2).data_type(),
             &DataType::Timestamp(TimeUnit::Microsecond, None)
         );
-        assert_eq!(schema.field(3).data_type(), &DataType::Decimal128(38, 10));
+        // The registered schema carries the column's *declared* precision and scale.
+        assert_eq!(schema.field(3).data_type(), &DataType::Decimal128(10, 2));
     });
 }
 
@@ -1115,6 +1307,7 @@ mod affinity_tests {
     use std::fmt::{self, Debug, Formatter};
     use std::sync::Arc;
 
+    use ballista_core::JobId;
     use ballista_core::error::Result;
     use ballista_core::serde::protobuf::{
         AvailableTaskSlots, JobStatus, RunningJob, TaskStatus, job_status,
@@ -1154,6 +1347,8 @@ mod affinity_tests {
     }
 
     struct MockExecutionGraph {
+        job_id: JobId,
+        session_config: Arc<SessionConfig>,
         stage: RunningStage,
         task_id_gen: usize,
         status: JobStatus,
@@ -1162,6 +1357,7 @@ mod affinity_tests {
 
     impl MockExecutionGraph {
         fn new(plan: Arc<dyn ExecutionPlan>, partitions: usize) -> Self {
+            let session_config = Arc::new(SessionConfig::new());
             let stage = RunningStage::new(
                 1,
                 0,
@@ -1169,9 +1365,11 @@ mod affinity_tests {
                 partitions,
                 vec![],
                 HashMap::new(),
-                Arc::new(SessionConfig::new()),
+                Arc::clone(&session_config),
             );
             Self {
+                job_id: JobId::new("job-1"),
+                session_config,
                 stage,
                 task_id_gen: 0,
                 status: JobStatus {
@@ -1195,14 +1393,17 @@ mod affinity_tests {
     }
 
     impl ExecutionGraph for MockExecutionGraph {
-        fn job_id(&self) -> &str {
-            "job-1"
+        fn job_id(&self) -> &JobId {
+            &self.job_id
         }
         fn job_name(&self) -> &str {
             "test-job"
         }
         fn session_id(&self) -> &str {
             "session-1"
+        }
+        fn session_config(&self) -> Arc<SessionConfig> {
+            Arc::clone(&self.session_config)
         }
         fn status(&self) -> &JobStatus {
             &self.status
@@ -1324,7 +1525,7 @@ mod affinity_tests {
         let cache = make_job_cache(graph);
 
         let mut jobs = HashMap::new();
-        jobs.insert("job-1".to_string(), cache);
+        jobs.insert(JobId::new("job-1"), cache);
         let running_jobs = Arc::new(jobs);
 
         let mut slot = AvailableTaskSlots {
@@ -1368,7 +1569,7 @@ mod affinity_tests {
         let cache = JobInfoCache::new(boxed);
 
         let mut jobs = HashMap::new();
-        jobs.insert("job-1".to_string(), cache);
+        jobs.insert(JobId::new("job-1"), cache);
         let running_jobs = Arc::new(jobs);
 
         let mut slot = AvailableTaskSlots {
@@ -1389,7 +1590,7 @@ mod affinity_tests {
         let cache = make_job_cache(graph);
 
         let mut jobs = HashMap::new();
-        jobs.insert("job-1".to_string(), cache);
+        jobs.insert(JobId::new("job-1"), cache);
         let running_jobs = Arc::new(jobs);
 
         let mut slot = AvailableTaskSlots {
@@ -1412,7 +1613,7 @@ mod affinity_tests {
         let cache = make_job_cache(graph);
 
         let mut jobs = HashMap::new();
-        jobs.insert("job-1".to_string(), cache);
+        jobs.insert(JobId::new("job-1"), cache);
         let running_jobs = Arc::new(jobs);
 
         let mut slot = AvailableTaskSlots {
@@ -1434,7 +1635,7 @@ mod affinity_tests {
         let cache = make_job_cache(graph);
 
         let mut jobs = HashMap::new();
-        jobs.insert("job-1".to_string(), cache);
+        jobs.insert(JobId::new("job-1"), cache);
         let running_jobs = Arc::new(jobs);
 
         let mut slot = AvailableTaskSlots {
@@ -1455,7 +1656,7 @@ mod affinity_tests {
         let cache = make_job_cache(graph);
 
         let mut jobs = HashMap::new();
-        jobs.insert("job-1".to_string(), cache);
+        jobs.insert(JobId::new("job-1"), cache);
         let running_jobs = Arc::new(jobs);
 
         let mut slot = AvailableTaskSlots {
@@ -1480,7 +1681,7 @@ mod affinity_tests {
         let cache = make_job_cache(graph);
 
         let mut jobs = HashMap::new();
-        jobs.insert("job-1".to_string(), cache);
+        jobs.insert(JobId::new("job-1"), cache);
         let running_jobs = Arc::new(jobs);
 
         let mut slot = AvailableTaskSlots {
@@ -1507,7 +1708,7 @@ mod affinity_tests {
         let cache = make_job_cache(graph);
 
         let mut jobs = HashMap::new();
-        jobs.insert("job-1".to_string(), cache);
+        jobs.insert(JobId::new("job-1"), cache);
         let running_jobs = Arc::new(jobs);
 
         let mut slot = AvailableTaskSlots {

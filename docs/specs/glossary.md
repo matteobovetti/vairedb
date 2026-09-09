@@ -8,7 +8,7 @@
 | **Fragment / Query Stage** | A portion of a distributed query plan that executes on a single core node's Ballista executor |
 | **Replication Factor** | The number of copies of each shard maintained across the cluster (denoted `N` in quorum formulas) |
 | **Exchange Operator** | A plan node inserted by the Ballista scheduler that transfers data between core node executors during distributed query execution via Arrow Flight |
-| **Push-Down** | Optimization technique where DataFusion moves computation (filters, projections, partial aggregations) closer to the data |
+| **Push-Down** | Moving computation closer to the data. DataFusion moves it down the plan; VaireDB takes the last step, carrying projections and the filters and row limits DuckDB reads identically into each shard's own `SELECT`. Partial aggregations are **not** pushed into a shard — the two-phase aggregation happens above the shard boundary |
 | **Ballista Scheduler** | The Apache Ballista component running on the coordinator that decomposes SELECT queries into query stages and assigns them to executors, which pull work from the scheduler |
 | **Ballista Executor** | The Apache Ballista component running on each core node that executes query stages using DataFusion |
 | **TableProvider** | A custom DataFusion `TableProvider` on the coordinator that expands a logical table into per-shard remote scans; the shard-local DuckDB SQL is executed on the core node by a custom execution-plan node |

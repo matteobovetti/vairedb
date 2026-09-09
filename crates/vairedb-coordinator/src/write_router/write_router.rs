@@ -8,8 +8,9 @@ use datafusion::scalar::ScalarValue;
 
 use crate::catalog::{MetadataCatalog, ShardMeta, TableMeta};
 use crate::error::{CoordinatorError, Result};
+use crate::write_router::write_params::scalar_to_write_param;
 use crate::write_sql_cl;
-use vairedb_common::proto::vairedb::v1::{WriteParam, write_param};
+use vairedb_common::proto::vairedb::v1::WriteParam;
 
 /// Resolves where a write goes and how it is expressed against the storage
 /// nodes, using shard metadata from the catalog.
@@ -87,8 +88,10 @@ impl WriteRouter {
             match write_sql_cl::renumber_placeholders(&mut stmt_clone) {
                 Some(order) => order
                     .into_iter()
-                    .map(|idx| scalar_to_write_param(params.get(idx)))
-                    .collect(),
+                    // The position reported is the one the client wrote, not the
+                    // renumbered shard-local one, so a refusal names the `$N` it sent.
+                    .map(|idx| scalar_to_write_param(params.get(idx), idx + 1))
+                    .collect::<Result<Vec<_>>>()?,
                 None => {
                     return Err(CoordinatorError::Internal(format!(
                         "failed to renumber bind placeholders for shard-local SQL on shard {} \
@@ -158,35 +161,4 @@ pub fn shard_for_bucket<'a>(
                 shards.len()
             ))
         })
-}
-
-/// Convert a decoded bind parameter into a typed `WriteParam` for transport to
-/// the storage node. NULLs (and any value not given) map to the `is_null`
-/// variant. Types DuckDB does not have a dedicated bind value for are carried as
-/// their string form and cast on bind.
-fn scalar_to_write_param(scalar: Option<&ScalarValue>) -> WriteParam {
-    let value = match scalar {
-        None => write_param::Value::IsNull(true),
-        Some(s) if s.is_null() => write_param::Value::IsNull(true),
-        Some(s) => match s {
-            ScalarValue::Boolean(Some(b)) => write_param::Value::BoolVal(*b),
-            ScalarValue::Int8(Some(v)) => write_param::Value::IntVal(*v as i64),
-            ScalarValue::Int16(Some(v)) => write_param::Value::IntVal(*v as i64),
-            ScalarValue::Int32(Some(v)) => write_param::Value::IntVal(*v as i64),
-            ScalarValue::Int64(Some(v)) => write_param::Value::IntVal(*v),
-            ScalarValue::UInt8(Some(v)) => write_param::Value::IntVal(*v as i64),
-            ScalarValue::UInt16(Some(v)) => write_param::Value::IntVal(*v as i64),
-            ScalarValue::UInt32(Some(v)) => write_param::Value::IntVal(*v as i64),
-            ScalarValue::Float32(Some(v)) => write_param::Value::DoubleVal(*v as f64),
-            ScalarValue::Float64(Some(v)) => write_param::Value::DoubleVal(*v),
-            ScalarValue::Utf8(Some(v))
-            | ScalarValue::LargeUtf8(Some(v))
-            | ScalarValue::Utf8View(Some(v)) => write_param::Value::StringVal(v.clone()),
-            ScalarValue::Binary(Some(v))
-            | ScalarValue::LargeBinary(Some(v))
-            | ScalarValue::BinaryView(Some(v)) => write_param::Value::BytesVal(v.clone()),
-            other => write_param::Value::StringVal(other.to_string()),
-        },
-    };
-    WriteParam { value: Some(value) }
 }

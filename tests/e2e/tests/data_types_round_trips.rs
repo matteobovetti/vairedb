@@ -46,26 +46,42 @@ use tokio_postgres::types::Type;
 // reached (DROP TABLE IF EXISTS), and every table name is run-unique, so an xfail
 // cannot poison the shared cluster for the next test or the next run.
 
-/// Result-column PostgreSQL types as reported at Describe, without executing the
-/// query. This is the read path's type-metadata surface: a wrong Arrow target in
-/// `parse_data_type` shows up here as a wrong OID even when the values are fine.
-async fn describe_result_types(client: &Client, sql: &str) -> Vec<Type> {
-    let stmt = client
-        .prepare(sql)
+/// Assert that a column of this type is refused at CREATE TABLE, by name, with an
+/// alternative.
+///
+/// Some DuckDB types cannot be read back as the value that was stored — the offset of a
+/// TIMETZ, the 39th digit of a HUGEINT, the bytes of a BIT — and the loss happens below
+/// the coordinator, in duckdb-rs's Arrow bridge or in a cast with nowhere to go. A type
+/// like that is refused at DDL time rather than accepted and served wrong: a table that
+/// admits rows it can never return is the worse failure, because it fails later and
+/// looks like data loss.
+///
+/// `ddl_column` is the column definition and `declared` the type as the message must
+/// name it. The message also has to offer something else to use — a refusal that leaves
+/// a client with no way forward is only half an answer.
+async fn assert_column_type_refused(
+    client: &Client,
+    prefix: &str,
+    ddl_column: &str,
+    declared: &str,
+) {
+    let tbl = unique_table_name(prefix);
+    let sql = format!("CREATE TABLE {tbl} (id INTEGER NOT NULL, {ddl_column}) {CREATE_OPTS}");
+    let err = assert_sqlstate(client, &sql, SQLSTATE_FEATURE_NOT_SUPPORTED).await;
+    let message = err.message();
+    assert!(
+        message.contains(declared),
+        "the refusal must name the type {declared}: {message}"
+    );
+    assert!(
+        message.contains("Use "),
+        "the refusal must name an alternative: {message}"
+    );
+    // Nothing was created, so the name is free — including for a client that retries
+    // with a type that works.
+    execute(client, &format!("DROP TABLE IF EXISTS {tbl}"))
         .await
-        .unwrap_or_else(|e| panic!("Describe failed for `{sql}`: {e}"));
-    stmt.columns().iter().map(|c| c.type_().clone()).collect()
-}
-
-/// Bind-parameter PostgreSQL types as reported at Describe. Parameter OIDs are
-/// inferred from a DataFusion plan over the advertised schema, so they inherit
-/// every `parse_data_type` error.
-async fn describe_param_types(client: &Client, sql: &str) -> Vec<Type> {
-    let stmt = client
-        .prepare(sql)
-        .await
-        .unwrap_or_else(|e| panic!("Describe failed for `{sql}`: {e}"));
-    stmt.params().to_vec()
+        .expect("a refused CREATE TABLE must leave no table behind");
 }
 
 // ============================================================================
@@ -157,11 +173,11 @@ async fn test_boolean_round_trip() {
     drop_table(&client, &tbl).await;
 }
 
-// Text format diverges: `arrow_array_value_to_string` emits Rust's `true`/`false`
-// where PostgreSQL's `boolout` emits `t`/`f`. Cosmetic (drivers accept both), but
-// it is a wire-form difference a strict client can see.
+// PostgreSQL's `boolout` emits `t`/`f`, and a simple query returns every column in
+// text format, so this is what a client comparing strings sees. The SQL literal form
+// stays `true`/`false` — `t` is an identifier to a parser — which is why the wire
+// renderer (`wire_text_value`) is separate from the one the write path shares.
 #[tokio::test]
-#[ignore = "gap (Boolean / Text vs binary divergence): text format renders `true`/`false` instead of PostgreSQL's `t`/`f`"]
 async fn test_boolean_text_wire_form() {
     let client = ready_client().await;
     let tbl = create_table(
@@ -263,11 +279,13 @@ async fn test_signed_integer_widths() {
     drop_table(&client, &tbl).await;
 }
 
-// All four unsigned widths are legal DuckDB and legal DataFusion, and arrow-pg
-// maps every one of them (UInt8->int2, UInt16->int4, UInt32->int8,
-// UInt64->numeric). They only fail because `parse_data_type` has no arms.
+// All four unsigned widths are legal DuckDB and legal DataFusion, and each is
+// advertised as the smallest PostgreSQL type that holds its whole range
+// (UInt8->int2, UInt16->int4, UInt32->int8). UBIGINT is the exception: it is carried
+// as DECIMAL(20,0) rather than UInt64, because a top-level UInt64 goes on the wire as
+// `bigint` (so that `row_number()` is typed the way PostgreSQL promises) and
+// `u64::MAX` is not a bigint. `numeric` holds it; `bigint` would refuse it.
 #[tokio::test]
-#[ignore = "gap (Integer): UTINYINT/USMALLINT/UINTEGER/UBIGINT have no parse_data_type arms, so all four are advertised as text"]
 async fn test_unsigned_integer_types() {
     let client = ready_client().await;
     let tbl = create_table(
@@ -309,10 +327,10 @@ async fn test_unsigned_integer_types() {
     drop_table(&client, &tbl).await;
 }
 
-// The `Utf8` fallback is not merely cosmetic: DataFusion evaluates ORDER BY over
-// the advertised type, so an unsigned column sorts digit-by-digit.
+// The type is not merely cosmetic: DataFusion evaluates ORDER BY over the advertised
+// type, so under the old `Utf8` fallback an unsigned column sorted digit-by-digit
+// (9, 10, 100 came back as 10, 100, 9).
 #[tokio::test]
-#[ignore = "gap (Integer): a UBIGINT column is advertised as text, so ORDER BY sorts lexicographically (10, 100, 9) instead of numerically"]
 async fn test_unsigned_integer_ordering_is_numeric() {
     let client = ready_client().await;
     let tbl = create_table(
@@ -484,9 +502,9 @@ async fn test_varchar_aliases_and_unicode() {
 // Exact numeric — doc section "Exact numeric"
 // ============================================================================
 
-// Values inside DECIMAL(10,2) survive as numbers; only the rendered scale is
-// wrong (see `test_numeric_declared_scale_is_preserved`), so this test parses to
-// f64 rather than comparing text.
+// Values inside DECIMAL(10,2) survive as numbers, and SUM widens the scale the way
+// both engines do, so this test parses to f64 rather than pinning a rendering —
+// `test_numeric_declared_scale_is_preserved` owns the exact text.
 #[tokio::test]
 async fn test_decimal_precision() {
     let client = ready_client().await;
@@ -524,11 +542,11 @@ async fn test_decimal_precision() {
     drop_table(&client, &tbl).await;
 }
 
-// Fault 1: the declared precision and scale are discarded and every decimal is
-// advertised as Decimal128(38,10), so PostgreSQL's scale-faithful rendering is
-// lost. PostgreSQL prints NUMERIC(10,2) 1.5 as `1.50`.
+// The declared precision and scale are read out of the type string, so the column is
+// advertised as Decimal128(10,2) and renders at the scale it was declared with:
+// PostgreSQL prints NUMERIC(10,2) 1.5 as `1.50`. Every DECIMAL used to be advertised
+// as Decimal128(38,10), which rendered that same value as `1.5000000000`.
 #[tokio::test]
-#[ignore = "gap (Exact numeric, fault 1): parse_data_type widens every DECIMAL to Decimal128(38,10), so declared scale is lost and 1.5 renders 1.5000000000"]
 async fn test_numeric_declared_scale_is_preserved() {
     let client = ready_client().await;
     let tbl = create_table(
@@ -558,11 +576,14 @@ async fn test_numeric_declared_scale_is_preserved() {
     drop_table(&client, &tbl).await;
 }
 
-// Fault 2: the safe rescale from the stored Decimal128(38,0) to the hardcoded
-// (38,10) target overflows above 28 integer digits, and a safe Arrow cast turns
-// overflow into NULL — a wrong answer rather than an error.
+// The widest DuckDB decimal survives now that the advertised type is the declared one:
+// the column is Decimal128(38,0), which is what the shard returns, so there is no
+// rescale to overflow. Rescaling to the old hardcoded (38,10) overflowed above 28
+// integer digits, and the *safe* cast turned that overflow into NULL — a wrong answer
+// rather than an error. Both halves of that are now fixed: the target is right, and
+// the cast is checked (`coerce_batch_to_schema`), so an unrepresentable value fails
+// the read instead of becoming NULL.
 #[tokio::test]
-#[ignore = "gap (Exact numeric, fault 2): rescaling DECIMAL(38,0) to the hardcoded (38,10) overflows and the safe cast NULLifies every value above 28 integer digits; on this NOT NULL column the rebuild then fails the read with XX000 `declared as non-nullable but contains null values`"]
 async fn test_numeric_38_digit_value_is_not_nullified() {
     let client = ready_client().await;
     let tbl = create_table(
@@ -594,12 +615,12 @@ async fn test_numeric_38_digit_value_is_not_nullified() {
     drop_table(&client, &tbl).await;
 }
 
-// Fault 3: `scalar_to_write_param` has no Decimal128 arm, so the parameter falls
-// through `other => StringVal(ScalarValue::to_string())`, which renders the debug
-// form `Some(150),10,2` and fails at DuckDB bind time. This is the single most
-// ordinary parameterized write in PostgreSQL.
+// The single most ordinary parameterized write in PostgreSQL. It used to fail: with no
+// Decimal128 arm, the parameter fell through `other => StringVal(to_string())`, which
+// renders the diagnostic form `Some(123456),10,2` — a string DuckDB cannot bind
+// (42804). `write_params::scalar_to_write_param` now renders every bindable scalar as
+// a SQL literal and refuses the rest by name.
 #[tokio::test]
-#[ignore = "gap (write-path parameter defect): NUMERIC bind parameters reach write_router.rs:145 and are stringified as `Some(12345600000000),38,10`, which DuckDB cannot bind (42804)"]
 async fn test_numeric_bind_parameter_insert() {
     let client = ready_client().await;
     let tbl = create_table(
@@ -627,14 +648,13 @@ async fn test_numeric_bind_parameter_insert() {
     drop_table(&client, &tbl).await;
 }
 
-// Fault 4: arrow-pg encodes `numeric` through rust_decimal, whose 96-bit mantissa
-// caps at 29 digits, so binary-format clients get SQLSTATE 22003 at the top of
-// DuckDB's legal DECIMAL range. Text-format clients are unaffected because
-// VaireDB renders text cells itself — the two wire formats disagree. Fault 2
-// currently masks fault 4: the value is NULLified before the encoder ever runs, so
-// today this test fails on the coercion rebuild rather than on 22003.
+// The remaining exact-numeric fault: arrow-pg encodes `numeric` through rust_decimal,
+// whose 96-bit mantissa caps at 29 digits, so binary-format clients get SQLSTATE 22003
+// at the top of DuckDB's legal DECIMAL range. Text-format clients are unaffected
+// because VaireDB renders text cells itself — the two wire formats disagree. Needs an
+// upstream encoder that does not go through rust_decimal.
 #[tokio::test]
-#[ignore = "gap (Exact numeric, fault 4): binary-format NUMERIC encoding goes through rust_decimal, which caps at 29 digits and raises 22003 for wider DuckDB decimals (masked today by fault 2)"]
+#[ignore = "gap (Exact numeric): binary-format NUMERIC encoding goes through rust_decimal, which caps at 29 digits and raises 22003 for wider DuckDB decimals"]
 async fn test_numeric_38_digit_value_in_binary_format() {
     let client = ready_client().await;
     let tbl = create_table(
@@ -682,7 +702,7 @@ async fn test_numeric_38_digit_value_in_binary_format() {
 // DuckDB's 38, and the Arrow type that would carry more (Decimal256) has no
 // arrow-pg mapping, so it cannot even be advertised.
 #[tokio::test]
-#[ignore = "gap (Exact numeric): NUMERIC(p,s) with p > 38 is rejected by DuckDB, and Decimal256 has no into_pg_type arm in arrow-pg 0.14 — needs upstream support in both duckdb-rs and arrow-pg"]
+#[ignore = "gap (Exact numeric): NUMERIC(p,s) with p > 38 is rejected by DuckDB, and Decimal256 has no into_pg_type arm in arrow-pg — needs upstream support in both duckdb-rs and arrow-pg"]
 async fn test_numeric_precision_above_38() {
     let client = ready_client().await;
     let tbl = create_table(
@@ -747,6 +767,11 @@ async fn test_timestamp_round_trip() {
 // literals, whose epoch only spans ~1677-09-21 .. 2262-04-11. A literal outside
 // that window fails the whole query in the `simplify_expressions` optimizer rule
 // even though DuckDB stores the data fine.
+//
+// Left open deliberately. Closing it inside VaireDB means rewriting timestamp
+// literals in every read-path AST — the widest blast radius of any change in this
+// area, for the narrowest range of values — so it belongs upstream in DataFusion's
+// planner, where the literal's type is chosen.
 #[tokio::test]
 #[ignore = "gap (Temporal): DataFusion timestamp literals are nanosecond-typed, so any literal outside 1677..2262 fails in the simplify_expressions optimizer rule"]
 async fn test_timestamp_literal_outside_nanosecond_range() {
@@ -796,10 +821,10 @@ async fn test_timestamp_literal_outside_nanosecond_range() {
     drop_table(&client, &tbl).await;
 }
 
-// TIMESTAMP bind parameters reach the `other` arm as
-// ScalarValue::TimestampMicrosecond, whose Display is the raw microsecond count.
+// A TIMESTAMP bind parameter used to arrive at the shard as a bare microsecond count
+// (`1780835400000000`), which DuckDB cannot bind: `ScalarValue`'s Display was being
+// used as a literal. It is now rendered through Arrow's formatter.
 #[tokio::test]
-#[ignore = "gap (write-path parameter defect): TIMESTAMP bind parameters are stringified as a bare microsecond count (e.g. `1780835400000000`), which DuckDB cannot bind"]
 async fn test_timestamp_bind_parameter_insert() {
     let client = ready_client().await;
     let tbl = create_table(
@@ -858,12 +883,12 @@ async fn test_timestamptz_column() {
     drop_table(&client, &tbl).await;
 }
 
-// TIMESTAMPTZ has no `parse_data_type` arm, so it degrades to Utf8: the column is
-// advertised `text`, and DuckDB's `Timestamp(µs, "UTC")` is stringified as
-// `2026-06-03T12:30:00Z` — the ISO T/Z form encoding.rs deliberately avoids for
-// real timestamps because libpq and JDBC reject it.
+// TIMESTAMPTZ is `Timestamp(µs, "UTC")` — the Arrow type DuckDB actually returns — so
+// the column is advertised `timestamptz` and rendered in PostgreSQL's space-separated
+// offset form. It used to degrade to Utf8, which stringified DuckDB's own
+// `2026-06-03T12:30:00Z`: the ISO T/Z form encoding.rs deliberately avoids for real
+// timestamps because libpq and JDBC reject it.
 #[tokio::test]
-#[ignore = "gap (Temporal): TIMESTAMPTZ has no parse_data_type arm, so it is advertised as text and rendered in ISO T/Z form instead of timestamptz"]
 async fn test_timestamptz_type_and_value() {
     let client = ready_client().await;
     let tbl = create_table(
@@ -907,12 +932,12 @@ async fn test_timestamptz_type_and_value() {
     drop_table(&client, &tbl).await;
 }
 
-// Because the column degrades to Utf8, DataFusion evaluates the predicate over
-// strings. The stored rendering is `2026-06-03T12:30:00Z` while the client sends
-// `2026-06-03 12:30:00+00`; `T` (0x54) sorts after a space (0x20), so a `>`
-// comparison is unconditionally true and the filter returns wrong rows.
+// The advertised type is also the type DataFusion evaluates predicates over, which is
+// why this test is here and not merely a duplicate of the one above. While the column
+// degraded to Utf8 the comparison was lexicographic: the stored rendering was
+// `2026-06-03T12:30:00Z` and the client sent `2026-06-03 12:30:00+00`, and `T` (0x54)
+// sorts after a space (0x20), so `ts > <literal>` was unconditionally true.
 #[tokio::test]
-#[ignore = "gap (Temporal): TIMESTAMPTZ predicates compare lexicographically against DuckDB's ISO T/Z rendering, so `ts > <literal>` matches rows it must exclude"]
 async fn test_timestamptz_predicate_is_chronological() {
     let client = ready_client().await;
     let tbl = create_table(
@@ -949,11 +974,10 @@ async fn test_timestamptz_predicate_is_chronological() {
     drop_table(&client, &tbl).await;
 }
 
-// TIMESTAMPTZ parameters are described as `text` today (the column degrades to
-// Utf8), so a client sending a real timestamptz is rejected before the bind path
-// is even reached.
+// The parameter's OID comes from the column's Arrow type, so this test covers both
+// halves at once: the column now describes `$2` as timestamptz, and the bind path
+// renders the zoned instant as a literal the shard's engine parses.
 #[tokio::test]
-#[ignore = "gap (Temporal + write-path parameter defect): a TIMESTAMPTZ column advertises text, so $1 is described text and a timestamptz parameter is refused"]
 async fn test_timestamptz_bind_parameter_insert() {
     let client = ready_client().await;
     let tbl = create_table(
@@ -985,11 +1009,10 @@ async fn test_timestamptz_bind_parameter_insert() {
     drop_table(&client, &tbl).await;
 }
 
-// TIME has no `parse_data_type` arm. DuckDB returns exactly the Arrow type
-// DataFusion wants (`Time64(µs)`) and arrow-pg maps it to `time`, so this is a
-// pure mapping gap: the value is right, the advertised type is text.
+// DuckDB returns exactly the Arrow type DataFusion wants for TIME (`Time64(µs)`) and
+// arrow-pg maps it to `time` (OID 1083), so nothing has to be converted — the mapping
+// was simply missing, and the column was advertised as text.
 #[tokio::test]
-#[ignore = "gap (Temporal): TIME has no parse_data_type arm, so a TIME column is advertised as text instead of time (OID 1083)"]
 async fn test_time_type_and_value() {
     let client = ready_client().await;
     let tbl = create_table(
@@ -1028,12 +1051,11 @@ async fn test_time_type_and_value() {
     drop_table(&client, &tbl).await;
 }
 
-// TIME parameters work today only *because* the column degrades to Utf8 and the
-// client is asked for text. Fixing `parse_data_type` without fixing
-// `scalar_to_write_param` turns this into a hard failure — see the doc's
-// "Sequencing warning".
+// TIME parameters used to work only *because* the column degraded to Utf8 and the
+// client was asked for text — mapping the type without fixing the bind path would have
+// turned that accident into a hard failure (the doc's "Sequencing warning"), so both
+// landed together. `$2` is described `time` and carried as a clock-time literal.
 #[tokio::test]
-#[ignore = "gap (Temporal + write-path parameter defect): a TIME column advertises text, so $1 is described text; once TIME maps to Time64 the bind path stringifies it as a raw microsecond count"]
 async fn test_time_bind_parameter_insert() {
     let client = ready_client().await;
     let tbl = create_table(
@@ -1066,11 +1088,11 @@ async fn test_time_bind_parameter_insert() {
     drop_table(&client, &tbl).await;
 }
 
-// INTERVAL has no `parse_data_type` arm either. Beyond the wrong OID, the Utf8
-// fallback renders Arrow's plural form (`1 days`) instead of PostgreSQL's
-// (`1 day`).
+// INTERVAL had no `parse_data_type` arm either. Beyond the wrong OID, the Utf8
+// fallback rendered Arrow's plural form (`1 days`) instead of PostgreSQL's
+// (`1 day`). Both halves are fixed: the column is Interval(MonthDayNano), and the wire
+// text follows PostgreSQL's `IntervalStyle` — `1 day`, `1 year 2 mons`, `-04:05:06`.
 #[tokio::test]
-#[ignore = "gap (Temporal): INTERVAL has no parse_data_type arm, so it is advertised as text and renders Arrow's `1 days` instead of PostgreSQL's `1 day`"]
 async fn test_interval_type_and_value() {
     let client = ready_client().await;
     let tbl = create_table(
@@ -1106,8 +1128,10 @@ async fn test_interval_type_and_value() {
     drop_table(&client, &tbl).await;
 }
 
+// The same two halves for a bound interval: `$2` is described `interval`, and the bind
+// path renders the value in explicit units (`0 months 1 days 0 microseconds`) rather
+// than the `Debug` form it used to send.
 #[tokio::test]
-#[ignore = "gap (Temporal + write-path parameter defect): an INTERVAL column advertises text, so $1 is described text; once INTERVAL maps to Interval(MonthDayNano) the bind path stringifies its Debug form"]
 async fn test_interval_bind_parameter_insert() {
     let client = ready_client().await;
     let tbl = create_table(
@@ -1140,47 +1164,19 @@ async fn test_interval_bind_parameter_insert() {
     drop_table(&client, &tbl).await;
 }
 
-// TIMETZ loses its offset inside duckdb-rs's Arrow bridge (`12:34:56+02` becomes
-// a bare `Time64(µs)` of `12:34:56`) — silent data loss upstream of the
-// coordinator. The doc recommends restricting the type until that is fixed.
+// TIMETZ loses its offset inside duckdb-rs's Arrow bridge (`12:34:56+02` becomes a bare
+// `Time64(µs)` of `12:34:56`) — silent data loss upstream of the coordinator, which is
+// why the type is refused rather than served wrong. See `assert_column_type_refused`.
 #[tokio::test]
-#[ignore = "gap (DuckDB types to restrict): duckdb-rs's Arrow bridge drops the TIMETZ offset, so the value is silently rewritten to local time"]
-async fn test_timetz_preserves_offset() {
+async fn test_timetz_is_refused_with_an_alternative() {
     let client = ready_client().await;
-    let tbl = create_table(
-        &client,
-        "tr_timetz",
-        &format!("(id INTEGER NOT NULL, t TIMETZ NOT NULL) {CREATE_OPTS}"),
-    )
-    .await;
-
-    execute(
-        &client,
-        &format!("INSERT INTO {tbl} (id, t) VALUES (1, '12:34:56+02')"),
-    )
-    .await
-    .unwrap();
-
-    let types = describe_result_types(&client, &format!("SELECT t FROM {tbl}")).await;
-    assert_eq!(types, vec![Type::TIMETZ]);
-
-    let rows = simple_query_rows(&client, &format!("SELECT t FROM {tbl}"))
-        .await
-        .unwrap();
-    assert_eq!(
-        rows[0][0].as_deref(),
-        Some("12:34:56+02"),
-        "the UTC offset must survive the round trip"
-    );
-
-    drop_table(&client, &tbl).await;
+    assert_column_type_refused(&client, "tr_timetz", "t TIMETZ NOT NULL", "TIMETZ").await;
 }
 
 // DuckDB's sub-microsecond and coarse timestamp variants are all valid Arrow
-// `Timestamp` units, so mapping them is cheap; today they fall through to text
-// and render in ISO T-separated form.
+// `Timestamp` units, so each is mapped to its own unit. Without an arm they fell
+// through to text and rendered in ISO T-separated form.
 #[tokio::test]
-#[ignore = "gap (DuckDB types to restrict): TIMESTAMP_S/_MS/_NS have no parse_data_type arm and read back as ISO T-separated text"]
 async fn test_timestamp_precision_variants() {
     let client = ready_client().await;
     let tbl = create_table(
@@ -1265,12 +1261,10 @@ async fn test_bytea_round_trip() {
     drop_table(&client, &tbl).await;
 }
 
-// DuckDB's other BLOB aliases have no `parse_data_type` arm, so they degrade to
-// Utf8 and the safe Binary->Utf8 cast sees invalid UTF-8: every non-ASCII value
-// reads back NULL. Silent data loss on a type that works correctly under a
-// different spelling.
+// DuckDB's other BLOB aliases are mapped too. Without an arm they degraded to Utf8,
+// and the safe Binary->Utf8 cast saw invalid UTF-8 and returned NULL: silent data loss
+// on a type that worked correctly under a different spelling.
 #[tokio::test]
-#[ignore = "gap (Binary / Alias gap): BINARY and VARBINARY have no parse_data_type arm, so non-UTF-8 bytes are NULLified by the safe Binary->Utf8 cast"]
 async fn test_binary_aliases_preserve_bytes() {
     let client = ready_client().await;
     let tbl = create_table(
@@ -1353,15 +1347,14 @@ async fn test_array_column() {
     drop_table(&client, &tbl).await;
 }
 
-// `T[n]` lands as `FixedSizeList(T,n)` in DuckDB but is advertised as `List(T)`.
-// The cast itself succeeds, yet it yields a list whose child field is unnamed, and
-// `coerce_batch_to_schema`'s rebuild rejects that against the advertised schema —
-// so every read of a fixed-length array column fails. The declared length is also
-// dropped from the schema; DuckDB still enforces it on write, which must surface as
-// a clean client error rather than an internal one. `FixedSizeList` must NOT be
-// adopted as the advertised type: arrow-pg's encoder has no arm for it.
+// `T[n]` reaches the shards as `T[]`, which is what PostgreSQL means by it: the
+// declared length is accepted and then ignored ("the current implementation does not
+// enforce the declared number of elements"). DuckDB took it literally and stored a
+// `FixedSizeList`, a type arrow-pg cannot encode and whose `List` cast produced an
+// unnamed child field the schema rebuild rejected — so every read of the column used
+// to fail. Dropping the length costs a constraint PostgreSQL never applied, and this
+// test pins both halves of that: the read works, and the length is not enforced.
 #[tokio::test]
-#[ignore = "gap (Nested): every read of a T[n] column fails — the FixedSizeList -> List cast yields an unnamed child field and coerce_batch_to_schema reports `expected List(Int32) but found List(Int32, field: '')`"]
 async fn test_fixed_length_array_column() {
     let client = ready_client().await;
     let tbl = create_table(
@@ -1387,49 +1380,36 @@ async fn test_fixed_length_array_column() {
         "a fixed-length array must read back in PostgreSQL array text form"
     );
 
-    // The declared length is part of the contract: a 2-element value is invalid.
-    let err = execute_expect_err(
+    // As in PostgreSQL, the declared length is not a constraint: a 2-element value is
+    // stored and read back as itself.
+    execute(
         &client,
         &format!("INSERT INTO {tbl} (id, tags) VALUES (2, ARRAY[1, 2])"),
     )
-    .await;
-    assert_ne!(
-        err.code().code(),
-        "XX000",
-        "a wrong-length ARRAY insert must be a clean client error, not an internal one"
+    .await
+    .expect("PostgreSQL does not enforce a declared array length, so neither do we");
+
+    let rows = simple_query_rows(&client, &format!("SELECT tags FROM {tbl} WHERE id = 2"))
+        .await
+        .unwrap();
+    assert_eq!(
+        rows[0][0].as_deref(),
+        Some("{1,2}"),
+        "a shorter array must read back at the length it was written"
     );
 
     drop_table(&client, &tbl).await;
 }
 
-// MAP is accepted at CREATE TABLE and accepts INSERTs, then every SELECT fails:
-// the column is advertised Utf8 and `Casting from Map(...) to Utf8` is not
-// supported. Advertising `Map` would not help — arrow-pg has no Map arm at all,
-// so this needs an upstream mapping or a DDL-time rejection.
+// MAP used to be accepted at CREATE TABLE and to accept INSERTs, and then every
+// SELECT failed: the column was advertised Utf8 and `Casting from Map(...) to Utf8`
+// is not supported. Advertising `Map` would not have helped — arrow-pg has no Map
+// arm at all — and PostgreSQL has no map type to be compatible with, so the column
+// is refused when it is declared, while the table is still empty.
 #[tokio::test]
-#[ignore = "gap (Nested): a MAP column is advertised Utf8, so every SELECT fails with `Casting from Map(...) to Utf8 not supported`; arrow-pg 0.14 has no Map arm either"]
-async fn test_map_column() {
+async fn test_map_column_is_refused_with_an_alternative() {
     let client = ready_client().await;
-    let tbl = create_table(
-        &client,
-        "tr_map",
-        &format!("(id INTEGER NOT NULL, m MAP(INTEGER, VARCHAR) NOT NULL) {CREATE_OPTS}"),
-    )
-    .await;
-
-    execute(
-        &client,
-        &format!("INSERT INTO {tbl} (id, m) VALUES (1, map([1, 2], ['a', 'b']))"),
-    )
-    .await
-    .unwrap();
-
-    let rows = simple_query_rows(&client, &format!("SELECT m FROM {tbl}"))
-        .await
-        .unwrap();
-    assert_eq!(rows.len(), 1, "the MAP row must read back");
-
-    drop_table(&client, &tbl).await;
+    assert_column_type_refused(&client, "tr_map", "m MAP(INTEGER, VARCHAR) NOT NULL", "MAP").await;
 }
 
 // STRUCT never reaches DuckDB intact: sqlparser re-renders
@@ -1462,207 +1442,79 @@ async fn test_struct_column() {
     drop_table(&client, &tbl).await;
 }
 
-// UNION hits the same re-render mangling as STRUCT, and there is no Arrow `Union`
-// path through arrow-pg even with valid DDL — a restrict-at-DDL candidate.
+// UNION hit the same re-render mangling as STRUCT, and there is no Arrow `Union`
+// path through arrow-pg even with valid DDL — and no PostgreSQL union type to be
+// compatible with, so it is refused at DDL time.
 #[tokio::test]
-#[ignore = "gap (DuckDB types to restrict): UNION's field list is mangled on re-render and arrow-pg has no Union path; it should be rejected at DDL time"]
-async fn test_union_column() {
+async fn test_union_column_is_refused_with_an_alternative() {
     let client = ready_client().await;
-    let tbl = create_table(
+    assert_column_type_refused(
         &client,
         "tr_union",
-        &format!("(id INTEGER NOT NULL, u UNION(num INTEGER, str VARCHAR)) {CREATE_OPTS}"),
+        "u UNION(num INTEGER, str VARCHAR)",
+        "UNION",
     )
     .await;
-
-    execute(
-        &client,
-        &format!("INSERT INTO {tbl} (id, u) VALUES (1, union_value(num := 2))"),
-    )
-    .await
-    .unwrap();
-
-    let rows = simple_query_rows(&client, &format!("SELECT u FROM {tbl}"))
-        .await
-        .unwrap();
-    assert_eq!(rows.len(), 1, "the UNION row must read back");
-
-    drop_table(&client, &tbl).await;
 }
 
 // VARIANT is unusable on the shard databases as deployed: DuckDB rejects the
-// per-shard CREATE because the store predates VARIANT support. Even on a v1.5.0+
-// store the read then fails inside duckdb-rs. Both failures are upstream of the
-// coordinator, so the type should be rejected at DDL time with a clear message.
+// per-shard CREATE because the store predates VARIANT support, and even on a
+// v1.5.0+ store the read then fails inside duckdb-rs. Both failures are upstream of
+// the coordinator and neither is visible at the point the column is declared, which
+// is exactly why the declaration is where the refusal belongs.
 #[tokio::test]
-#[ignore = "gap (DuckDB types to restrict): the per-shard CREATE fails with `VARIANT columns are not supported in storage versions prior to v1.5.0`; even on a newer store duckdb-rs cannot decode Variant columns"]
-async fn test_variant_column() {
+async fn test_variant_column_is_refused_with_an_alternative() {
     let client = ready_client().await;
-    let tbl = create_table(
-        &client,
-        "tr_variant",
-        &format!("(id INTEGER NOT NULL, v VARIANT NOT NULL) {CREATE_OPTS}"),
-    )
-    .await;
-
-    execute(
-        &client,
-        &format!("INSERT INTO {tbl} (id, v) VALUES (1, 42)"),
-    )
-    .await
-    .unwrap();
-
-    let rows = simple_query_rows(&client, &format!("SELECT v FROM {tbl}"))
-        .await
-        .unwrap();
-    assert_eq!(rows.len(), 1, "the VARIANT row must read back");
-
-    drop_table(&client, &tbl).await;
+    assert_column_type_refused(&client, "tr_variant", "v VARIANT NOT NULL", "VARIANT").await;
 }
 
 // ============================================================================
 // DuckDB types to restrict — doc section "DuckDB types to restrict"
 // ============================================================================
 
-// duckdb-rs's Arrow bridge narrows 128-bit integers to Decimal128(38,0) BEFORE
-// the coordinator sees the batch, so the 39th digit is lost silently. Not fixable
-// in `parse_data_type`; needs Decimal256 in duckdb-rs and arrow-pg, or a
-// `c::VARCHAR` projection in the shard scan.
+// duckdb-rs's Arrow bridge narrows 128-bit integers to Decimal128(38,0) BEFORE the
+// coordinator sees the batch, so the 39th digit was lost silently — nothing in the
+// coordinator can widen a value that arrived already truncated. The declaration is
+// therefore refused, and the refusal names the two types that do work.
 #[tokio::test]
-#[ignore = "gap (DuckDB types to restrict): duckdb-rs narrows HUGEINT to Decimal128(38,0), silently truncating the 39th digit upstream of the coordinator"]
-async fn test_hugeint_precision() {
+async fn test_hugeint_is_refused_with_an_alternative() {
     let client = ready_client().await;
-    let tbl = create_table(
-        &client,
-        "tr_hugeint",
-        &format!("(id INTEGER NOT NULL, v HUGEINT NOT NULL) {CREATE_OPTS}"),
-    )
-    .await;
+    assert_column_type_refused(&client, "tr_hugeint", "v HUGEINT NOT NULL", "HUGEINT").await;
+}
 
-    // i128::MAX — 39 digits.
-    let max = "170141183460469231731687303715884105727";
-    execute(
-        &client,
-        &format!("INSERT INTO {tbl} (id, v) VALUES (1, {max})"),
-    )
-    .await
-    .unwrap();
+// UHUGEINT is worse than HUGEINT: its maximum did not truncate, it read back as -1.
+#[tokio::test]
+async fn test_uhugeint_is_refused_with_an_alternative() {
+    let client = ready_client().await;
+    assert_column_type_refused(&client, "tr_uhugeint", "v UHUGEINT NOT NULL", "UHUGEINT").await;
+}
 
-    let rows = simple_query_rows(&client, &format!("SELECT v FROM {tbl}"))
-        .await
-        .unwrap();
-    assert_eq!(
-        rows[0][0].as_deref(),
-        Some(max),
-        "all 39 digits of HUGEINT max must survive"
-    );
-
-    drop_table(&client, &tbl).await;
+// DuckDB returns a packed bitstring as `Binary`, whose bytes are not valid UTF-8;
+// there is no Arrow type that carries a bitstring to a PostgreSQL client, so the
+// column is refused rather than read back as NULL.
+#[tokio::test]
+async fn test_bit_column_is_refused_with_an_alternative() {
+    let client = ready_client().await;
+    assert_column_type_refused(&client, "tr_bit", "b BIT NOT NULL", "BIT").await;
+    // The parameterized and aliased spellings are refused the same way — a client
+    // must not be able to reach the NULLifying path by writing VARBIT instead.
+    assert_column_type_refused(&client, "tr_varbit", "b VARBIT NOT NULL", "VARBIT").await;
 }
 
 #[tokio::test]
-#[ignore = "gap (DuckDB types to restrict): UHUGEINT max reads back as -1 after duckdb-rs narrows it to Decimal128(38,0)"]
-async fn test_uhugeint_precision() {
+async fn test_bignum_column_is_refused_with_an_alternative() {
     let client = ready_client().await;
-    let tbl = create_table(
-        &client,
-        "tr_uhugeint",
-        &format!("(id INTEGER NOT NULL, v UHUGEINT NOT NULL) {CREATE_OPTS}"),
-    )
-    .await;
-
-    // u128::MAX — 39 digits.
-    let max = "340282366920938463463374607431768211455";
-    execute(
-        &client,
-        &format!("INSERT INTO {tbl} (id, v) VALUES (1, {max})"),
-    )
-    .await
-    .unwrap();
-
-    let rows = simple_query_rows(&client, &format!("SELECT v FROM {tbl}"))
-        .await
-        .unwrap();
-    assert_eq!(
-        rows[0][0].as_deref(),
-        Some(max),
-        "UHUGEINT max must survive, not read back as -1"
-    );
-
-    drop_table(&client, &tbl).await;
-}
-
-// DuckDB returns a packed bitstring as `Binary`; the Utf8 fallback's safe cast
-// sees invalid UTF-8 and NULLifies every value.
-#[tokio::test]
-#[ignore = "gap (DuckDB types to restrict): BIT is returned as Binary and NULLified by the safe Binary->Utf8 cast (on this NOT NULL column the rebuild then fails the read); PostgreSQL renders it as a 1/0 string"]
-async fn test_bit_column() {
-    let client = ready_client().await;
-    let tbl = create_table(
-        &client,
-        "tr_bit",
-        &format!("(id INTEGER NOT NULL, b BIT NOT NULL) {CREATE_OPTS}"),
-    )
-    .await;
-
-    execute(
-        &client,
-        &format!("INSERT INTO {tbl} (id, b) VALUES (1, '101010')"),
-    )
-    .await
-    .unwrap();
-
-    let rows = simple_query_rows(&client, &format!("SELECT b FROM {tbl}"))
-        .await
-        .unwrap();
-    assert_eq!(
-        rows[0][0].as_deref(),
-        Some("101010"),
-        "a bitstring must read back as its 1/0 text form, not NULL"
-    );
-
-    drop_table(&client, &tbl).await;
-}
-
-#[tokio::test]
-#[ignore = "gap (DuckDB types to restrict): BIGNUM is returned as Binary and NULLified by the safe Binary->Utf8 cast (on this NOT NULL column the rebuild then fails the read)"]
-async fn test_bignum_column() {
-    let client = ready_client().await;
-    let tbl = create_table(
-        &client,
-        "tr_bignum",
-        &format!("(id INTEGER NOT NULL, v BIGNUM NOT NULL) {CREATE_OPTS}"),
-    )
-    .await;
-
-    let big = "123456789012345678901234567890123456789012345";
-    execute(
-        &client,
-        &format!("INSERT INTO {tbl} (id, v) VALUES (1, '{big}')"),
-    )
-    .await
-    .unwrap();
-
-    let rows = simple_query_rows(&client, &format!("SELECT v FROM {tbl}"))
-        .await
-        .unwrap();
-    assert_eq!(
-        rows[0][0].as_deref(),
-        Some(big),
-        "a variable-length integer must read back exactly, not NULL"
-    );
-
-    drop_table(&client, &tbl).await;
+    assert_column_type_refused(&client, "tr_bignum", "v BIGNUM NOT NULL", "BIGNUM").await;
 }
 
 // ============================================================================
 // Alias gap — doc section "The alias gap"
 // ============================================================================
 
-// `parse_data_type` matches the declared string, so an unrecognized alias of a
-// fully-supported type degrades to text even though the canonical spelling works.
+// `parse_data_type` matches the declared string, so an alias missing from it used to
+// degrade to text even though the canonical spelling worked — the same declaration
+// meaning two different things depending on how it was spelled.
 #[tokio::test]
-#[ignore = "gap (Alias gap): LONG/SIGNED/SHORT/INT1/DATETIME/LOGICAL are missing from parse_data_type, so all six degrade to text"]
 async fn test_duckdb_type_aliases() {
     let client = ready_client().await;
     let tbl = create_table(

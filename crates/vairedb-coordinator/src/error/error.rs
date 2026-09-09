@@ -53,6 +53,14 @@ pub enum CoordinatorError {
     #[error("sql parse error: {0}")]
     SqlParse(#[from] crate::sqlparser::parser::ParserError),
 
+    /// A statement form VaireDB refuses by name instead of answering as if it had
+    /// applied it. Raised at parse time, which is where a clause an upstream
+    /// compatibility rewrite would otherwise discard is still visible — see
+    /// [`crate::pgwire_handler::parser::parse_sql`]. The message is already
+    /// client-facing, so it is passed through unchanged.
+    #[error("{0}")]
+    Unsupported(String),
+
     #[error("table not found: {0}")]
     TableNotFound(String),
 
@@ -117,6 +125,7 @@ impl CoordinatorError {
             CoordinatorError::NoAliveNodes => VdbErrorCode::NoAliveNodes,
             CoordinatorError::Anonymization(_) => VdbErrorCode::FeatureNotSupported,
             CoordinatorError::SqlParse(_) => VdbErrorCode::SqlSyntaxError,
+            CoordinatorError::Unsupported(_) => VdbErrorCode::FeatureNotSupported,
             CoordinatorError::Serialization(_) => VdbErrorCode::SerializationError,
             CoordinatorError::Internal(_) => VdbErrorCode::InternalError,
             CoordinatorError::Grpc(status) => match status.code() {

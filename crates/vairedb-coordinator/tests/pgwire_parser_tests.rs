@@ -1,6 +1,7 @@
 //! The single SQL parse and the read-path AST rewrites (`pgwire_handler::parser`).
 //! Write-path translation is covered by `write_sql_cl_tests`.
 
+use vairedb_coordinator::error::CoordinatorError;
 use vairedb_coordinator::pgwire_handler::parser::{
     collapse_schema_qualified_relations, parse_sql, transform_to_char_format_for_read,
 };
@@ -187,4 +188,72 @@ fn test_read_transform_ignores_non_to_char() {
     transform_to_char_format_for_read(&mut stmts[0]);
     let after = stmts[0].to_string();
     assert_eq!(before, after);
+}
+
+// --- COLLATE is decided during the parse, because that is where it still exists ---
+//
+// The compatibility parser deletes every `COLLATE` clause on its way past, so a read
+// statement asking for a real locale would otherwise be answered in byte order with
+// nothing said. `parse_sql` refuses it while the client's own text is still in reach.
+
+#[test]
+fn test_read_path_refuses_a_collation_that_is_not_byte_order() {
+    let err = parse_sql(r#"SELECT name COLLATE "en_US" FROM t"#)
+        .expect_err("a collation VaireDB cannot apply must be refused, not dropped");
+    assert!(
+        matches!(err, CoordinatorError::Unsupported(_)),
+        "0A000, not a syntax error: the statement parses, VaireDB just cannot honour it          — got {err:?}"
+    );
+    assert!(err.to_string().contains("COLLATE"), "got: {err}");
+}
+
+// Byte order is what VaireDB applies, so the three names for it stay accepted — and
+// come back stripped, which is what makes them plannable.
+#[test]
+fn test_read_path_accepts_byte_order_collations() {
+    for sql in [
+        r#"SELECT name COLLATE "C" FROM t"#,
+        r#"SELECT 1 FROM t ORDER BY name COLLATE "POSIX""#,
+        "SELECT name COLLATE ucs_basic FROM t",
+    ] {
+        let stmts = parse_sql(sql).unwrap_or_else(|e| panic!("`{sql}` must be accepted: {e}"));
+        assert!(
+            !stmts[0].to_string().to_uppercase().contains("COLLATE"),
+            "the clause is dropped once accepted, got: {}",
+            stmts[0]
+        );
+    }
+}
+
+// The keyword scan that decides whether to parse a second time errs towards yes, so a
+// string that merely contains the word must still be answered rather than refused.
+#[test]
+fn test_the_word_collate_inside_a_literal_is_not_a_collation() {
+    let stmts = parse_sql("SELECT 'collate me' AS s").unwrap();
+    assert_eq!(stmts.len(), 1);
+}
+
+// A write is refused on the same terms as a read. It was not, once — the reasoning being
+// that a write never reaches DataFusion and DuckDB has collations of its own, so the
+// clause could be passed through intact. That is true and it is the problem: DuckDB
+// applies one of *its* collations, so the same comparison was ordered by ICU rules on an
+// UPDATE and by byte value on the SELECT that read the result back. The client asked for
+// an ordering neither path was going to give it, and nothing said so.
+#[test]
+fn test_write_path_refuses_a_collation_it_does_not_implement() {
+    let err = parse_sql(r#"UPDATE t SET a = 1 WHERE name COLLATE "en_US" < 'x'"#)
+        .expect_err("a locale collation must be refused on a write");
+    assert!(err.to_string().contains("COLLATE"), "got: {err}");
+}
+
+// The byte-order spellings are accepted instead — and stripped on the way to a shard,
+// which `write_sql_cl_tests` covers.
+#[test]
+fn test_write_path_accepts_a_byte_order_collation() {
+    for sql in [
+        r#"UPDATE t SET a = 1 WHERE name COLLATE "C" < 'x'"#,
+        "DELETE FROM t WHERE name COLLATE pg_catalog.default < 'x'",
+    ] {
+        parse_sql(sql).unwrap_or_else(|e| panic!("`{sql}` must be accepted: {e}"));
+    }
 }

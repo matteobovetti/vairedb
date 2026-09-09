@@ -1298,6 +1298,7 @@ dependencies = [
 name = "vairedb-e2e"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "chrono",
  "futures",
  "hmac 0.12.1",

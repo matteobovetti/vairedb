@@ -548,6 +548,7 @@ fn prepend_view_ctes(query: &mut Query, views: Vec<(String, Box<Query>)>) {
                 // a name whose case the client protected from being folded again.
                 name: Ident::with_quote('"', name),
                 columns: Vec::new(),
+                at: None,
             },
             query: body,
             from: None,
@@ -760,15 +761,7 @@ mod tests {
     /// A catalog in a temp file, for the expansion tests: they need real stored
     /// views, and the point lookups are what expansion actually does.
     fn catalog_with(views: &[(&str, &str)]) -> Arc<MetadataCatalog> {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-
-        let path = std::env::temp_dir().join(format!(
-            "vairedb_test_views_{}_{}.redb",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        let catalog = MetadataCatalog::open(path.to_str().unwrap()).unwrap();
+        let catalog = crate::pgwire_handler::test_catalog::scratch_catalog("views");
         for (name, definition) in views {
             catalog
                 .put_view(&ViewMeta {

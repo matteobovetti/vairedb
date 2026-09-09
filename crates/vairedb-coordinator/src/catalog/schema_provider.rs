@@ -2,7 +2,6 @@
 //! read-only virtual tables (under the `vairedb_catalog` schema), letting the
 //! query planner inspect table, column, shard, and node metadata via SQL.
 
-use std::any::Any;
 use std::sync::Arc;
 
 use async_trait::async_trait;
@@ -379,10 +378,6 @@ fn make_memtable(
 
 #[async_trait]
 impl SchemaProvider for VaireDbCatalogSchema {
-    fn as_any(&self) -> &dyn Any {
-        self
-    }
-
     fn table_names(&self) -> Vec<String> {
         VIRTUAL_TABLES.iter().map(|s| s.to_string()).collect()
     }

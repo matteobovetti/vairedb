@@ -6,7 +6,6 @@
 //! task. It is never executed on the coordinator — it must be serialized and
 //! shipped to a core node, so calling `execute` here is an error.
 
-use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
 
@@ -26,6 +25,7 @@ pub struct RemoteDuckDbScanExec {
     projected_schema: SchemaRef,
     projection: Option<Vec<usize>>,
     filter_exprs: Vec<String>,
+    limit: Option<usize>,
     target_executor_id: Option<String>,
     replica_executor_ids: Vec<String>,
     properties: Arc<PlanProperties>,
@@ -54,10 +54,21 @@ impl RemoteDuckDbScanExec {
             projected_schema,
             projection,
             filter_exprs,
+            limit: None,
             target_executor_id,
             replica_executor_ids,
             properties,
         }
+    }
+
+    /// Cap the rows this shard returns.
+    ///
+    /// A limit is a hint, not part of the scan's contract, which is why it is set here
+    /// rather than being a seventh constructor argument: a caller that has no limit to
+    /// push builds the same scan it always did.
+    pub fn with_limit(mut self, limit: Option<usize>) -> Self {
+        self.limit = limit;
+        self
     }
 
     /// Physical (shard-suffixed) table name to scan on the core node.
@@ -80,6 +91,11 @@ impl RemoteDuckDbScanExec {
         &self.filter_exprs
     }
 
+    /// The most rows this shard needs to return, if the query has a limit to push.
+    pub fn limit(&self) -> Option<usize> {
+        self.limit
+    }
+
     /// Executor id of the shard's primary node, if known.
     pub fn target_executor_id(&self) -> Option<&str> {
         self.target_executor_id.as_deref()
@@ -93,17 +109,23 @@ impl RemoteDuckDbScanExec {
 
 impl DisplayAs for RemoteDuckDbScanExec {
     fn fmt_as(&self, _t: DisplayFormatType, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "RemoteDuckDbScanExec: table={}", self.shard_table_name)
+        write!(f, "RemoteDuckDbScanExec: table={}", self.shard_table_name)?;
+        // What the shard does on the coordinator's behalf, and therefore what an EXPLAIN
+        // has to show: a predicate that is not listed here is one the coordinator is
+        // evaluating over every row of the shard.
+        if !self.filter_exprs.is_empty() {
+            write!(f, ", filters=[{}]", self.filter_exprs.join(", "))?;
+        }
+        if let Some(limit) = self.limit {
+            write!(f, ", limit={limit}")?;
+        }
+        Ok(())
     }
 }
 
 impl ExecutionPlan for RemoteDuckDbScanExec {
     fn name(&self) -> &str {
         "RemoteDuckDbScanExec"
-    }
-
-    fn as_any(&self) -> &dyn Any {
-        self
     }
 
     fn properties(&self) -> &Arc<PlanProperties> {

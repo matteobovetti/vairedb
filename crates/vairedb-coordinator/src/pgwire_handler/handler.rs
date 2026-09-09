@@ -42,11 +42,15 @@ use vairedb_common::proto::vairedb::v1::VdbErrorCode;
 
 use crate::pgwire_handler::catalog_routing::{catalog_table_names, references_catalog_schema};
 use crate::pgwire_handler::encoding;
-use crate::pgwire_handler::error_enrichment::{ErrorContext, enrich_generic_error, make_vdb_error};
+use crate::pgwire_handler::error_enrichment::{
+    ErrorContext, enrich_datafusion_error, make_vdb_error,
+};
+use crate::pgwire_handler::introspection;
 use crate::pgwire_handler::parser::{self, VairePrepared, VaireQueryParser};
 use crate::pgwire_handler::query_router::{self, QueryType};
 use crate::pgwire_handler::sequences;
 use crate::pgwire_handler::session::SessionState;
+use crate::pgwire_handler::session_params;
 use crate::pgwire_handler::user_types;
 use crate::replication::ReplicationManager;
 use crate::write_router::WriteRouter;
@@ -112,8 +116,13 @@ impl PgWireServerHandlers for VaireDbHandlers {
         Arc::clone(&self.startup_handler)
     }
 
+    /// The same handler that ran the `COPY` statement: importing a row is an
+    /// INSERT, so the copy sub-protocol reaches the write path through the object
+    /// that already owns it rather than through a second one. The per-connection
+    /// state a copy needs lives in the session — see
+    /// [`crate::pgwire_handler::copy_stream`].
     fn copy_handler(&self) -> Arc<impl CopyHandler> {
-        Arc::new(NoopHandler)
+        Arc::clone(&self.query_handler)
     }
 
     fn error_handler(&self) -> Arc<impl ErrorHandler> {
@@ -169,9 +178,13 @@ fn unsupported_statement_label(stmt: &crate::sqlparser::ast::Statement) -> &'sta
     }
 
     match stmt {
-        Statement::Set(_) => "SET",
-        Statement::ShowVariable { .. } => "SHOW",
-        Statement::Explain { .. } | Statement::ExplainTable { .. } => "EXPLAIN",
+        // `SET` and `SHOW` are not listed: both classify as
+        // [`QueryType::SessionParam`] and are answered (or refused by parameter
+        // name, which is more specific than this label could be) in
+        // [`crate::pgwire_handler::session_params`]. `EXPLAIN` and `DESCRIBE` are
+        // absent for the same reason — they classify as [`QueryType::Explain`], and
+        // the forms that cannot be answered truthfully name the *form* in
+        // [`crate::pgwire_handler::introspection`].
         Statement::CreateSequence { .. } => "CREATE SEQUENCE",
         Statement::Comment { .. } => "COMMENT ON",
         Statement::Analyze { .. } => "ANALYZE",
@@ -216,15 +229,7 @@ impl VaireDbQueryHandler {
     /// actually ships a write will fail to resolve a shard, which is what makes
     /// this cheap enough to build per test.
     pub(super) fn for_tests(allow_cross_shard_transactions: bool) -> Self {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-
-        let path = std::env::temp_dir().join(format!(
-            "vairedb_test_handler_{}_{}.redb",
-            std::process::id(),
-            COUNTER.fetch_add(1, Ordering::Relaxed)
-        ));
-        let catalog = Arc::new(MetadataCatalog::open(path.to_str().unwrap()).unwrap());
+        let catalog = Arc::new(super::test_catalog::scratch_catalog("handler"));
         let pool = Arc::new(ChannelPool::new());
         let replication_manager = Arc::new(ReplicationManager::new(
             Arc::clone(&catalog),
@@ -268,8 +273,12 @@ impl SimpleQueryHandler for VaireDbQueryHandler {
         PgWireError: From<<C as Sink<PgWireBackendMessage>>::Error>,
     {
         let session = SessionState::for_client(client);
+        // The error carries its own code: a parse failure is a syntax error, but a
+        // statement refused at parse time — a `COLLATE` the compatibility parser would
+        // otherwise have discarded — is `feature_not_supported`, and a client that
+        // branches on SQLSTATE needs to be able to tell those apart.
         let statements = parser::parse_sql(query)
-            .map_err(|e| make_vdb_error(VdbErrorCode::SqlSyntaxError, e.to_string()))?;
+            .map_err(|e| make_vdb_error(e.vdb_error_code(), e.to_string()))?;
 
         let mut responses = Vec::with_capacity(statements.len());
 
@@ -308,6 +317,54 @@ impl ExtendedQueryHandler for VaireDbQueryHandler {
         let Some(stmt) = &prepared.stmt else {
             return Ok(Response::EmptyQuery);
         };
+
+        if prepared.query_type == QueryType::SessionParam {
+            // Answered from the connection's own parameter map — no plan, no shard,
+            // and no bind parameters to decode: a runtime parameter takes a literal
+            // or a bare word, never a `$1`. Routed before the write path because a
+            // `SHOW` returns rows, which the write path has no way to produce.
+            let result = async {
+                self.check_transaction_allows(stmt, &prepared.query_type, &session)
+                    .await?;
+                session_params::handle_session_param(stmt, &session, &portal.result_column_format)
+                    .await
+            }
+            .await;
+            self.note_failure_in_transaction(result.is_err(), &session)
+                .await;
+            return result;
+        }
+
+        if prepared.query_type == QueryType::Explain {
+            // The plan is the answer, so it was built at Parse and is reused here
+            // verbatim. Bind parameters are not decoded: `EXPLAIN` reports the shape
+            // of a query, and a placeholder's value does not change it — a client
+            // that binds one gets the same plan a `$1` in a SELECT would produce.
+            let result = async {
+                self.check_transaction_allows(stmt, &prepared.query_type, &session)
+                    .await?;
+                let plan = prepared.plan.as_ref().ok_or_else(|| {
+                    make_vdb_error(VdbErrorCode::InternalError, "missing plan for EXPLAIN")
+                })?;
+                let is_catalog = self.is_catalog_query(stmt);
+                let ctx = if is_catalog {
+                    &self.local_ctx
+                } else {
+                    &self.session_ctx
+                };
+                introspection::execute_introspection(
+                    ctx,
+                    plan,
+                    &portal.result_column_format,
+                    &introspection::error_context(stmt),
+                )
+                .await
+            }
+            .await;
+            self.note_failure_in_transaction(result.is_err(), &session)
+                .await;
+            return result;
+        }
 
         if prepared.query_type == QueryType::Select {
             // Read path: bind typed parameters into the cached logical plan.
@@ -370,7 +427,13 @@ impl ExtendedQueryHandler for VaireDbQueryHandler {
     where
         C: ClientInfo + Unpin + Send + Sync,
     {
-        if portal.statement.statement.query_type == QueryType::Select {
+        // `SHOW` and `EXPLAIN` produce rows too, so they have to be described like a
+        // SELECT: a client that was told `no data` would not read the rows that
+        // follow.
+        if matches!(
+            portal.statement.statement.query_type,
+            QueryType::Select | QueryType::SessionParam | QueryType::Explain
+        ) {
             // Advertise the columns with the same per-column format the client
             // requested in Bind, so the RowDescription matches the DataRows
             // Execute will send.
@@ -412,6 +475,7 @@ impl VaireDbQueryHandler {
             self.reject_view_as_table(stmt, &query_type)?;
             match query_type {
                 QueryType::Select => self.handle_select(stmt).await,
+                QueryType::Explain => self.handle_introspection(stmt, &Format::UnifiedText).await,
                 QueryType::Insert | QueryType::Update | QueryType::Delete => {
                     self.handle_dml(stmt, &query_type, &[], session).await
                 }
@@ -428,6 +492,11 @@ impl VaireDbQueryHandler {
                 QueryType::CreateSchema => self.handle_create_schema(stmt).await,
                 QueryType::DropSchema => self.handle_drop_schema(stmt).await,
                 QueryType::Copy => self.handle_copy(stmt, session).await,
+                // The simple-query protocol has no Bind, so every value on the wire
+                // is text.
+                QueryType::SessionParam => {
+                    session_params::handle_session_param(stmt, session, &Format::UnifiedText).await
+                }
                 QueryType::TransactionControl | QueryType::Other => {
                     Err(unsupported_statement_error(stmt))
                 }
@@ -475,9 +544,14 @@ impl VaireDbQueryHandler {
                 QueryType::CreateSchema => self.handle_create_schema(stmt).await,
                 QueryType::DropSchema => self.handle_drop_schema(stmt).await,
                 QueryType::Copy => self.handle_copy(stmt, session).await,
-                QueryType::Select | QueryType::TransactionControl | QueryType::Other => {
-                    Err(unsupported_statement_error(stmt))
-                }
+                // A read, an `EXPLAIN` and a session parameter each reach the
+                // extended protocol through their own branch in `do_query`, so none
+                // of them arrives here.
+                QueryType::Select
+                | QueryType::Explain
+                | QueryType::SessionParam
+                | QueryType::TransactionControl
+                | QueryType::Other => Err(unsupported_statement_error(stmt)),
             }
         }
         .await;
@@ -548,7 +622,7 @@ impl VaireDbQueryHandler {
         let bound = plan
             .clone()
             .replace_params_with_values(&param_values)
-            .map_err(|e| enrich_generic_error(&e, &select_ctx))?;
+            .map_err(|e| enrich_datafusion_error(&e, &select_ctx))?;
 
         let ctx = if prepared.is_catalog {
             &self.local_ctx
@@ -558,7 +632,7 @@ impl VaireDbQueryHandler {
         let df = ctx
             .execute_logical_plan(bound)
             .await
-            .map_err(|e| enrich_generic_error(&e, &select_ctx))?;
+            .map_err(|e| enrich_datafusion_error(&e, &select_ctx))?;
 
         encoding::encode_dataframe_response(df, result_format, &select_ctx).await
     }
@@ -595,18 +669,18 @@ impl VaireDbQueryHandler {
                 .map(|value| ScalarAndMetadata::new(value.clone(), None))
                 .collect();
             plan.replace_params_with_values(&ParamValues::List(bindings))
-                .map_err(|e| enrich_generic_error(&e, &select_ctx))?
+                .map_err(|e| enrich_datafusion_error(&e, &select_ctx))?
         };
 
         let df = ctx
             .execute_logical_plan(plan)
             .await
-            .map_err(|e| enrich_generic_error(&e, &select_ctx))?;
+            .map_err(|e| enrich_datafusion_error(&e, &select_ctx))?;
         let schema = Arc::new(df.schema().as_arrow().clone());
         let batches = df
             .collect()
             .await
-            .map_err(|e| enrich_generic_error(&e, &select_ctx))?;
+            .map_err(|e| enrich_datafusion_error(&e, &select_ctx))?;
 
         Ok((schema, batches))
     }
@@ -629,10 +703,30 @@ impl VaireDbQueryHandler {
         let df = ctx
             .execute_logical_plan(plan)
             .await
-            .map_err(|e| enrich_generic_error(&e, &select_ctx))?;
+            .map_err(|e| enrich_datafusion_error(&e, &select_ctx))?;
 
         // The simple query protocol always returns results in text format.
         encoding::encode_dataframe_response(df, &Format::UnifiedText, &select_ctx).await
+    }
+
+    /// Answer an `EXPLAIN`/`DESCRIBE`, planning it on the same context the query it
+    /// is about would run on — the plan reported is worthless if it was built
+    /// against a different set of registered relations than the read path uses.
+    async fn handle_introspection(
+        &self,
+        stmt: &crate::sqlparser::ast::Statement,
+        format: &Format,
+    ) -> PgWireResult<Response> {
+        let is_catalog = self.is_catalog_query(stmt);
+        let ctx = if is_catalog {
+            &self.local_ctx
+        } else {
+            &self.session_ctx
+        };
+
+        let (plan, err_ctx) =
+            introspection::plan_introspection(ctx, stmt, is_catalog, &self.catalog).await?;
+        introspection::execute_introspection(ctx, &plan, format, &err_ctx).await
     }
 }
 
@@ -651,12 +745,16 @@ mod tests {
 
     /// Every statement the gap analysis pins to the classification rejection point
     /// must be named in the error, so a client can tell which command was refused.
+    ///
+    /// `SET` and `SHOW` are deliberately absent: they classify as
+    /// [`QueryType::SessionParam`] and are answered, or refused by *parameter* name,
+    /// in [`session_params`] — which is more specific than a command label could be.
+    /// `EXPLAIN` and `DESCRIBE` are absent for the same reason: they classify as
+    /// [`QueryType::Explain`] and are answered, or refused by *form*, in
+    /// [`introspection`].
     #[test]
     fn rejected_commands_are_named_in_the_error() {
         for (sql, want) in [
-            ("SET client_encoding = 'UTF8'", "SET"),
-            ("SHOW client_encoding", "SHOW"),
-            ("EXPLAIN SELECT 1", "EXPLAIN"),
             ("CREATE SEQUENCE s", "CREATE SEQUENCE"),
             ("CREATE TYPE ty AS ENUM ('a', 'b')", "CREATE TYPE"),
             ("CREATE DOMAIN d AS INTEGER", "CREATE DOMAIN"),
@@ -668,6 +766,84 @@ mod tests {
         ] {
             assert_eq!(label_of(sql), want, "wrong label for `{sql}`");
         }
+    }
+
+    /// The three statements must reach [`QueryType::SessionParam`] — including
+    /// `RESET`, which no parser has and which
+    /// [`parser::parse_sql`] rewrites to the `SET … TO DEFAULT` PostgreSQL defines
+    /// it to be. If any of them fell back to `Other` it would be refused by name
+    /// again, silently undoing the routing.
+    #[test]
+    fn session_parameter_statements_are_routed_not_refused() {
+        for sql in [
+            "SET client_encoding = 'UTF8'",
+            "SET TIME ZONE 'UTC'",
+            "SET LOCAL application_name = 'x'",
+            "SET ROLE readonly",
+            "SHOW client_encoding",
+            "SHOW ALL",
+            "SHOW TRANSACTION ISOLATION LEVEL",
+            "RESET application_name",
+            "RESET ALL",
+        ] {
+            let stmt = parser::parse_sql(sql)
+                .unwrap_or_else(|e| panic!("`{sql}` should parse: {e}"))
+                .into_iter()
+                .next()
+                .unwrap();
+            assert_eq!(
+                query_router::classify_statement(&stmt),
+                QueryType::SessionParam,
+                "`{sql}` should route to the session-parameter handler"
+            );
+        }
+    }
+
+    /// A session parameter is neither shipped to a shard nor planned, so it must
+    /// stay off both those paths: the write path would render it back to SQL and
+    /// send it to DuckDB, and `wants_verbatim_ast` would re-parse it for no reason.
+    #[test]
+    fn a_session_parameter_is_not_a_write() {
+        assert!(!QueryType::SessionParam.is_write_path());
+        assert!(!QueryType::SessionParam.wants_verbatim_ast());
+    }
+
+    /// Every spelling of the two introspection commands must reach
+    /// [`QueryType::Explain`], including the `DESC` abbreviation and the
+    /// `DESCRIBE <query>` form, which parses to a different node than
+    /// `DESCRIBE <relation>`. One falling back to `Other` would be refused by name
+    /// instead of answered.
+    #[test]
+    fn introspection_statements_are_routed_not_refused() {
+        for sql in [
+            "EXPLAIN SELECT 1",
+            "EXPLAIN ANALYZE SELECT 1",
+            "EXPLAIN (ANALYZE, VERBOSE) SELECT 1",
+            "DESCRIBE t",
+            "DESC t",
+            "DESCRIBE SELECT 1",
+        ] {
+            let stmt = parser::parse_sql(sql)
+                .unwrap_or_else(|e| panic!("`{sql}` should parse: {e}"))
+                .into_iter()
+                .next()
+                .unwrap();
+            assert_eq!(
+                query_router::classify_statement(&stmt),
+                QueryType::Explain,
+                "`{sql}` should route to the introspection handler"
+            );
+        }
+    }
+
+    /// An `EXPLAIN` is planned in the coordinator and never rendered back to SQL, so
+    /// it must stay off the write path — which would ship it to a shard — while still
+    /// being rewritten by the pg-compatibility parser, exactly as the query inside it
+    /// would be on its own.
+    #[test]
+    fn an_explain_is_a_read_not_a_write() {
+        assert!(!QueryType::Explain.is_write_path());
+        assert!(!QueryType::Explain.wants_verbatim_ast());
     }
 
     #[test]

@@ -19,6 +19,12 @@ pub struct DuckDbScanPlanBytes {
     pub projection: Option<Vec<usize>>,
     /// Pushed-down filter predicates as SQL fragments.
     pub filter_exprs: Vec<String>,
+    /// The most rows the shard needs to return, when the query's `LIMIT` could be pushed
+    /// down to it. A hint: the coordinator applies the real limit over the union of the
+    /// shards' answers, so a shard returning more rows costs bandwidth and not
+    /// correctness.
+    #[serde(default)]
+    pub limit: Option<usize>,
     /// Executor the scan should be routed to, if pinned to a specific node.
     #[serde(default)]
     pub target_executor_id: Option<String>,

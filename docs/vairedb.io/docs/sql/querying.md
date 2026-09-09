@@ -132,9 +132,17 @@ SELECT name, email FROM foo_table WHERE name = 'Bob';
 SELECT name, email FROM foo_table WHERE name IN ('Bob', 'Alice');
 ```
 
-Filters, projections, aggregations, and joins are optimized and distributed by
-Ballista and DataFusion. See
-[Query Processing](../concepts/query-processing.md) for the full read path.
+Aggregations and joins are planned and distributed by Ballista and DataFusion.
+Projections, and the filters both engines read identically, are also carried into each
+shard's own scan so a shard sends back the rows you asked for rather than its whole
+table — the four queries above all qualify. A `LIMIT` with no filter under it becomes a
+per-shard cap the same way.
+
+None of that changes an answer. The coordinator re-applies every pushed filter and the
+real `LIMIT` over the union of the shards' rows, so a filter it cannot safely delegate —
+a function call, a cast, arithmetic — simply runs on the coordinator instead. See
+[Query Processing](../concepts/query-processing.md#query-optimization) for the read path
+and the shapes that qualify.
 
 !!! warning "Cross-shard read snapshots"
     A query that touches multiple shards may read different shards at different

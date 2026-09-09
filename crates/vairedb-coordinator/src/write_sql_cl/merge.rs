@@ -9,7 +9,7 @@
 
 use crate::sqlparser::ast::{
     AssignmentTarget, BinaryOperator, Expr, Ident, MergeAction, MergeClauseKind, MergeInsertKind,
-    ObjectName, ObjectNamePart, Query, SetExpr, Statement, TableAlias, TableFactor, Values,
+    ObjectName, ObjectNamePart, Parens, Query, SetExpr, Statement, TableAlias, TableFactor, Values,
 };
 use datafusion::scalar::ScalarValue;
 
@@ -186,6 +186,7 @@ fn alias_relation_by_its_own_name(factor: &mut TableFactor) {
             explicit: true,
             name: ident.clone(),
             columns: Vec::new(),
+            at: None,
         });
     }
 }
@@ -611,7 +612,7 @@ pub fn split_merge_by_rows(stmt: &Statement, row_indices: &[usize]) -> Option<St
     };
     let values = merge_values(stmt)?;
 
-    let selected: Vec<Vec<Expr>> = row_indices
+    let selected: Vec<Parens<Vec<Expr>>> = row_indices
         .iter()
         .filter_map(|&idx| values.rows.get(idx).cloned())
         .collect();

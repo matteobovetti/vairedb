@@ -21,6 +21,7 @@ pub use datafusion::sql::sqlparser;
 pub mod anonymization;
 pub mod catalog;
 pub mod channel_pool;
+pub mod column_types;
 pub mod config;
 pub mod error;
 pub mod node_service;

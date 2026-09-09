@@ -15,6 +15,7 @@ use vairedb_common::proto::vairedb::v1::{
 };
 
 use crate::catalog::{MetadataCatalog, NodeMeta, NodeState};
+use crate::error::CoordinatorError;
 use crate::util::now_unix_secs;
 
 /// gRPC service handling core-node lifecycle: registration, heartbeat streaming,
@@ -100,9 +101,28 @@ impl NodeService for NodeServiceImpl {
             while let Ok(Some(hb)) = stream.message().await {
                 tracing::trace!("heartbeat from node {}", hb.node_id);
 
-                if let Err(e) = catalog.update_node_heartbeat(&hb.node_id) {
-                    tracing::warn!("failed to update heartbeat for {}: {}", hb.node_id, e);
-                }
+                // A heartbeat for a node the catalog has never seen is not a lost
+                // update to shrug at: the node is running, and this coordinator cannot
+                // place a shard on it, so `CREATE TABLE` fails for want of nodes while
+                // the cluster is in fact whole. Answering `REGISTER` is what lets the
+                // node repair it, and it is the only recovery path when the stream
+                // itself is healthy — which is what a coordinator started over a fresh
+                // catalog sees from every core that never stopped.
+                let action = match catalog.update_node_heartbeat(&hb.node_id) {
+                    Ok(()) => HeartbeatAction::None,
+                    Err(CoordinatorError::NodeNotFound(_)) => {
+                        tracing::warn!(
+                            node_id = %hb.node_id,
+                            "heartbeat from a node this coordinator has no record of, \
+                             asking it to register",
+                        );
+                        HeartbeatAction::Register
+                    }
+                    Err(e) => {
+                        tracing::warn!("failed to update heartbeat for {}: {}", hb.node_id, e);
+                        HeartbeatAction::None
+                    }
+                };
 
                 let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
 
@@ -111,7 +131,7 @@ impl NodeService for NodeServiceImpl {
                         seconds: now.as_secs() as i64,
                         nanos: now.subsec_nanos() as i32,
                     }),
-                    action: HeartbeatAction::None.into(),
+                    action: action.into(),
                 };
 
                 if tx.send(Ok(response)).await.is_err() {

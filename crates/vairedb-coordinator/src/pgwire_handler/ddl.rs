@@ -36,7 +36,8 @@ use crate::pgwire_handler::query_router;
 use crate::pgwire_handler::schemas;
 use crate::pgwire_handler::session::SessionState;
 use crate::pgwire_handler::table_meta_ops::{
-    self, apply_alter_operation, parse_create_table_config, reject_unsupported_create_table_form,
+    self, apply_alter_operation, parse_create_table_config, reject_unserviceable_column_types,
+    reject_unsupported_create_table_form,
 };
 use crate::scheduler;
 use crate::util::{now_unix_secs, shard_table_name};
@@ -96,6 +97,9 @@ impl VaireDbQueryHandler {
         // derived must not reach `put_table`, or a half-created table outlives the
         // error the client sees.
         reject_unsupported_create_table_form(create)?;
+        // Likewise before the catalog: a column whose type cannot be read back must not
+        // become a table that accepts rows it can never return.
+        reject_unserviceable_column_types(create)?;
 
         let table_name = query_router::canonical_table_name(&create.name).ok_or_else(|| {
             make_vdb_error(
@@ -963,25 +967,41 @@ impl VaireDbQueryHandler {
         failed_nodes
     }
 
-    /// Drop the table from the local DataFusion session so a later re-create or
-    /// schema change re-registers it fresh. Logged, never fatal.
+    /// Drop the table from both DataFusion sessions so a later re-create or schema
+    /// change re-registers it fresh. Logged, never fatal.
+    ///
+    /// Both, because both hold a registration: the distributed context plans the reads
+    /// and the local one is what `pg_class` is answered from. Leaving the local one
+    /// behind would keep a dropped table visible to every client that lists tables.
     fn deregister_table_after_ddl(&self, table_name: &str) {
-        let table_ref = datafusion::common::TableReference::bare(table_name.to_string());
-        if let Err(e) = self.session_ctx.deregister_table(table_ref) {
-            tracing::warn!(
-                "failed to deregister table '{}' from DataFusion session: {}",
-                table_name,
-                e
-            );
+        for (label, ctx) in [
+            ("distributed", &self.session_ctx),
+            ("local", &self.local_ctx),
+        ] {
+            let table_ref = datafusion::common::TableReference::bare(table_name.to_string());
+            if let Err(e) = ctx.deregister_table(table_ref) {
+                tracing::warn!(
+                    "failed to deregister table '{}' from the {} DataFusion session: {}",
+                    table_name,
+                    label,
+                    e
+                );
+            }
         }
     }
 
-    /// Refresh the Ballista/DataFusion catalog view after a successful DDL so
-    /// distributed reads see the new schema. Logged, never fatal.
+    /// Refresh the DataFusion catalog view after a successful DDL so reads see the new
+    /// schema and introspection sees the new table. Logged, never fatal.
     fn refresh_catalog_after_ddl(&self, op_label: &str) {
-        if let Err(e) = scheduler::refresh_ballista_catalog_tables(&self.session_ctx, &self.catalog)
-        {
-            tracing::warn!("failed to refresh DataFusion catalog after {op_label}: {e}");
+        for (label, ctx) in [
+            ("distributed", &self.session_ctx),
+            ("local", &self.local_ctx),
+        ] {
+            if let Err(e) = scheduler::refresh_catalog_tables(ctx, &self.catalog) {
+                tracing::warn!(
+                    "failed to refresh the {label} DataFusion catalog after {op_label}: {e}"
+                );
+            }
         }
     }
 }

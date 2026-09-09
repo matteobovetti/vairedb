@@ -29,6 +29,7 @@ use crate::pgwire_handler::error_enrichment::{
     ErrorContext, enrich_coordinator_error, make_vdb_error,
 };
 use crate::pgwire_handler::handler::VaireDbQueryHandler;
+use crate::pgwire_handler::introspection;
 use crate::pgwire_handler::query_router::{self, QueryType, canonicalize_ident};
 use crate::pgwire_handler::session::{BufferedWrite, SessionState, Transaction, TransactionStatus};
 use crate::sqlparser::ast::{
@@ -376,6 +377,30 @@ impl VaireDbQueryHandler {
                 VdbErrorCode::FeatureNotSupported,
                 "schema DDL is not supported inside a transaction block: the namespace is written to the coordinator catalog immediately, so ROLLBACK could not undo it. Run the statement outside a transaction block",
             )),
+            // A runtime parameter is allowed inside a block, as in PostgreSQL: it
+            // touches no relation, so there is nothing for the block's buffered
+            // writes to be inconsistent with. The one form whose scope *is* the
+            // block, `SET LOCAL`, is refused in
+            // [`crate::pgwire_handler::session_params`] rather than here, because it
+            // has to be refused outside a block too.
+            QueryType::SessionParam => Ok(()),
+            // An `EXPLAIN` inherits its inner query's rule. The non-`ANALYZE` form
+            // runs nothing, but it is still *planned* against a database that does
+            // not hold the block's buffered writes, so the plan it prints — the
+            // scans chosen, the shards involved — is a plan for the wrong state; the
+            // `ANALYZE` form additionally runs the query and would return the rows a
+            // refused SELECT would have. A `DESCRIBE <relation>` reports no inner
+            // query and is allowed: only DDL could change a relation's shape, and DDL
+            // cannot have run inside the block.
+            QueryType::Explain => {
+                let written = introspection::explained_query(stmt)
+                    .and_then(query_router::extract_select_table_name)
+                    .is_some_and(|table| txn.has_buffered_writes_for(&table));
+                if written {
+                    return Err(reads_a_buffered_table());
+                }
+                Ok(())
+            }
             // Transaction control never reaches here, and an unsupported
             // statement is rejected by name a moment later either way.
             QueryType::TransactionControl | QueryType::Other => Ok(()),

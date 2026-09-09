@@ -13,6 +13,7 @@ fn encode_decode_roundtrip_preserves_all_fields() {
         schema_ipc: vec![1, 2, 3, 4, 5],
         projection: Some(vec![0, 2, 5]),
         filter_exprs: vec!["id > 10".to_string(), "status = 'active'".to_string()],
+        limit: Some(50),
         target_executor_id: Some("exec-1".to_string()),
         replica_executor_ids: vec!["exec-2".to_string()],
     };
@@ -23,6 +24,7 @@ fn encode_decode_roundtrip_preserves_all_fields() {
     assert_eq!(decoded.schema_ipc, vec![1, 2, 3, 4, 5]);
     assert_eq!(decoded.projection, Some(vec![0, 2, 5]));
     assert_eq!(decoded.filter_exprs, vec!["id > 10", "status = 'active'"]);
+    assert_eq!(decoded.limit, Some(50));
     assert_eq!(decoded.target_executor_id.as_deref(), Some("exec-1"));
     assert_eq!(decoded.replica_executor_ids, vec!["exec-2"]);
 }
@@ -34,6 +36,7 @@ fn encode_produces_expected_json_shape() {
         schema_ipc: vec![42],
         projection: Some(vec![1, 3]),
         filter_exprs: vec!["col = 'value'".to_string()],
+        limit: None,
         target_executor_id: None,
         replica_executor_ids: vec![],
     };
@@ -48,7 +51,7 @@ fn encode_produces_expected_json_shape() {
 
 #[test]
 fn decode_backfills_optional_fields_when_absent() {
-    // target_executor_id and replica_executor_ids are #[serde(default)]:
+    // target_executor_id, replica_executor_ids and limit are #[serde(default)]:
     // older payloads that predate those fields must still decode.
     let legacy = br#"{
         "shard_table_name": "s0",
@@ -62,6 +65,10 @@ fn decode_backfills_optional_fields_when_absent() {
     assert_eq!(decoded.shard_table_name, "s0");
     assert!(decoded.target_executor_id.is_none());
     assert!(decoded.replica_executor_ids.is_empty());
+    assert!(
+        decoded.limit.is_none(),
+        "a payload with no limit must scan the whole shard, not zero rows"
+    );
 }
 
 #[test]

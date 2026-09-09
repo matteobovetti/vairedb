@@ -1,18 +1,22 @@
-//! `COPY ... TO/FROM` a server-side CSV file: the bulk import/export path.
+//! `COPY ... TO/FROM`: the bulk import/export path, to a server-side CSV file or
+//! to the client over the copy sub-protocol.
 //!
-//! Both directions are built from parts that already exist, which is what keeps
+//! Every direction is built from parts that already exist, which is what keeps
 //! them consistent with ordinary statements:
 //!
-//! * `COPY <table|query> TO '<file>'` runs the source on the read path — so it
-//!   gathers every shard's rows through the same planner a `SELECT` uses — and
-//!   writes the collected batches out as CSV.
-//! * `COPY <table> FROM '<file>'` reads the CSV into record batches and hands them
-//!   to the INSERT lane, so every row is routed by its shard key, split per shard,
-//!   and counted exactly like a client `INSERT ... VALUES` would be.
+//! * `COPY <table|query> TO '<file>' | STDOUT` runs the source on the read path —
+//!   so it gathers every shard's rows through the same planner a `SELECT` uses —
+//!   and emits the collected batches as CSV.
+//! * `COPY <table> FROM '<file>' | STDIN` decodes the CSV into record batches and
+//!   hands them to the INSERT lane, so every row is routed by its shard key, split
+//!   per shard, and counted exactly like a client `INSERT ... VALUES` would be.
 //!
-//! The file is on the **coordinator's** filesystem, not the client's: this is
-//! PostgreSQL's server-side `COPY`, and `COPY ... FROM STDIN`/`TO STDOUT` (the
-//! client-side forms, which need the copy sub-protocol) are refused by name.
+//! The two `FROM` forms differ only in who supplies the bytes: both feed one
+//! [`crate::pgwire_handler::copy_stream::CopySink`], which is what makes a file
+//! import and a `\copy` import land identically. A named file is on the
+//! **coordinator's** filesystem, not the client's — that is PostgreSQL's
+//! server-side `COPY` — while `STDIN`/`STDOUT` are the client's own, driven by the
+//! copy sub-protocol in [`crate::pgwire_handler::copy_stream`].
 //!
 //! Only CSV is accepted, and it must be asked for explicitly: PostgreSQL's default
 //! `TEXT` format is a different encoding, and silently writing CSV where a client
@@ -20,16 +24,22 @@
 
 use std::fs::File;
 use std::io::BufWriter;
+use std::sync::Arc;
 
+use bytes::Bytes;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::csv::WriterBuilder;
-use datafusion::prelude::CsvReadOptions;
-use pgwire::api::results::{Response, Tag};
+use datafusion::arrow::datatypes::SchemaRef;
+use pgwire::api::results::{CopyResponse, Response, Tag};
 use pgwire::error::PgWireResult;
+use pgwire::messages::copy::CopyData;
+use tokio::io::AsyncReadExt;
 
 use vairedb_common::proto::vairedb::v1::VdbErrorCode;
 
+use crate::catalog::MetadataCatalog;
 use crate::error::CoordinatorError;
+use crate::pgwire_handler::copy_stream::CopySink;
 use crate::pgwire_handler::error_enrichment::{
     ErrorContext, enrich_coordinator_error, make_vdb_error,
 };
@@ -53,9 +63,9 @@ use crate::write_sql_cl;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct CsvDialect {
     /// `HEADER`: on export, write the column names first; on import, read them.
-    header: bool,
-    delimiter: u8,
-    quote: u8,
+    pub(super) header: bool,
+    pub(super) delimiter: u8,
+    pub(super) quote: u8,
 }
 
 impl Default for CsvDialect {
@@ -77,13 +87,26 @@ enum CopyOutSource {
     Query(Box<Query>),
 }
 
+/// Who supplies (or receives) a COPY's bytes.
+///
+/// The distinction is *only* about the transport: the CSV either side reads and
+/// writes is the same CSV, decoded by the same sink and rendered by the same
+/// writer, so a file and a `\copy` cannot disagree about what a row means.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CopyEndpoint {
+    /// A path on the coordinator's own filesystem — PostgreSQL's server-side form.
+    File(String),
+    /// The client, over the copy sub-protocol (`STDIN`/`STDOUT`).
+    Client,
+}
+
 /// A validated COPY: everything decidable from the statement alone is settled
 /// here, so the I/O steps have no rules left to apply.
 #[derive(Debug, Clone, PartialEq)]
 enum CopyPlan {
     Out {
         source: CopyOutSource,
-        path: String,
+        endpoint: CopyEndpoint,
         dialect: CsvDialect,
     },
     In {
@@ -91,53 +114,65 @@ enum CopyPlan {
         /// The columns the file's fields map onto, canonical. Empty means "decide
         /// from the file's header, or the table's leading columns".
         columns: Vec<String>,
-        path: String,
+        endpoint: CopyEndpoint,
         dialect: CsvDialect,
     },
 }
 
+/// Bytes read from a file per `COPY ... FROM '<file>'` step.
+///
+/// The sink buffers rows, not bytes, so this only bounds how much of the file is
+/// in flight at once; it is a read size, chosen to be a few filesystem blocks.
+const FILE_CHUNK_BYTES: usize = 64 * 1024;
+
 impl VaireDbQueryHandler {
-    /// Run a `COPY`, exporting to or importing from a CSV file on the coordinator.
+    /// Run a `COPY`, in whichever of the four directions the statement named.
     ///
-    /// Returns PostgreSQL's `COPY <n>` tag, counting the rows written to the file
-    /// or to the table.
+    /// Three of them answer with PostgreSQL's `COPY <n>` tag straight away. The
+    /// fourth, `FROM STDIN`, cannot: the rows have not been sent yet, so it answers
+    /// with `CopyInResponse` and the tag is sent by
+    /// [`crate::pgwire_handler::copy_stream`] once the client says it is done.
     pub(super) async fn handle_copy(
         &self,
         stmt: &Statement,
         session: &SessionState,
     ) -> PgWireResult<Response> {
-        let rows = match plan_copy(stmt)? {
+        match plan_copy(stmt)? {
             CopyPlan::Out {
                 source,
-                path,
+                endpoint,
                 dialect,
-            } => self.copy_to_file(&source, &path, &dialect).await?,
+            } => self.copy_out(&source, &endpoint, &dialect).await,
             CopyPlan::In {
                 table,
                 columns,
-                path,
+                endpoint,
                 dialect,
             } => {
-                self.copy_from_file(&table, &columns, &path, &dialect, session)
-                    .await?
+                let sink = self.open_copy_sink(&table, &columns, &dialect).await?;
+                match endpoint {
+                    CopyEndpoint::File(path) => {
+                        let rows = self.copy_from_file(sink, &path, session).await?;
+                        Ok(Response::Execution(
+                            Tag::new("COPY").with_rows(rows as usize),
+                        ))
+                    }
+                    CopyEndpoint::Client => Ok(begin_copy_from_client(sink, session).await),
+                }
             }
-        };
-
-        Ok(Response::Execution(
-            Tag::new("COPY").with_rows(rows as usize),
-        ))
+        }
     }
 
-    /// Export a table or query to a CSV file, returning the number of rows written.
+    /// Export a table or query, to a file on the coordinator or to the client.
     ///
-    /// The source runs on the read path, which is what makes the export complete:
-    /// gathering the shards is the planner's job, not this function's.
-    async fn copy_to_file(
+    /// The source runs on the read path either way, which is what makes the export
+    /// complete: gathering the shards is the planner's job, not this function's.
+    async fn copy_out(
         &self,
         source: &CopyOutSource,
-        path: &str,
+        endpoint: &CopyEndpoint,
         dialect: &CsvDialect,
-    ) -> PgWireResult<u64> {
+    ) -> PgWireResult<Response> {
         let query = match source {
             CopyOutSource::Table { name, columns } => {
                 // Reported before the query is planned so a missing table is a
@@ -157,41 +192,51 @@ impl VaireDbQueryHandler {
             CopyOutSource::Query(query) => Statement::Query(query.clone()),
         };
 
-        let (_schema, batches) = self.collect_query_rows(&query, &[]).await?;
-        let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        let (schema, batches) = self.collect_query_rows(&query, &[]).await?;
 
-        write_csv_file(path.to_string(), batches, dialect.clone()).await?;
-        Ok(rows as u64)
+        match endpoint {
+            CopyEndpoint::File(path) => {
+                let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+                write_csv_file(path.clone(), batches, dialect.clone()).await?;
+                Ok(Response::Execution(Tag::new("COPY").with_rows(rows)))
+            }
+            CopyEndpoint::Client => {
+                let columns = schema.fields().len();
+                let chunks = csv_row_messages(&schema, &batches, dialect)?;
+                // Format 0 is the textual one, which is what CSV is. pgwire drives
+                // the rest of the exchange — the `CopyOutResponse` header, the
+                // `CopyDone`, and the `COPY n` tag it derives from the stream.
+                Ok(Response::CopyOut(CopyResponse::new(
+                    0,
+                    columns,
+                    futures::stream::iter(chunks.into_iter().map(Ok)),
+                )))
+            }
+        }
     }
 
-    /// Import a CSV file into a table, returning the number of rows written.
-    ///
-    /// The rows go through the INSERT lane, so each is routed by its shard key and
-    /// the count is the number actually shipped. Like any multi-statement write,
-    /// the whole file is planned before any of it ships: a file with a row that
-    /// cannot be routed is refused with nothing written.
-    async fn copy_from_file(
+    async fn open_copy_sink(
         &self,
         table: &str,
         columns: &[String],
-        path: &str,
         dialect: &CsvDialect,
+    ) -> PgWireResult<CopySink> {
+        open_copy_sink(&self.catalog, table, columns, dialect)
+    }
+
+    /// Feed a file on the coordinator's disk to `sink`, returning the rows written.
+    ///
+    /// Read in chunks rather than whole: a bulk import is as large as the client's
+    /// file, and the sink ships a batch at a time, so nothing here needs the file
+    /// to fit in memory.
+    async fn copy_from_file(
+        &self,
+        mut sink: CopySink,
+        path: &str,
         session: &SessionState,
     ) -> PgWireResult<u64> {
-        let ctx = ErrorContext::for_table(table);
-        let table_meta = self
-            .catalog
-            .get_table(table)
-            .map_err(|e| enrich_coordinator_error(&e, &ctx, &self.catalog))?
-            .ok_or_else(|| {
-                let err = CoordinatorError::TableNotFound(table.to_string());
-                enrich_coordinator_error(&err, &ctx, &self.catalog)
-            })?;
-
-        // The reader resolves the path as an object-store listing, which yields an
-        // empty schema for a path that matches nothing instead of failing. Checked
-        // here so a typo'd path is a file error rather than an import that reports
-        // success having written nothing.
+        // Checked before opening so that a directory — which opens fine and reads
+        // as an error only later — is reported as what it is.
         let metadata = std::fs::metadata(path).map_err(|e| file_error("read", path, &e))?;
         if !metadata.is_file() {
             return Err(make_vdb_error(
@@ -200,82 +245,152 @@ impl VaireDbQueryHandler {
             ));
         }
 
-        let options = CsvReadOptions::new()
-            .has_header(dialect.header)
-            .delimiter(dialect.delimiter)
-            .quote(dialect.quote)
-            // The path names one file, so its extension is the client's business:
-            // the default `.csv` filter would refuse `COPY ... FROM '/tmp/export'`.
-            .file_extension("");
-        // `local_ctx`, not `session_ctx`: the file is on the coordinator's disk and
-        // `session_ctx` is upgraded for Ballista, so it would plan the scan as a
-        // distributed one and hand it to an executor — a core node, where the path
-        // does not exist. The rows are re-emitted as literals afterwards anyway, so
-        // reading them locally costs nothing distributed.
-        let frame = self
-            .local_ctx
-            .read_csv(path, options)
+        let mut file = tokio::fs::File::open(path)
             .await
             .map_err(|e| file_error("read", path, &e))?;
-        let schema = frame.schema().as_arrow().clone();
-        if schema.fields().is_empty() {
-            return Err(make_vdb_error(
-                VdbErrorCode::SqlSyntaxError,
-                format!("COPY could not find any columns in \"{path}\": the file is empty"),
-            ));
-        }
-        let batches = frame
-            .collect()
-            .await
-            .map_err(|e| file_error("read", path, &e))?;
-
-        let table_columns: Vec<String> =
-            table_meta.columns.iter().map(|c| c.name.clone()).collect();
-        let target = target_columns(
-            columns,
-            &schema
-                .fields()
-                .iter()
-                .map(|f| f.name().clone())
-                .collect::<Vec<_>>(),
-            &table_columns,
-            dialect.header,
-        )?;
-
-        for column in &target {
-            if !table_columns.contains(column) {
-                return Err(make_vdb_error(
-                    VdbErrorCode::ColumnNotFound,
-                    format!("column \"{column}\" does not exist in table \"{table}\""),
-                ));
+        let mut buffer = vec![0u8; FILE_CHUNK_BYTES];
+        loop {
+            let read = file
+                .read(&mut buffer)
+                .await
+                .map_err(|e| file_error("read", path, &e))?;
+            if read == 0 {
+                break;
             }
+            sink.push(self, session, &buffer[..read]).await?;
         }
-        // Every row is placed by hashing its shard key, so a file that does not
-        // carry that column cannot be imported — refused before anything is read
-        // into the table rather than routed somewhere arbitrary.
-        if !target.contains(&table_meta.shard_key) {
-            return Err(make_vdb_error(
-                VdbErrorCode::SqlSyntaxError,
-                format!(
-                    "COPY ... FROM must include the shard key \"{}\": every row is routed by it. Add the column to the file, or name the columns in COPY {table} (...) FROM",
-                    table_meta.shard_key
-                ),
-            ));
-        }
-
-        let column_refs: Vec<&str> = target.iter().map(String::as_str).collect();
-        let template = write_sql_cl::insert_template(table, &column_refs)
-            .map_err(|msg| make_vdb_error(VdbErrorCode::SqlSyntaxError, msg))?;
-        let statements = write_sql_cl::insert_statements_from_batches(
-            &template,
-            &batches,
-            write_sql_cl::ROWS_PER_STATEMENT,
-        )
-        .map_err(|msg| make_vdb_error(VdbErrorCode::FeatureNotSupported, msg))?;
-
-        self.write_row_statements(&statements, &[], session, table, "COPY")
-            .await
+        sink.finish(self, session).await
     }
+}
+
+/// The sink a `COPY ... FROM` feeds, with everything decidable before a byte
+/// arrives already decided: the table exists, and a column list the statement
+/// spelled out names real columns and carries the shard key.
+fn open_copy_sink(
+    catalog: &Arc<MetadataCatalog>,
+    table: &str,
+    columns: &[String],
+    dialect: &CsvDialect,
+) -> PgWireResult<CopySink> {
+    let ctx = ErrorContext::for_table(table);
+    let table_meta = catalog
+        .get_table(table)
+        .map_err(|e| enrich_coordinator_error(&e, &ctx, catalog))?
+        .ok_or_else(|| {
+            let err = CoordinatorError::TableNotFound(table.to_string());
+            enrich_coordinator_error(&err, &ctx, catalog)
+        })?;
+
+    CopySink::open(table, columns, dialect, &table_meta)
+}
+
+/// Decide, at Parse time, whether a `COPY ... FROM STDIN` could ever work.
+///
+/// The refusal has to land here rather than at Execute, and the reason is the
+/// client's own book-keeping rather than politeness. A driver asks for a streaming
+/// import by preparing the statement, then binding and executing it, and it queues
+/// the abort for that copy — a `CopyFail` and a second `Sync` — the moment the
+/// request object is dropped. If the refusal comes from Execute, the first `Sync`
+/// has already been answered with `ReadyForQuery`, so the abort's `Sync` draws a
+/// second one; the client counts that against its *next* request and every later
+/// reply on the connection is attributed to the wrong query. Refusing while the
+/// statement is still being prepared means no copy is ever begun, nothing is
+/// queued to abort, and the connection is left as it was — which is also what a
+/// bulk loader wants, since it learns the copy is hopeless before uploading a
+/// gigabyte of rows for it.
+///
+/// Only `FROM STDIN` is checked. The other three directions do not invite the
+/// client to send anything, so nothing about them is riding on when they refuse,
+/// and Execute is where they stay.
+pub(super) fn precheck_copy_from_stdin(
+    stmt: &Statement,
+    catalog: &Arc<MetadataCatalog>,
+) -> PgWireResult<()> {
+    if let CopyPlan::In {
+        table,
+        columns,
+        endpoint: CopyEndpoint::Client,
+        dialect,
+    } = plan_copy(stmt)?
+    {
+        open_copy_sink(catalog, &table, &columns, &dialect)?;
+    }
+    Ok(())
+}
+
+/// Hand `sink` to the connection and tell the client to start sending.
+///
+/// Nothing is read here: the rows arrive as `CopyData` messages, which pgwire
+/// routes to [`crate::pgwire_handler::copy_stream`] for as long as the connection
+/// is in copy mode. The sink lives in the session for exactly that reason — the
+/// handler is one `Arc` shared by every connection, and this state belongs to one.
+async fn begin_copy_from_client(sink: CopySink, session: &SessionState) -> Response {
+    let columns = sink.advertised_columns();
+    *session.copy_in().await = Some(sink);
+    // Format 0 is text, which is what CSV is; the stream is unused for an inbound
+    // copy — pgwire only reads the format and column count off it.
+    Response::CopyIn(CopyResponse::new(0, columns, futures::stream::empty()))
+}
+
+/// The `CopyData` messages a `COPY ... TO STDOUT` sends: one per row, as
+/// PostgreSQL sends them.
+///
+/// One message per row is not just idiomatic, it is what makes the tag right:
+/// pgwire counts non-empty `CopyData` messages to build `COPY n`. That is also why
+/// a requested header rides along in the *first row's* message instead of getting
+/// one of its own — a message of its own would be counted as a row.
+///
+/// The one case that cannot come out right is a header over an empty result: the
+/// header still has to be sent, and any message carrying it is counted, so the tag
+/// reads `COPY 1` where PostgreSQL says `COPY 0`. Sending the header is the half
+/// worth keeping — a client that reads the output back with `HEADER` needs it, and
+/// a count of 1 on a transfer the client can see is empty misleads nobody.
+fn csv_row_messages(
+    schema: &SchemaRef,
+    batches: &[RecordBatch],
+    dialect: &CsvDialect,
+) -> PgWireResult<Vec<CopyData>> {
+    let mut messages = Vec::new();
+    let mut header_pending = dialect.header;
+
+    for batch in batches {
+        for row in 0..batch.num_rows() {
+            let bytes = write_csv_bytes(&batch.slice(row, 1), dialect, header_pending)?;
+            header_pending = false;
+            messages.push(CopyData::new(Bytes::from(bytes)));
+        }
+    }
+
+    if header_pending {
+        let empty = RecordBatch::new_empty(SchemaRef::clone(schema));
+        messages.push(CopyData::new(Bytes::from(write_csv_bytes(
+            &empty, dialect, true,
+        )?)));
+    }
+
+    Ok(messages)
+}
+
+/// One batch rendered as CSV, optionally preceded by the column-name header.
+fn write_csv_bytes(
+    batch: &RecordBatch,
+    dialect: &CsvDialect,
+    header: bool,
+) -> PgWireResult<Vec<u8>> {
+    let mut out = Vec::new();
+    let mut writer = WriterBuilder::new()
+        .with_header(header)
+        .with_delimiter(dialect.delimiter)
+        .with_quote(dialect.quote)
+        .build(&mut out);
+    writer.write(batch).map_err(|e| {
+        make_vdb_error(
+            VdbErrorCode::InternalError,
+            format!("COPY could not render a row as CSV: {e}"),
+        )
+    })?;
+    drop(writer);
+    Ok(out)
 }
 
 /// True for the direction that puts rows into a table, `COPY ... FROM`.
@@ -321,15 +436,24 @@ fn plan_copy(stmt: &Statement) -> PgWireResult<CopyPlan> {
         ));
     };
 
-    let path = copy_file_path(target, *to)?;
+    let endpoint = copy_endpoint(target)?;
     let dialect = csv_dialect(options, legacy_options)?;
 
-    // Inline data belongs to `COPY ... FROM STDIN`, which `copy_file_path` has
-    // already refused; a non-empty `values` here would mean data with nowhere to go.
-    if !values.is_empty() {
+    // `COPY t FROM STDIN ...;` puts the rows after the statement's semicolon, and
+    // the parser reads whatever follows it in the same buffer as inline data. On a
+    // `COPY` that arrived on its own, that is the statement's own trailing newline —
+    // one empty value — which is not data and must not be mistaken for it.
+    //
+    // Anything more than that *is* data in the query string, which no client sends
+    // over the wire protocol: the rows travel as `CopyData` messages, so bytes here
+    // would be silently dropped.
+    if values
+        .iter()
+        .any(|v| v.as_deref().is_none_or(|s| !s.trim().is_empty()))
+    {
         return Err(make_vdb_error(
             VdbErrorCode::FeatureNotSupported,
-            "COPY with inline data is not supported by VaireDB: write the rows to a file on the coordinator and use COPY ... FROM '<file>' (FORMAT CSV), or use INSERT",
+            "COPY with inline data in the query text is not supported by VaireDB: send the rows over the copy protocol with COPY ... FROM STDIN (FORMAT CSV), read them from a file on the coordinator with COPY ... FROM '<file>' (FORMAT CSV), or use INSERT",
         ));
     }
 
@@ -351,7 +475,7 @@ fn plan_copy(stmt: &Statement) -> PgWireResult<CopyPlan> {
         };
         return Ok(CopyPlan::Out {
             source,
-            path,
+            endpoint,
             dialect,
         });
     }
@@ -376,31 +500,23 @@ fn plan_copy(stmt: &Statement) -> PgWireResult<CopyPlan> {
             )
         })?,
         columns: columns.iter().map(canonicalize_ident).collect(),
-        path,
+        endpoint,
         dialect,
     })
 }
 
-/// The server-side file a COPY reads or writes.
+/// Where a COPY's bytes come from or go to.
 ///
-/// `STDIN`/`STDOUT` are the client-side forms: they hand the connection to the
-/// copy sub-protocol, which VaireDB does not drive, so they are refused by name
-/// rather than mistaken for the file form. `PROGRAM` would run a shell command on
-/// the coordinator, which VaireDB does not do at all.
-fn copy_file_path(target: &CopyTarget, to: bool) -> PgWireResult<String> {
+/// `PROGRAM` is the one form still refused: it would run a shell command on the
+/// coordinator, which VaireDB does not do at all — and unlike `STDIN`/`STDOUT`
+/// there is no transport to route it to, only a process to spawn.
+fn copy_endpoint(target: &CopyTarget) -> PgWireResult<CopyEndpoint> {
     match target {
-        CopyTarget::File { filename } => Ok(filename.clone()),
-        CopyTarget::Stdin | CopyTarget::Stdout => Err(make_vdb_error(
-            VdbErrorCode::FeatureNotSupported,
-            format!(
-                "COPY ... {} is not supported by VaireDB: the streaming copy sub-protocol is not implemented. Use a file on the coordinator: COPY ... {} '<file>' (FORMAT CSV)",
-                if to { "TO STDOUT" } else { "FROM STDIN" },
-                if to { "TO" } else { "FROM" }
-            ),
-        )),
+        CopyTarget::File { filename } => Ok(CopyEndpoint::File(filename.clone())),
+        CopyTarget::Stdin | CopyTarget::Stdout => Ok(CopyEndpoint::Client),
         CopyTarget::Program { .. } => Err(make_vdb_error(
             VdbErrorCode::FeatureNotSupported,
-            "COPY ... PROGRAM is not supported by VaireDB: the coordinator does not run shell commands. Use a file on the coordinator: COPY ... '<file>' (FORMAT CSV)",
+            "COPY ... PROGRAM is not supported by VaireDB: the coordinator does not run shell commands. Stream the data instead with COPY ... FROM STDIN / TO STDOUT (FORMAT CSV), or name a file on the coordinator",
         )),
     }
 }
@@ -502,7 +618,7 @@ fn single_byte(option: &str, c: char) -> PgWireResult<u8> {
 /// The statement's own column list wins. Failing that, a file with a header names
 /// its columns, and a file without one is positional against the table's leading
 /// columns — the same rule PostgreSQL applies to `INSERT INTO t VALUES (...)`.
-fn target_columns(
+pub(super) fn target_columns(
     stated: &[String],
     file_fields: &[String],
     table_columns: &[String],
@@ -534,6 +650,43 @@ fn target_columns(
         ));
     }
     Ok(columns)
+}
+
+/// Check that the columns a `COPY ... FROM` is about to write can actually be
+/// written: they exist on the table, and they include the column every row is
+/// placed by.
+///
+/// Both checks are cheap and both are worth making before a byte of data is
+/// accepted, so a client that named the columns hears about a mistake in reply to
+/// the `COPY` itself rather than after uploading a file. When the columns come from
+/// a header instead, the earliest this can run is the first record — which is still
+/// before anything is written.
+pub(super) fn validate_target_columns(
+    table: &str,
+    target: &[String],
+    table_columns: &[String],
+    shard_key: &str,
+) -> PgWireResult<()> {
+    for column in target {
+        if !table_columns.contains(column) {
+            return Err(make_vdb_error(
+                VdbErrorCode::ColumnNotFound,
+                format!("column \"{column}\" does not exist in table \"{table}\""),
+            ));
+        }
+    }
+    // Every row is placed by hashing its shard key, so data that does not carry
+    // that column cannot be imported — refused before anything is read into the
+    // table rather than routed somewhere arbitrary.
+    if !target.iter().any(|c| c == shard_key) {
+        return Err(make_vdb_error(
+            VdbErrorCode::SqlSyntaxError,
+            format!(
+                "COPY ... FROM must include the shard key \"{shard_key}\": every row is routed by it. Add the column to the data, or name the columns in COPY {table} (...) FROM"
+            ),
+        ));
+    }
+    Ok(())
 }
 
 /// `SELECT <columns> FROM <table>` for a `COPY <table> TO`, built as SQL and
@@ -662,7 +815,7 @@ mod tests {
                     name: "orders".to_string(),
                     columns: vec![],
                 },
-                path: "/tmp/orders.csv".to_string(),
+                endpoint: CopyEndpoint::File("/tmp/orders.csv".to_string()),
                 dialect: CsvDialect {
                     header: true,
                     ..Default::default()
@@ -682,7 +835,7 @@ mod tests {
                     name: "orders".to_string(),
                     columns: vec!["id".to_string(), "V".to_string()],
                 },
-                path: "/tmp/o.csv".to_string(),
+                endpoint: CopyEndpoint::File("/tmp/o.csv".to_string()),
                 dialect: CsvDialect::default(),
             }
         );
@@ -695,7 +848,7 @@ mod tests {
             CopyPlan::In {
                 table: "orders".to_string(),
                 columns: vec!["id".to_string(), "v".to_string()],
-                path: "/tmp/orders.csv".to_string(),
+                endpoint: CopyEndpoint::File("/tmp/orders.csv".to_string()),
                 dialect: CsvDialect {
                     header: true,
                     ..Default::default()
@@ -719,21 +872,53 @@ mod tests {
         );
     }
 
-    // The streaming forms need the copy sub-protocol, which VaireDB does not drive.
-    // Refused by name so a client is not left waiting on a stream that never opens.
+    // The streaming forms plan like the file ones — same source, same dialect, only
+    // the endpoint differs. That is the point of splitting the endpoint out: `\copy`
+    // and a server-side file cannot disagree about what the statement meant.
     #[test]
-    fn the_streaming_forms_are_refused_by_name() {
-        // `FROM STDIN` only parses terminated: the parser reads what follows as the
-        // statement's inline data, which is how a client sends it.
-        for (sql, named) in [
-            ("COPY orders TO STDOUT (FORMAT CSV)", "TO STDOUT"),
-            ("COPY orders FROM STDIN (FORMAT CSV);", "FROM STDIN"),
-        ] {
-            let (code, msg) = rejection(sql);
-            assert_eq!(code, "0A000", "`{sql}`");
-            assert!(msg.contains(named), "`{sql}` got: {msg}");
-            assert!(msg.contains("file"), "`{sql}` got: {msg}");
-        }
+    fn copy_to_stdout_plans_an_export_to_the_client() {
+        assert_eq!(
+            plan("COPY orders TO STDOUT (FORMAT CSV, HEADER)"),
+            CopyPlan::Out {
+                source: CopyOutSource::Table {
+                    name: "orders".to_string(),
+                    columns: vec![],
+                },
+                endpoint: CopyEndpoint::Client,
+                dialect: CsvDialect {
+                    header: true,
+                    ..Default::default()
+                },
+            }
+        );
+    }
+
+    // The trailing semicolon is not optional in the test: the parser reads whatever
+    // follows it as the statement's inline data, which for a `COPY ... FROM STDIN`
+    // sent on its own is one empty value — the statement's own newline, not data.
+    #[test]
+    fn copy_from_stdin_plans_an_import_from_the_client() {
+        assert_eq!(
+            plan("COPY orders (id, v) FROM STDIN (FORMAT CSV, HEADER);"),
+            CopyPlan::In {
+                table: "orders".to_string(),
+                columns: vec!["id".to_string(), "v".to_string()],
+                endpoint: CopyEndpoint::Client,
+                dialect: CsvDialect {
+                    header: true,
+                    ..Default::default()
+                },
+            }
+        );
+    }
+
+    // Rows written into the query text are not how the protocol carries them, so
+    // accepting the statement would drop them. Refused rather than half-honoured.
+    #[test]
+    fn inline_data_in_the_query_text_is_refused() {
+        let (code, msg) = rejection("COPY orders FROM STDIN (FORMAT CSV);\n1,x\n2,y\n\\.\n");
+        assert_eq!(code, "0A000");
+        assert!(msg.contains("FROM STDIN"), "got: {msg}");
     }
 
     #[test]
@@ -797,7 +982,7 @@ mod tests {
                     name: "orders".to_string(),
                     columns: vec![],
                 },
-                path: "/tmp/o.csv".to_string(),
+                endpoint: CopyEndpoint::File("/tmp/o.csv".to_string()),
                 dialect: CsvDialect {
                     header: true,
                     ..Default::default()
@@ -1029,6 +1214,232 @@ mod tests {
         assert_eq!(code, "42601");
         assert!(msg.contains("2 column(s)"), "got: {msg}");
         assert!(msg.contains("3 field(s)"), "got: {msg}");
+    }
+
+    // An empty file is an empty import, not a malformed one — PostgreSQL answers
+    // `COPY 0`. It used to be refused for having no columns, which is a file the
+    // client can legitimately produce (an export of an empty table without HEADER).
+    #[tokio::test]
+    async fn an_empty_import_file_writes_no_rows() {
+        let handler = VaireDbQueryHandler::for_tests(false);
+        register(&handler, "orders", &["id", "v"]);
+        let path = write_csv("empty", "");
+
+        let session = SessionState::default();
+        let response = handler
+            .handle_copy(
+                &parse_one(&format!("COPY orders FROM '{path}' (FORMAT CSV, HEADER)")),
+                &session,
+            )
+            .await
+            .expect("an empty file is an empty import");
+        assert_eq!(execution_tag(response), "COPY 0");
+    }
+
+    /// The command tag a completed COPY reports.
+    fn execution_tag(response: Response) -> String {
+        match response {
+            Response::Execution(tag) => pgwire::messages::response::CommandComplete::from(tag).tag,
+            other => panic!("expected a completed COPY, got {other:?}"),
+        }
+    }
+
+    // `FROM STDIN` cannot answer with a row count: the rows have not been sent. It
+    // hands the sink to the connection and tells the client to start.
+    #[tokio::test]
+    async fn copy_from_stdin_hands_the_sink_to_the_connection() {
+        let handler = VaireDbQueryHandler::for_tests(false);
+        register(&handler, "orders", &["id", "v"]);
+
+        let session = SessionState::default();
+        let response = handler
+            .handle_copy(
+                &parse_one("COPY orders FROM STDIN (FORMAT CSV, HEADER);"),
+                &session,
+            )
+            .await
+            .expect("a streaming import opens rather than completing");
+        assert!(
+            matches!(response, Response::CopyIn(_)),
+            "expected a CopyInResponse, got {response:?}"
+        );
+        assert!(
+            session.copy_in().await.is_some(),
+            "the sink must be waiting for the client's CopyData"
+        );
+    }
+
+    // Everything the statement decides is still decided before the client is invited
+    // to send anything — a client should not upload data for a copy that cannot work.
+    #[tokio::test]
+    async fn a_streaming_import_is_refused_before_the_client_sends() {
+        let handler = VaireDbQueryHandler::for_tests(false);
+        register(&handler, "orders", &["id", "v"]);
+
+        let session = SessionState::default();
+        for (sql, expected) in [
+            ("COPY nowhere FROM STDIN (FORMAT CSV);", "42P01"),
+            ("COPY orders (id, nope) FROM STDIN (FORMAT CSV);", "42703"),
+            ("COPY orders (v) FROM STDIN (FORMAT CSV);", "42601"),
+        ] {
+            let err = handler
+                .handle_copy(&parse_one(sql), &session)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("`{sql}` must be refused"));
+            let PgWireError::UserError(info) = err else {
+                panic!("`{sql}`: expected a user-facing error");
+            };
+            assert_eq!(info.code, expected, "`{sql}` got: {}", info.message);
+            assert!(
+                session.copy_in().await.is_none(),
+                "`{sql}` must leave the connection out of copy mode"
+            );
+        }
+    }
+
+    // Those same refusals have to be reachable while the statement is only being
+    // prepared, which is the whole point of the pre-check: a driver that hears
+    // "no" at Parse never begins a copy, so it never queues the abort whose
+    // trailing `Sync` would desynchronize the connection.
+    #[tokio::test]
+    async fn the_precheck_refuses_a_hopeless_streaming_import() {
+        let handler = VaireDbQueryHandler::for_tests(false);
+        register(&handler, "orders", &["id", "v"]);
+
+        for (sql, expected) in [
+            ("COPY nowhere FROM STDIN (FORMAT CSV);", "42P01"),
+            ("COPY orders (id, nope) FROM STDIN (FORMAT CSV);", "42703"),
+            ("COPY orders (v) FROM STDIN (FORMAT CSV);", "42601"),
+            // Not CSV, so there is no import VaireDB could perform at all.
+            ("COPY orders FROM STDIN;", "0A000"),
+        ] {
+            let err = precheck_copy_from_stdin(&parse_one(sql), &handler.catalog)
+                .err()
+                .unwrap_or_else(|| panic!("`{sql}` must be refused at Parse"));
+            let PgWireError::UserError(info) = err else {
+                panic!("`{sql}`: expected a user-facing error");
+            };
+            assert_eq!(info.code, expected, "`{sql}` got: {}", info.message);
+        }
+    }
+
+    // A copy that could work passes, and so does every direction the pre-check is
+    // not about: those never invite the client to send, so nothing rides on when
+    // they refuse and they stay Execute's business — including a missing table,
+    // which the pre-check must not start reporting early for them.
+    #[tokio::test]
+    async fn the_precheck_passes_what_is_not_a_hopeless_streaming_import() {
+        let handler = VaireDbQueryHandler::for_tests(false);
+        register(&handler, "orders", &["id", "v"]);
+
+        for sql in [
+            "COPY orders FROM STDIN (FORMAT CSV, HEADER);",
+            "COPY orders (id) FROM STDIN (FORMAT CSV);",
+            "COPY orders TO STDOUT (FORMAT CSV);",
+            "COPY nowhere TO STDOUT (FORMAT CSV);",
+            "COPY nowhere FROM '/tmp/nowhere.csv' (FORMAT CSV);",
+        ] {
+            precheck_copy_from_stdin(&parse_one(sql), &handler.catalog)
+                .unwrap_or_else(|e| panic!("`{sql}` must not be refused at Parse: {e}"));
+        }
+    }
+
+    // --- COPY ... TO STDOUT ---
+
+    fn export_batch(rows: &[(&str, &str)]) -> (SchemaRef, RecordBatch) {
+        use std::sync::Arc;
+
+        use datafusion::arrow::array::StringArray;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Utf8, true),
+            Field::new("v", DataType::Utf8, true),
+        ]));
+        let batch = RecordBatch::try_new(
+            SchemaRef::clone(&schema),
+            vec![
+                Arc::new(StringArray::from(
+                    rows.iter().map(|(id, _)| *id).collect::<Vec<_>>(),
+                )),
+                Arc::new(StringArray::from(
+                    rows.iter().map(|(_, v)| *v).collect::<Vec<_>>(),
+                )),
+            ],
+        )
+        .unwrap();
+        (schema, batch)
+    }
+
+    fn exported(dialect: &CsvDialect, rows: &[(&str, &str)]) -> Vec<String> {
+        let (schema, batch) = export_batch(rows);
+        csv_row_messages(&schema, &[batch], dialect)
+            .unwrap()
+            .into_iter()
+            .map(|m| String::from_utf8(m.data.to_vec()).unwrap())
+            .collect()
+    }
+
+    // One message per row, because that is what pgwire counts to build `COPY n`.
+    #[test]
+    fn an_export_sends_one_message_per_row() {
+        assert_eq!(
+            exported(&CsvDialect::default(), &[("1", "x"), ("2", "y")]),
+            vec!["1,x\n".to_string(), "2,y\n".to_string()]
+        );
+    }
+
+    // A header cannot have a message of its own: it would be counted as a row. It
+    // rides along in the first row's message instead.
+    #[test]
+    fn a_requested_header_rides_in_the_first_rows_message() {
+        assert_eq!(
+            exported(
+                &CsvDialect {
+                    header: true,
+                    ..Default::default()
+                },
+                &[("1", "x"), ("2", "y")]
+            ),
+            vec!["id,v\n1,x\n".to_string(), "2,y\n".to_string()]
+        );
+    }
+
+    // The one case that cannot come out right: with no rows to carry it, the header
+    // needs a message of its own, and pgwire counts it — so the tag reads `COPY 1`
+    // where PostgreSQL says `COPY 0`. Sending the header is the half worth keeping,
+    // since a client reading the output back with HEADER needs it.
+    #[test]
+    fn an_empty_export_still_sends_a_requested_header() {
+        assert_eq!(
+            exported(
+                &CsvDialect {
+                    header: true,
+                    ..Default::default()
+                },
+                &[]
+            ),
+            vec!["id,v\n".to_string()]
+        );
+    }
+
+    #[test]
+    fn an_empty_export_without_a_header_sends_nothing_at_all() {
+        assert!(exported(&CsvDialect::default(), &[]).is_empty());
+    }
+
+    #[test]
+    fn an_exports_dialect_reaches_the_rendered_rows() {
+        let dialect = CsvDialect {
+            header: true,
+            delimiter: b';',
+            quote: b'\'',
+        };
+        assert_eq!(
+            exported(&dialect, &[("1", "a;b")]),
+            vec!["id;v\n1;'a;b'\n".to_string()]
+        );
     }
 
     // The rows in the file are read, mapped and validated; what stops this import

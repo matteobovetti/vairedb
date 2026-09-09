@@ -31,6 +31,39 @@ enum VdbErrorCode {
   // The object named still has objects inside it, so dropping it would drop
   // them too. Reported by `DROP SCHEMA` without `CASCADE`.
   VDB_ERROR_CODE_DEPENDENT_OBJECTS_EXIST = 1015;
+  // The name is not something the server has, and the client's mistake is the
+  // name itself rather than a missing feature. Reported by SET/SHOW/RESET for a
+  // configuration parameter VaireDB does not model, so a client can tell a typo
+  // from a refusal.
+  VDB_ERROR_CODE_UNDEFINED_OBJECT = 1016;
+  // The name is recognized but the value is not one it can take. Reported by SET
+  // for a value VaireDB's behaviour does not match, which is a different answer
+  // from "SET is unsupported": the parameter works, this value does not.
+  VDB_ERROR_CODE_INVALID_PARAMETER_VALUE = 1017;
+  // The parameter exists and is reportable, but cannot be changed after the
+  // server started. PostgreSQL reports the same for its `internal`-context
+  // settings.
+  VDB_ERROR_CODE_CANT_CHANGE_RUNTIME_PARAM = 1018;
+  // The value is outside the range the type it must be reported as can hold, so
+  // it cannot reach the client at all. Reported instead of silently substituting
+  // NULL, which would look like a value that was never stored.
+  VDB_ERROR_CODE_NUMERIC_VALUE_OUT_OF_RANGE = 1019;
+  // A division whose divisor evaluated to zero. Its own code because the query and
+  // the server are both fine and one row's data was not, which is what separates it
+  // from the ENGINE_ERROR it used to be reported as — and because the float forms
+  // otherwise return `inf`, a poison value that flows on into aggregates.
+  VDB_ERROR_CODE_DIVISION_BY_ZERO = 1020;
+  // A literal or parameter whose text is not valid for the type it is being read
+  // as, such as `'x'::int`. Distinct from TYPE_MISMATCH (42804): there the two
+  // types cannot meet at all, here the target type is right and the value is not
+  // spelled the way it accepts.
+  VDB_ERROR_CODE_INVALID_TEXT_REPRESENTATION = 1021;
+  // An aggregate appearing inside another aggregate's arguments. PostgreSQL rejects
+  // it at parse time (42803) rather than executing something.
+  VDB_ERROR_CODE_GROUPING_ERROR = 1022;
+  // A window function used where one is not allowed — a WHERE, GROUP BY or HAVING
+  // clause, or nested inside another window function (42P20).
+  VDB_ERROR_CODE_WINDOWING_ERROR = 1023;
 
   // Storage errors (2000-2999)
   VDB_ERROR_CODE_SHARD_NOT_FOUND = 2000;

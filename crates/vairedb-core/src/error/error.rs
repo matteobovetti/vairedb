@@ -26,6 +26,17 @@ pub enum CoreError {
     #[error("type mismatch: {0}")]
     TypeMismatch(String),
 
+    /// An expression divided by zero.
+    ///
+    /// Carries no detail on purpose: the message is PostgreSQL's own wording, and it is
+    /// what the client reads. What DuckDB said is logged by the caller, and what the
+    /// client needs is the class — `22012`, the same one the read path reports for the
+    /// same expression. The write path raises this by way of a `CASE … error('division by
+    /// zero')` guard the coordinator wraps every division in, since DuckDB itself answers
+    /// NULL.
+    #[error("division by zero")]
+    DivisionByZero,
+
     /// The write queue was closed or its writer task dropped the response.
     #[error("write queue error: {0}")]
     WriteQueue(String),
@@ -59,6 +70,12 @@ impl CoreError {
             && (lower.contains("does not exist") || lower.contains("not found"))
         {
             CoreError::ShardNotFound(msg)
+        } else if lower.contains("division by zero") || lower.contains("divide by zero") {
+            // Raised by the coordinator's own guard — DuckDB answers NULL for `7/0` — so
+            // the phrase is one this tree wrote and not one a version bump can reword.
+            // Reported as `22012`, which is what the read path reports for `7/0` too.
+            tracing::warn!(error = %msg, "write divided by zero");
+            CoreError::DivisionByZero
         } else if lower.contains("unique constraint")
             || lower.contains("duplicate key")
             || lower.contains("primary key constraint")
@@ -80,6 +97,7 @@ impl CoreError {
             CoreError::ShardNotFound(_) => VdbErrorCode::ShardNotFound,
             CoreError::WriteConflict(_) => VdbErrorCode::WriteConflict,
             CoreError::TypeMismatch(_) => VdbErrorCode::TypeMismatch,
+            CoreError::DivisionByZero => VdbErrorCode::DivisionByZero,
             CoreError::WriteQueue(_) => VdbErrorCode::WriteQueueFull,
             CoreError::Engine(_) => VdbErrorCode::EngineError,
             CoreError::Heartbeat(_) => VdbErrorCode::InternalError,
@@ -150,6 +168,44 @@ mod tests {
         assert!(matches!(err, CoreError::Engine(_)));
         assert!(!matches!(err, CoreError::WriteQueue(_)));
         assert!(!matches!(err, CoreError::Heartbeat(_)));
+    }
+
+    /// The guard the coordinator wraps every write-path division in raises through DuckDB's
+    /// `error()`, so the failure arrives here as a DuckDB message and has to be classified
+    /// back into the class PostgreSQL uses — `22012` — rather than the `XX000` an
+    /// unrecognized message would get. The phrase is one this tree wrote, so matching on it
+    /// is not the usual bet on an upstream wording.
+    #[test]
+    fn a_guarded_zero_divisor_is_classified_as_division_by_zero() {
+        for msg in [
+            "Invalid Input Error: division by zero",
+            // DuckDB prefixes and wraps, and PostgreSQL's own spelling of the same class
+            // varies by operator ("divide by zero" for modulo), so both are matched.
+            "Invalid Input Error: Divide by zero",
+        ] {
+            let err = CoreError::from_duckdb(duckdb::Error::DuckDBFailure(
+                duckdb::ffi::Error::new(1),
+                Some(msg.to_string()),
+            ));
+            assert!(
+                matches!(err, CoreError::DivisionByZero),
+                "`{msg}` should be a zero divisor, got: {err:?}"
+            );
+            assert_eq!(err.vdb_error_code(), VdbErrorCode::DivisionByZero);
+            // The client reads PostgreSQL's wording, not DuckDB's.
+            assert_eq!(err.to_string(), "division by zero");
+        }
+    }
+
+    /// An unrelated failure must not be swept into the zero-divisor class just because it
+    /// mentions division.
+    #[test]
+    fn an_unrelated_error_is_not_a_division_by_zero() {
+        let err = CoreError::from_duckdb(duckdb::Error::DuckDBFailure(
+            duckdb::ffi::Error::new(1),
+            Some("Binder Error: No function matches divide(VARCHAR, VARCHAR)".to_string()),
+        ));
+        assert!(matches!(err, CoreError::Engine(_)), "got: {err:?}");
     }
 
     #[test]

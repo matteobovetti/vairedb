@@ -39,14 +39,17 @@ impl PhysicalExtensionCodec for VairePhysicalCodec {
         if let Ok(plan_bytes) = DuckDbScanPlanBytes::decode(buf)
             && let Ok(schema) = decode_schema_ipc(&plan_bytes.schema_ipc)
         {
-            return Ok(Arc::new(RemoteDuckDbScanExec::new(
-                plan_bytes.shard_table_name,
-                schema,
-                plan_bytes.projection,
-                plan_bytes.filter_exprs,
-                plan_bytes.target_executor_id,
-                plan_bytes.replica_executor_ids,
-            )));
+            return Ok(Arc::new(
+                RemoteDuckDbScanExec::new(
+                    plan_bytes.shard_table_name,
+                    schema,
+                    plan_bytes.projection,
+                    plan_bytes.filter_exprs,
+                    plan_bytes.target_executor_id,
+                    plan_bytes.replica_executor_ids,
+                )
+                .with_limit(plan_bytes.limit),
+            ));
         }
 
         self.ballista_codec.try_decode(buf, inputs, ctx)
@@ -57,7 +60,7 @@ impl PhysicalExtensionCodec for VairePhysicalCodec {
         node: Arc<dyn ExecutionPlan>,
         buf: &mut Vec<u8>,
     ) -> datafusion::error::Result<()> {
-        if let Some(remote_scan) = node.as_any().downcast_ref::<RemoteDuckDbScanExec>() {
+        if let Some(remote_scan) = node.downcast_ref::<RemoteDuckDbScanExec>() {
             let schema_ipc = encode_schema_ipc(remote_scan.projected_schema())?;
 
             let plan_bytes = DuckDbScanPlanBytes {
@@ -65,6 +68,7 @@ impl PhysicalExtensionCodec for VairePhysicalCodec {
                 schema_ipc,
                 projection: remote_scan.projection().clone(),
                 filter_exprs: remote_scan.filter_exprs().to_vec(),
+                limit: remote_scan.limit(),
                 target_executor_id: remote_scan.target_executor_id().map(|s| s.to_string()),
                 replica_executor_ids: remote_scan.replica_executor_ids().to_vec(),
             };

@@ -141,9 +141,12 @@ fn test_index_ddl_is_write_path() {
     assert!(QueryType::DropIndex.is_write_path());
 }
 
+// `Other` is the fallback for a statement no subsystem claims, and it has to stay
+// reachable: it is what turns an unhandled command into a refusal that names it
+// rather than a fake `OK`.
 #[test]
 fn test_classify_other() {
-    let stmts = parser::parse_sql("EXPLAIN SELECT 1").unwrap();
+    let stmts = parser::parse_sql("CALL p()").unwrap();
     assert_eq!(classify_statement(&stmts[0]), QueryType::Other);
 }
 

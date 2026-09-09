@@ -26,6 +26,7 @@ use crate::pgwire_handler::handler::VaireDbQueryHandler;
 use crate::pgwire_handler::query_router::{self, QueryType};
 use crate::pgwire_handler::session::{BufferedWrite, SessionState, Transaction};
 use crate::replication::BatchStatement;
+use crate::util::insert_column_ident;
 use crate::write_router::{compute_shard_index, shard_for_bucket};
 use crate::write_sql_cl;
 
@@ -771,7 +772,14 @@ fn parse_anonymization_secret_insert(stmt: &Statement) -> PgWireResult<Vec<Anony
         ));
     };
 
-    let columns: Vec<&str> = insert.columns.iter().map(|c| c.value.as_str()).collect();
+    // A column-list entry that is not a bare identifier (a dotted composite-field
+    // target) cannot name one of the three required columns, so it maps to the empty
+    // string and `column_index` rejects the statement below.
+    let columns: Vec<&str> = insert
+        .columns
+        .iter()
+        .map(|c| insert_column_ident(c).map_or("", |i| i.value.as_str()))
+        .collect();
     let id_idx = column_index(&columns, "id")?;
     let algo_idx = column_index(&columns, "algo")?;
     let secret_idx = column_index(&columns, "secret_key")?;

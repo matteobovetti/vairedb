@@ -8,7 +8,9 @@ The client configuration specifies the coordinator address. The client connects 
 
 **Coordinator-to-core-node membership**
 
-The coordinator maintains the live set of core nodes via gRPC. Core nodes register themselves with the coordinator on startup and are tracked in the node registry (see [Metadata Catalog](coordinator-node.md#metadata-catalog-database-catalog)). Membership changes (node joins, departures) are handled entirely on the coordinator side; clients are unaware of the core node topology.
+The coordinator maintains the live set of core nodes via gRPC. Core nodes register themselves with the coordinator and are tracked in the node registry (see [Metadata Catalog](coordinator-node.md#metadata-catalog-database-catalog)). Membership changes (node joins, departures) are handled entirely on the coordinator side; clients are unaware of the core node topology.
+
+Registration is part of **establishing** the connection to the coordinator, not of starting up: a core node registers before each heartbeat stream it opens, and the coordinator can also ask a node it has no record of to register when answering its heartbeat. Membership is therefore re-asserted by the core nodes themselves, so a coordinator that comes up with an empty node registry learns the cluster back without the core nodes being restarted.
 
 ## Leader Election
 

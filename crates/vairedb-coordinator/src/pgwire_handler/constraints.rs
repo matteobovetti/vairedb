@@ -690,6 +690,17 @@ fn declared_from_table_constraint(
                 "declaring an index inside CREATE TABLE is not supported by VaireDB; create it afterwards with CREATE INDEX",
             ));
         }
+        // PostgreSQL's `PRIMARY KEY|UNIQUE USING INDEX <name>` promotes an
+        // existing unique index into a constraint. A constraint record is stored
+        // from its column list, and this form names an index instead — so there is
+        // nothing to record. Refused by name rather than stored column-less, which
+        // would let the shard-key rule pass a constraint it never checked.
+        TableConstraint::PrimaryKeyUsingIndex(_) | TableConstraint::UniqueUsingIndex(_) => {
+            return Err(make_vdb_error(
+                VdbErrorCode::FeatureNotSupported,
+                "PRIMARY KEY / UNIQUE USING INDEX is not supported by VaireDB; declare the constraint on its columns instead",
+            ));
+        }
     };
     Ok(declared)
 }

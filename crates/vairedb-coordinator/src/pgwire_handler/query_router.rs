@@ -60,7 +60,19 @@ pub enum QueryType {
     /// the coordinator's session state — see
     /// [`crate::pgwire_handler::transaction`].
     TransactionControl,
-    /// Anything not handled specially (e.g. SET, EXPLAIN).
+    /// `SET`/`SHOW`/`RESET`: statements that read or change one connection's
+    /// runtime parameters. Answered entirely in the coordinator, from the session's
+    /// own parameter map — see [`crate::pgwire_handler::session_params`]. Nothing is
+    /// broadcast: a runtime parameter is a property of the client's connection, and
+    /// no shard could answer it differently.
+    SessionParam,
+    /// `EXPLAIN` / `EXPLAIN ANALYZE` / `DESCRIBE`: statements that report how a
+    /// query would run, or what shape a relation has, instead of returning rows.
+    /// Answered on the read path — an `EXPLAIN` is the plan a SELECT already builds,
+    /// rendered rather than executed — see
+    /// [`crate::pgwire_handler::introspection`].
+    Explain,
+    /// Anything not handled specially (e.g. `CALL`).
     Other,
 }
 
@@ -149,6 +161,17 @@ pub fn classify_statement(stmt: &Statement) -> QueryType {
         | Statement::Rollback { .. }
         | Statement::Savepoint { .. }
         | Statement::ReleaseSavepoint { .. } => QueryType::TransactionControl,
+        // `RESET` arrives here as a `Set` too: the parser rewrites it to the
+        // `SET x TO DEFAULT` PostgreSQL defines it to be — see
+        // [`crate::pgwire_handler::session_params::parse_reset`]. The `SHOW TABLES`
+        // family does *not*: each parses into a statement of its own, so only
+        // `SHOW <parameter>` reaches `ShowVariable`.
+        Statement::Set(_) | Statement::ShowVariable { .. } => QueryType::SessionParam,
+        // `DESCRIBE <relation>` parses to `ExplainTable` and `EXPLAIN <statement>`
+        // / `DESCRIBE <query>` to `Explain`; both are sorted out by alias in
+        // [`crate::pgwire_handler::introspection`], which is also where the forms
+        // that cannot be answered truthfully are refused by name.
+        Statement::Explain { .. } | Statement::ExplainTable { .. } => QueryType::Explain,
         _ => QueryType::Other,
     }
 }

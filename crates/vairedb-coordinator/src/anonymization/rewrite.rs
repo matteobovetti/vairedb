@@ -5,6 +5,7 @@
 use std::collections::HashMap;
 
 use crate::sqlparser::ast::{AssignmentTarget, Expr, SetExpr, Statement, Value};
+use crate::util::insert_column_ident;
 
 use super::{HMAC_SHA256_ALGO, Secret, SecretResolver, hmac_sha256_hex};
 
@@ -31,16 +32,19 @@ pub fn anonymize_statement(
             // Column names are matched case-insensitively: the map is keyed on
             // lowercased identifiers, so `EMAIL` still resolves to the `email`
             // rule. A case mismatch must never silently skip hashing.
-            let target_positions: Vec<(usize, &String)> = insert
-                .columns
-                .iter()
-                .enumerate()
-                .filter_map(|(idx, col)| {
-                    anonymized_columns
-                        .get(&col.value.to_ascii_lowercase())
-                        .map(|sid| (idx, sid))
-                })
-                .collect();
+            let mut target_positions: Vec<(usize, &String)> = Vec::new();
+            for (idx, col) in insert.columns.iter().enumerate() {
+                // A column-list entry that is not a bare identifier (a dotted
+                // composite-field target) cannot be matched against the rule map.
+                // Refuse rather than skip: skipping would write plaintext into a
+                // column declared anonymized.
+                let name = insert_column_ident(col).ok_or_else(|| {
+                    format!("unsupported column reference '{col}' in INSERT column list")
+                })?;
+                if let Some(sid) = anonymized_columns.get(&name.value.to_ascii_lowercase()) {
+                    target_positions.push((idx, sid));
+                }
+            }
 
             if target_positions.is_empty() {
                 return Ok(());

@@ -72,6 +72,104 @@ pub(super) fn references_catalog_schema(
     found
 }
 
+/// Whether the statement reads metadata, decided **without** the set of registered
+/// `pg_catalog` relations — the parse-time approximation of
+/// [`references_catalog_schema`].
+///
+/// The parse happens before any context is in hand, so the registered set is not
+/// available there; what is available is the naming convention it follows. Every
+/// `pg_catalog` relation is `pg_`-prefixed (the reason [`catalog_table_names`]
+/// enumerates that schema and no other), and the two schemas with collidable names are
+/// matched only when qualified — exactly as they are at routing time.
+///
+/// It errs towards *yes*: a user table called `pg_things` is treated as metadata. That
+/// is the harmless direction for the one caller, which uses the answer to decide
+/// whether to leave a statement to `datafusion-pg-catalog`'s own rewrites, and PG
+/// reserves the prefix anyway.
+pub(super) fn reads_metadata(stmt: &crate::sqlparser::ast::Statement) -> bool {
+    use std::ops::ControlFlow;
+    let mut found = false;
+    let mut stmt = stmt.clone();
+    let _ = crate::sqlparser::ast::visit_relations_mut(&mut stmt, |relation| {
+        let name = relation.to_string().to_lowercase();
+        if CATALOG_SCHEMA_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+        {
+            found = true;
+            return ControlFlow::Break(());
+        }
+        if let Some(crate::sqlparser::ast::ObjectNamePart::Identifier(ident)) = relation.0.last()
+            && ident.value.to_lowercase().starts_with("pg_")
+        {
+            found = true;
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    });
+    found
+}
+
+/// Refuse a statement that reads catalog metadata **and** a user table.
+///
+/// Such a statement routes to the local context, because that is where the emulated
+/// `pg_catalog` lives, and the local context can resolve a user table — its providers
+/// are registered there so `pg_class` can list them — but it cannot *execute* one. The
+/// per-shard scan those providers plan (`RemoteDuckDbScanExec`) is a placeholder that
+/// only means something once a core node has been handed it, so executing it in-process
+/// fails with an internal error naming DataFusion. Distributing the statement instead is
+/// not an option either: the `pg_catalog` half is an in-memory provider the distributed
+/// plan cannot carry.
+///
+/// So the statement is refused by name, which is what this codebase does with a
+/// construct it cannot answer correctly. The join has to be written as two statements.
+pub(super) fn reject_catalog_join_to_user_data(
+    stmt: &crate::sqlparser::ast::Statement,
+    catalog: &crate::catalog::MetadataCatalog,
+) -> pgwire::error::PgWireResult<()> {
+    use std::ops::ControlFlow;
+
+    let mut user_table: Option<String> = None;
+    let mut stmt = stmt.clone();
+    let _ = crate::sqlparser::ast::visit_relations_mut(&mut stmt, |relation| {
+        let name = relation.to_string().to_lowercase();
+        if CATALOG_SCHEMA_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+        {
+            return ControlFlow::Continue(());
+        }
+        let Some(crate::sqlparser::ast::ObjectNamePart::Identifier(ident)) = relation.0.last()
+        else {
+            return ControlFlow::Continue(());
+        };
+        if ident.value.to_lowercase().starts_with("pg_") {
+            return ControlFlow::Continue(());
+        }
+        // A name the metadata catalog knows is user data by definition. A name it does
+        // not know is left alone: it may be an `information_schema` relation reached
+        // unqualified, and an unresolvable name is the planner's error to report.
+        if matches!(catalog.get_table(&ident.value), Ok(Some(_))) {
+            user_table = Some(ident.value.clone());
+            return ControlFlow::Break(());
+        }
+        ControlFlow::Continue(())
+    });
+
+    match user_table {
+        None => Ok(()),
+        Some(table) => Err(crate::pgwire_handler::error_enrichment::make_vdb_error(
+            vairedb_common::proto::vairedb::v1::VdbErrorCode::FeatureNotSupported,
+            format!(
+                "a query that reads catalog metadata and the table '{table}' in one \
+                 statement is not supported: catalog metadata is answered on the \
+                 coordinator and '{table}' lives on the storage nodes, so the two cannot \
+                 be joined in one plan; query them separately"
+            ),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -149,5 +247,83 @@ mod tests {
         // A user table whose name is not a known catalog table must not match.
         let stmt = parse_one("SELECT * FROM orders WHERE id = 1");
         assert!(!references_catalog_schema(&stmt, &catalog_names()));
+    }
+
+    // --- the mixed catalog/user-data refusal ---
+
+    /// A metadata catalog holding `orders`, so the refusal has a name to recognize as
+    /// user data. Distinct file per call: redb takes an exclusive lock.
+    fn catalog_with_orders() -> crate::catalog::MetadataCatalog {
+        use crate::catalog::{ColumnDef, TableMeta};
+
+        let catalog = crate::pgwire_handler::test_catalog::scratch_catalog("catalog_routing");
+        catalog
+            .put_table(&TableMeta {
+                table_name: "orders".to_string(),
+                columns: vec![ColumnDef {
+                    name: "id".to_string(),
+                    data_type: "INTEGER".to_string(),
+                    nullable: true,
+                    default_expr: String::new(),
+                }],
+                shard_key: "id".to_string(),
+                shard_count: 2,
+                replication_factor: 1,
+                ..Default::default()
+            })
+            .unwrap();
+        catalog
+    }
+
+    fn refusal(sql: &str) -> Option<pgwire::error::ErrorInfo> {
+        match reject_catalog_join_to_user_data(&parse_one(sql), &catalog_with_orders()) {
+            Ok(()) => None,
+            Err(pgwire::error::PgWireError::UserError(info)) => Some(*info),
+            Err(other) => panic!("expected a client-facing error, got {other}"),
+        }
+    }
+
+    #[test]
+    fn test_a_join_between_metadata_and_a_user_table_is_refused() {
+        let info = refusal(
+            "SELECT c.relname, o.id FROM pg_catalog.pg_class c JOIN orders o ON o.id = c.oid",
+        )
+        .expect("the two halves live on different nodes, so the join cannot be planned");
+        assert_eq!(info.code, "0A000", "feature_not_supported");
+        assert!(
+            info.message.contains("orders"),
+            "the message names the table that cannot be reached: {}",
+            info.message
+        );
+    }
+
+    #[test]
+    fn test_a_user_table_in_a_subquery_is_refused_too() {
+        // The visitor walks subqueries, so hiding the table one level down changes nothing:
+        // it is still the local context that would have to execute the scan.
+        assert!(
+            refusal("SELECT relname FROM pg_class WHERE oid IN (SELECT id FROM orders)").is_some()
+        );
+    }
+
+    #[test]
+    fn test_a_pure_catalog_query_is_accepted() {
+        assert!(
+            refusal(
+                "SELECT c.relname FROM pg_catalog.pg_class c \
+                 JOIN pg_catalog.pg_namespace n ON n.oid = c.relnamespace"
+            )
+            .is_none(),
+            "both halves are answered on the coordinator"
+        );
+    }
+
+    #[test]
+    fn test_an_unknown_relation_is_left_to_the_planner() {
+        // `information_schema` relations are reached unqualified too, and the catalog does
+        // not know them. Refusing on "not a known user table" would refuse those; an
+        // unresolvable name is the planner's error to report, with its own message.
+        assert!(refusal("SELECT * FROM pg_class, columns").is_none());
+        assert!(refusal("SELECT * FROM pg_class, no_such_table").is_none());
     }
 }

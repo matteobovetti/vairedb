@@ -46,6 +46,12 @@ distribute execution plans across the cluster.
   executors.
 - The scheduler inserts **exchange operators** (repartition, broadcast, gather)
   between stages to manage data shuffling via Arrow Flight (gRPC).
+- Column projections, plus the predicates and row limits DuckDB reads the same way
+  the coordinator does, are carried into each shard's own `SELECT`, so a shard
+  streams the rows the query wants instead of its whole table. The coordinator keeps
+  its own filter and applies the real `LIMIT` over the union, so this saves bandwidth
+  and is never trusted for correctness — see
+  [Query optimization](query-processing.md#query-optimization).
 - Each stage is assigned to one or more core node executors based on data
   locality (the shard map) and executor availability. Because Ballista's default
   scheduling policy does not support hard placement constraints, VaireDB

@@ -8,11 +8,12 @@ use std::ops::ControlFlow;
 
 use crate::sqlparser::ast::{
     Assignment, AssignmentTarget, ConflictTarget, Expr, Ident, ObjectName, OnConflictAction,
-    OnInsert, SetExpr, Statement, Value, visit_expressions_mut, visit_relations,
+    OnInsert, Parens, SetExpr, Statement, Value, visit_expressions_mut, visit_relations,
 };
 use datafusion::scalar::ScalarValue;
 
 use crate::pgwire_handler::query_router::{canonical_table_name, canonicalize_ident};
+use crate::util::insert_column_ident;
 
 use super::routing_value::{RoutedValue, expr_routing_value};
 
@@ -21,11 +22,13 @@ use super::routing_value::{RoutedValue, expr_routing_value};
 ///
 /// `shard_key` is the catalog's canonical name, so the client's identifiers are
 /// folded the same way before comparing: `INSERT INTO t (ID, v)` names the shard
-/// key `id`, while `INSERT INTO t ("ID", v)` names a different column.
-pub(super) fn shard_key_column_index(columns: &[Ident], shard_key: &str) -> Option<usize> {
-    columns
-        .iter()
-        .position(|c| canonicalize_ident(c) == shard_key)
+/// key `id`, while `INSERT INTO t ("ID", v)` names a different column. A list
+/// entry that is not a bare identifier never matches (see
+/// [`insert_column_ident`]).
+pub(super) fn shard_key_column_index(columns: &[ObjectName], shard_key: &str) -> Option<usize> {
+    columns.iter().position(|c| {
+        insert_column_ident(c).is_some_and(|ident| canonicalize_ident(ident) == shard_key)
+    })
 }
 
 /// True for an `INSERT` that names no columns — the positional form
@@ -137,7 +140,7 @@ pub fn materialize_insert_columns(
         let SetExpr::Values(values) = source.body.as_ref() else {
             return Ok(());
         };
-        let Some(arity) = values.rows.first().map(Vec::len) else {
+        let Some(arity) = values.rows.first().map(|row| row.len()) else {
             return Ok(());
         };
         if values.rows.iter().any(|row| row.len() != arity) {
@@ -180,7 +183,7 @@ pub fn materialize_insert_columns_for_arity(
 
     insert.columns = table_columns[..arity]
         .iter()
-        .map(|name| Ident::with_quote('"', *name))
+        .map(|name| ObjectName::from(vec![Ident::with_quote('"', *name)]))
         .collect();
     Ok(())
 }
@@ -437,7 +440,7 @@ pub fn split_insert_by_rows(stmt: &Statement, row_indices: &[usize]) -> Option<S
         return None;
     };
 
-    let selected_rows: Vec<Vec<Expr>> = row_indices
+    let selected_rows: Vec<Parens<Vec<Expr>>> = row_indices
         .iter()
         .filter_map(|&idx| values.rows.get(idx).cloned())
         .collect();

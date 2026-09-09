@@ -6,6 +6,33 @@ use duckdb::arrow::record_batch::RecordBatch;
 
 use crate::error::CoreError;
 
+/// Bring the database's arithmetic in line with PostgreSQL's, which is the dialect a
+/// VaireDB client speaks.
+///
+/// One setting, and it decides an answer rather than a spelling. DuckDB's `/` is
+/// floating-point division whatever its operands are, so `7 / 2` answers `3.5` on a
+/// write while the coordinator's read path — DataFusion, which follows PostgreSQL —
+/// answers `3`. One database cannot hold both answers to the same expression, and the
+/// contract is PostgreSQL's. `integer_division` makes `/` integer division when both
+/// operands are integers and leaves every other combination floating point, which is
+/// PostgreSQL's rule exactly.
+///
+/// Two details of *how* decide whether it works at all, and both were measured against
+/// DuckDB 1.5.5 rather than read off its documentation:
+///
+/// * It is applied at open, not alongside each statement. The setting is consulted when
+///   a statement is **bound**, so a `SET` sent in the same batch as the statement it is
+///   meant to govern arrives too late and the statement still divides as floats.
+/// * `GLOBAL` is required, even though `duckdb_settings()` already reports the setting's
+///   scope as `GLOBAL`. A plain `SET` takes effect on this connection only, and
+///   [`DuckDbEngine::clone_connection`] — which every read and every write goes through
+///   — hands out a connection where it has reverted to `false`. `SET GLOBAL` is what
+///   survives the clone.
+fn apply_postgres_semantics(conn: &Connection) -> Result<(), CoreError> {
+    conn.execute_batch("SET GLOBAL integer_division = true")
+        .map_err(|e| CoreError::engine("failed to set integer_division", e))
+}
+
 /// Owns the node's DuckDB connection and serves as the factory for the
 /// per-operation connection clones used by reads and writes.
 ///
@@ -35,6 +62,7 @@ impl DuckDbEngine {
         let db_path = data_dir.join("core.duckdb");
         let conn = Connection::open(&db_path)
             .map_err(|e| CoreError::engine("failed to open duckdb", e))?;
+        apply_postgres_semantics(&conn)?;
 
         Ok(Self { conn })
     }
@@ -83,6 +111,7 @@ impl DuckDbEngine {
     fn open_in_memory() -> Result<Self, CoreError> {
         let conn = Connection::open_in_memory()
             .map_err(|e| CoreError::engine("failed to open in-memory duckdb", e))?;
+        apply_postgres_semantics(&conn)?;
         Ok(Self { conn })
     }
 
@@ -158,6 +187,51 @@ mod tests {
         let engine = DuckDbEngine::open_in_memory().unwrap();
         let result = engine.execute_write("NOT VALID SQL AT ALL");
         assert!(result.is_err());
+    }
+
+    /// The whole point of [`apply_postgres_semantics`], asserted through the same
+    /// `read_connection` a real write goes through — which is a *clone* of the
+    /// connection the setting was applied to. The `GLOBAL` scope is what makes that
+    /// work, and this is the assertion that would fail if DuckDB ever narrowed it.
+    #[test]
+    fn integer_division_follows_postgres_on_every_connection() {
+        let engine = DuckDbEngine::open_in_memory().unwrap();
+        engine
+            .execute_write("CREATE TABLE divs (a INTEGER, b INTEGER)")
+            .unwrap();
+        engine
+            .execute_write("INSERT INTO divs VALUES (7, 2), (-7, 2)")
+            .unwrap();
+
+        // Integer / integer truncates toward zero and stays an integer, as in
+        // PostgreSQL. DuckDB's default would answer 3.5 and -3.5 as DOUBLE.
+        let batches = engine
+            .execute_query("SELECT a / b AS q FROM divs ORDER BY a DESC")
+            .unwrap();
+        let quotients: Vec<i32> = batches
+            .iter()
+            .flat_map(|b| {
+                b.column(0)
+                    .as_any()
+                    .downcast_ref::<duckdb::arrow::array::Int32Array>()
+                    .expect("integer division yields an integer, not a float")
+                    .iter()
+                    .flatten()
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        assert_eq!(quotients, vec![3, -3]);
+
+        // And a non-integer operand still divides as floating point, which is also
+        // PostgreSQL's rule: the setting narrows `/`, it does not replace it.
+        let batches = engine.execute_query("SELECT 7.0 / 2 AS q").unwrap();
+        let q = batches[0]
+            .column(0)
+            .as_any()
+            .downcast_ref::<duckdb::arrow::array::Float64Array>()
+            .expect("a decimal operand keeps float division")
+            .value(0);
+        assert_eq!(q, 3.5);
     }
 
     #[test]

@@ -364,3 +364,124 @@ async fn test_copying_between_anonymized_tables_is_refused() {
     drop_table(&client, &dst).await;
     drop_table(&client, &src).await;
 }
+
+// The read half of the contract. HMAC preserves equality and destroys order and
+// structure, so a query that reads the digests as if they were the plaintext gets a
+// plausible answer that means nothing: `ORDER BY email` sorts by digest, `min(email)`
+// returns the digest's extreme, `LIKE '%@x.com'` matches no row however many addresses
+// end that way, and `email = 'plaintext'` matches no row at all. Each of those is
+// refused by name; everything the hash preserves stays available and correct.
+#[tokio::test]
+async fn test_reads_that_would_report_digest_order_are_refused() {
+    let client = ready_client().await;
+
+    let secret_id = unique_table_name("anon_secret_read");
+    let secret_key = "read_path_key";
+    execute(
+        &client,
+        &format!(
+            "INSERT INTO vairedb_catalog.anonymization_secret (id, algo, secret_key) \
+             VALUES ('{secret_id}', 'HMAC-SHA256', '{secret_key}')"
+        ),
+    )
+    .await
+    .unwrap();
+
+    let tbl = create_table(
+        &client,
+        "anon_read",
+        &format!(
+            "(id INTEGER NOT NULL, email VARCHAR(64), city VARCHAR(32)) \
+             WITH (shards = 3, replication_factor = 3, shard_by = 'id', \
+             anonymized_columns = [ email -> '{secret_id}' ])"
+        ),
+    )
+    .await;
+
+    let emails = ["alice@x.com", "bob@x.com", "carol@x.com"];
+    for (id, email) in emails.iter().enumerate() {
+        execute(
+            &client,
+            &format!(
+                "INSERT INTO {tbl} (id, email, city) VALUES ({}, '{email}', 'Turin')",
+                id + 1
+            ),
+        )
+        .await
+        .unwrap();
+    }
+
+    // Ordering, and the aggregates that are an ordering: the answer would be in digest
+    // order, and nothing in the result would say so.
+    for sql in [
+        format!("SELECT id FROM {tbl} ORDER BY email"),
+        format!("SELECT id FROM {tbl} ORDER BY email DESC"),
+        format!("SELECT min(email) FROM {tbl}"),
+        format!("SELECT max(email) FROM {tbl}"),
+        format!("SELECT row_number() OVER (ORDER BY email) FROM {tbl}"),
+        format!("SELECT id FROM {tbl} WHERE email > 'b'"),
+        format!("SELECT id FROM {tbl} WHERE email BETWEEN 'a' AND 'c'"),
+    ] {
+        assert_unsupported(&client, &sql).await;
+    }
+
+    // Pattern matching against 64 hex characters: an empty answer for every row, not
+    // for the rows that do not match.
+    for sql in [
+        format!("SELECT id FROM {tbl} WHERE email LIKE '%@x.com'"),
+        format!("SELECT id FROM {tbl} WHERE email ILIKE '%@X.COM'"),
+        format!("SELECT id FROM {tbl} WHERE email ~ 'x[.]com$'"),
+    ] {
+        assert_unsupported(&client, &sql).await;
+    }
+
+    // Equality against plaintext, which is the one refusal that can say exactly what to
+    // send instead — so the message has to say it.
+    let err = execute_expect_err(
+        &client,
+        &format!("SELECT id FROM {tbl} WHERE email = 'alice@x.com'"),
+    )
+    .await;
+    assert_eq!(err.code().code(), SQLSTATE_FEATURE_NOT_SUPPORTED);
+    assert!(
+        err.message().contains("digest"),
+        "the refusal must point at the digest: {}",
+        err.message()
+    );
+
+    // Everything the hash preserves. The digest lookup is the documented way to find a
+    // row, and equality, grouping and counting all survive a deterministic hash.
+    let digest = hmac_sha256_hex(secret_key, emails[0]);
+    let found = simple_query_rows(
+        &client,
+        &format!("SELECT id FROM {tbl} WHERE email = '{digest}'"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(found.len(), 1, "a lookup by digest must still find the row");
+    assert_eq!(found[0][0].as_deref(), Some("1"));
+
+    let counted = simple_query_rows(
+        &client,
+        &format!("SELECT count(DISTINCT email) FROM {tbl} WHERE city = 'Turin'"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        counted[0][0].as_deref(),
+        Some("3"),
+        "cardinality survives the hash, so counting distinct addresses is exact"
+    );
+
+    // And a query that orders by something else, while projecting the digests, is not
+    // this refusal's business.
+    let projected = simple_query_rows(
+        &client,
+        &format!("SELECT email FROM {tbl} ORDER BY id LIMIT 1"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(projected[0][0].as_deref(), Some(digest.as_str()));
+
+    drop_table(&client, &tbl).await;
+}

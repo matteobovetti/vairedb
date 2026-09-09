@@ -4,6 +4,9 @@ Gap analysis of the **data types** VaireDB carries end-to-end: from a PostgreSQL
 wire-protocol client, down the write path into the per-shard DuckDB engines, and
 back up the read path through DataFusion/Ballista to the client.
 
+One of five axis documents consolidated in [`gap-analysis.md`](gap-analysis.md); read that
+for the overall picture and this one for the type rows.
+
 ## Scope and framing
 
 Three type systems meet in VaireDB, and they are not peers:
@@ -42,8 +45,8 @@ parser has no name that produces them.
 
 This matters because VaireDB never asks DataFusion's parser for a column type.
 It builds the schema itself, in
-[`parse_data_type`](../../crates/vairedb-coordinator/src/scheduler/scheduler.rs)
-(`scheduler.rs:236`), from the type string the catalog stored. VaireDB is
+[`parse_data_type`](../../crates/vairedb-coordinator/src/column_types.rs), from the
+type string the catalog stored. VaireDB is
 free to choose the Arrow type that matches DuckDB exactly — the binding
 constraint is not DataFusion's parser but **arrow-pg's** ability to map that
 Arrow type to a PostgreSQL OID and encode its values.
@@ -59,7 +62,7 @@ A type crosses five boundaries. It can be lost at any of them.
 | W1 | Parse the statement under `PostgreSqlDialect` (sqlparser 0.58) | `pgwire_handler::parser::parse_sql` | Unknown type names parse as `DataType::Custom`; nothing is rejected. `STRUCT`/`UNION` field lists are **mangled on re-render**. |
 | W2 | Rewrite PG → DuckDB, broadcast shard-local DDL/DML | `write_sql_cl/dialect.rs` (`transform_data_type`), `pgwire_handler/ddl.rs:453` | Only `BYTEA`→`BLOB` and `JSONB`→`JSON` are rewritten. A type DuckDB cannot parse fails the DDL on every shard. |
 | W3 | Store the declared type string in the catalog | `table_meta_ops.rs:238` — stores `col.data_type.to_string()`, **untransformed** | The catalog keeps the PostgreSQL spelling (`BYTEA`, `JSONB`), not what DuckDB received. Both spellings must be handled downstream. |
-| W4 | Convert extended-protocol bind parameters for transport | `write_router.rs:124` (`scalar_to_write_param`) → `WriteParam` oneof → `param_conversion.rs` (`write_param_to_duckdb_value`) | The `WriteParam` oneof carries only `bool / i64 / f64 / string / bytes`. Everything else falls through `other => StringVal(other.to_string())` — see [The write-path parameter defect](#the-write-path-parameter-defect). |
+| W4 | Convert extended-protocol bind parameters for transport | `write_router.rs:124` (`scalar_to_write_param`) → `WriteParam` oneof → `param_conversion.rs` (`write_param_to_duckdb_value`) | The `WriteParam` oneof carries only `bool / i64 / f64 / string / bytes`. Everything else fell through `other => StringVal(other.to_string())` — see [The write-path parameter defect](#the-write-path-parameter-defect). ✅ The fall-through is gone: every remaining variant renders as a SQL literal the shard parses, and a type with no literal form is refused by name. |
 
 Inline literals (simple protocol) are pass-through: the coordinator hands
 rewritten SQL text to DuckDB, which parses the literals itself. **Only
@@ -69,8 +72,8 @@ parameterized DML crosses W4**, which is why the defect there is easy to miss.
 
 | # | Boundary | Code | What can go wrong |
 |---|---|---|---|
-| R1 | Map the stored type string to Arrow for the coordinator's DataFusion schema | `scheduler.rs:203` → `parse_data_type` | Ends in `_ => DataType::Utf8`: **any unrecognized type silently becomes text.** |
-| R2 | Coerce DuckDB's Arrow batches to that schema on the core node | `vairedb-core/src/table_provider/scan_exec.rs:212` (`coerce_batch_to_schema`) | A **safe** `arrow::compute::cast`: unsupported casts error the query; out-of-range or invalid values return **`NULL` instead of failing**. |
+| R1 | Map the stored type string to Arrow for the coordinator's DataFusion schema | `scheduler.rs` → `parse_data_type` (`column_types.rs`) | Ends in `_ => DataType::Utf8`: **any unrecognized type silently becomes text.** ✅ Still the fallback, but it is now reached only by types whose *values* are faithful as text; the ones that lose data are refused at DDL by `unserviceable_type_reason`, the other half of the same table. |
+| R2 | Coerce DuckDB's Arrow batches to that schema on the core node | `vairedb-core/src/table_provider/scan_exec.rs` (`coerce_batch_to_schema`) | Was a **safe** `arrow::compute::cast`, which returned **`NULL` instead of failing** for an out-of-range or invalid value. ✅ The cast is now *checked*: a value the advertised type cannot hold fails the scan, naming the column, the declared type and the type the shard returned. A `NULL` the shard actually stored is still a `NULL`. |
 | R3 | Advertise result/parameter types | `parser.rs:165` (`get_parameter_types`), `parser.rs:200` (`get_result_schema`) → `arrow_pg::datatypes::into_pg_type` | An Arrow type with no arm in `into_pg_type` fails the statement with `XX000 Unsupported Datatype`. |
 | R4 | Encode cells to the wire | `pgwire_handler/encoding.rs` (text) / `arrow_pg::encoder::encode_value` (binary + arrays) | Text and binary have **different code paths and different failure modes** (see [Text vs binary divergence](#text-vs-binary-divergence)). |
 
@@ -103,11 +106,112 @@ except `DATE`, every exact-numeric type, and every unsigned integer is broken or
 lossy** — and `NUMERIC`, `TIMESTAMP` and `TIME` are among the most common column
 types in real PostgreSQL schemas.
 
+### Recomputed after the type-layer work
+
+The counts above are the measurement that motivated the work. Re-measured against the
+same 24 types afterwards, with the same e2e method:
+
+| Verdict | Count | Arrow types |
+|---|---:|---|
+| ✅ Clean | 20 | `Boolean`, `Int8`, `Int16`, `Int32`, `Int64`, `UInt8`, `UInt16`, `UInt32`, `Float32`, `Float64`, `Decimal128`, `Utf8`, `Binary`, `Date32`, `Time64`, `Timestamp(µs, None)`, `Timestamp(µs, tz)`, `Interval`, `List(T)`, `FixedSizeList(n,T)` |
+| 🟡 Lossy | 2 | `UInt64` (advertised `numeric`, not `bigint`), `Struct` (advertised as text) |
+| ❌ Broken | 1 | `Decimal256` |
+| 🚫 Refused at DDL | 1 | `Map` |
+
+The four verdicts that did not become ✅ each have a stated reason:
+
+- **`UInt64`** → `Decimal128(20, 0)`. No PostgreSQL integer type is unsigned, and a
+  top-level Arrow `UInt64` is widened to `Int64` on the wire (so `row_number()` is
+  advertised as `bigint`, which PostgreSQL promises) — which would refuse every value
+  above `i64::MAX`. `DECIMAL(20,0)` holds every `u64`, renders as digits and compares
+  numerically. The 🟡 is the OID, not the value.
+- **`Struct`** stays on the `Utf8` fallback: DuckDB returns it as an Arrow struct that
+  `arrow_pg` has no PG composite encoder for, and re-rendering the declared struct back
+  into a row type is a separate piece of work.
+- **`Decimal256`** has no PostgreSQL OID at all — see
+  [Why not `Decimal256`?](#why-not-decimal256) — so it is refused rather than widened.
+  A literal past 38 digits reaches it, which is why the read path names it.
+- **`Map`** is refused at `CREATE TABLE`, which is a *better* answer than 🟡: the loss
+  happened inside DuckDB's Arrow bridge, below anything the coordinator advertises.
+
+### What the type-layer work changed
+
+**Declared parameters are part of the type.** `DECIMAL(10,2)` and `DECIMAL(38,0)` are
+now different Arrow types instead of both being read as `Decimal128(38,10)`, which
+rendered `1.5` as `1.5000000000` and turned a 38-digit value into `NULL`. A bare
+`DECIMAL`/`NUMERIC` gets **`(18, 3)`** — DuckDB's own default, because the shard is what
+stores the value, so its default is the truth about what comes back rather than
+PostgreSQL's unconstrained `numeric`. Length parameters Arrow does not model
+(`VARCHAR(64)`, `TIMESTAMP(6)`) are stripped, which is what PostgreSQL does to them on
+the wire too. One user-visible consequence survives: `\d` on a `VARCHAR(64)` column prints
+`text` where PostgreSQL prints `character varying(64)`, because introspection is answered
+from the Arrow schema and Arrow has nowhere to keep a typmod. The catalog still holds the
+declared string verbatim, so the length is recoverable if introspection is ever answered
+from there instead.
+
+**Microseconds, not nanoseconds**, for `TIMESTAMP` and `TIME` — DuckDB's actual Arrow
+return type, so the schema rebuild takes its "fields already match" fast path and casts
+nothing. `TIMESTAMPTZ` carries `Some("UTC")`, because the zone is the point of the type.
+
+**An array's declared length is dropped:** `T[n]` is rewritten to `T[]` on the write
+path. PostgreSQL accepts a declared array length and then ignores it entirely, so
+matching PostgreSQL means dropping it — and keeping it made DuckDB store a
+`FixedSizeList` that `arrow_pg` cannot encode at all.
+
+**The schema-rebuild cast is checked, not safe.** Arrow's default *safe* cast replaces
+any value the target type cannot hold with `NULL`, so a shard holding
+`12345678901234567890` under a column the catalog calls `DECIMAL(18,3)` returned a
+`NULL` the client could not distinguish from one it had written. The cast now fails the
+scan and names the column, the declared type and the type the shard returned. The write
+path does the same for a bind parameter that does not fit its column.
+
+**Interval and `timestamptz` render in PostgreSQL's text form**, not Arrow's debug form
+— `1 year 2 mons` and `2024-01-01 10:00:00+00` — because the text wire format is what
+`psql` and every driver that asks for text will parse.
+
+**Eight types are refused at DDL** rather than accepted and then unreadable. Each
+refusal names an alternative:
+
+| Refused | Because | Alternative named |
+|---|---|---|
+| `HUGEINT` / `INT128` | DuckDB narrows a 128-bit integer to 38 digits below the coordinator | `BIGINT`, or `DECIMAL(38,0)` |
+| `UHUGEINT` / `UINT128` | same narrowing; the unsigned maximum reads back as `-1` | `UBIGINT`, or `DECIMAL(38,0)` |
+| `BIT` / `BITSTRING` / `VARBIT` / `BIT VARYING` | returned as bytes that are not valid text, so every value becomes `NULL` | `BOOLEAN`, or `VARCHAR` for the `'0'`/`'1'` spelling |
+| `BIGNUM` / `VARINT` | same byte-to-`NULL` conversion | `DECIMAL(38,s)` |
+| `UNION` | no PostgreSQL wire type to describe the column as | one nullable column per member, or `JSON` |
+| `VARIANT` | DuckDB cannot store or decode one | `JSON` |
+| `MAP` | no PostgreSQL wire type | `JSON`, or a pair of array columns |
+| `TIMETZ` / `TIME WITH TIME ZONE` | DuckDB drops the UTC offset, so the value comes back as a different time | `TIMESTAMPTZ`, or `TIME` with the offset in its own column |
+
+The refusal is `0A000` (`feature_not_supported`), applies to `CREATE TABLE`,
+`ALTER TABLE ... ADD COLUMN` and `ALTER COLUMN ... TYPE`, and applies to an array for
+the same reason as its element: `HUGEINT[]` is refused because `HUGEINT` is.
+
+**Still deliberately on the `Utf8` fallback**, because their *values* are faithful as
+text and only the OID is wrong: `UUID`, `CHAR`/`BPCHAR`, `JSON`, `ENUM`, `STRUCT`.
+`ENUM` is not mapped to `Dictionary(UInt8, Utf8)` even though `arrow_pg` accepts it —
+the dictionary would still sort by decoded string, so the one behavior that would
+justify the change (PostgreSQL's ordering by declaration order) would not follow.
+
+**Deferred, with the reason:** `Decimal256`; `NUMERIC` above 29 digits in *binary*
+format; `STRUCT` re-rendered as a PG composite; `ENUM` declaration-order sorting;
+`JSON`/`UUID` OIDs; and timestamp literals outside the nanosecond range, which is a
+DataFusion planner limit rather than a coordinator one and belongs upstream. The
+remaining `#[ignore]`d cases in `tests/e2e/tests/data_types_round_trips.rs` are exactly
+this list — each carries the reason in its ignore message.
+
 ## Master table — DataFusion types end-to-end
 
 `DuckDB Arrow` is what the DuckDB driver returns on a scan. `VaireDB advertises`
-is what `parse_data_type` derives today. `PG OID` is what the client is told in
-`RowDescription`/`ParameterDescription`.
+is what `parse_data_type` derived **at the time of the audit**. `PG OID` is what the
+client is told in `RowDescription`/`ParameterDescription`.
+
+> This table is the original measurement, kept because the *mechanism* behind each
+> verdict is what the fixes had to address, and because it is the record against which
+> the work was checked. For the state after that work, read
+> [the recomputed verdicts](#recomputed-after-the-type-layer-work) and
+> [what changed](#what-the-type-layer-work-changed) — every ❌ and 🟡 below is either
+> resolved there or listed as deferred with its reason.
 
 ### Boolean
 
@@ -115,11 +219,13 @@ is what `parse_data_type` derives today. `PG OID` is what the client is told in
 |---|---|---|---|---|:--:|:--:|
 | `Boolean` | `BOOLEAN`, `BOOL` | `BOOLEAN` | `Boolean` | `Boolean` | `bool` | ✅ |
 
-Notes: the type mapping is clean and no value is lost, but the **text** wire form
-diverges: `arrow_array_value_to_string` emits Rust's `true`/`false` where
-PostgreSQL's `boolout` emits `t`/`f`. Binary format is correct. Most drivers
-accept both spellings on input, so this is cosmetic — see
-[Text vs binary divergence](#text-vs-binary-divergence).
+Notes: the type mapping is clean, no value is lost, and the **text** wire form now
+matches `boolout` — `t`/`f`, not Rust's `true`/`false`. The two spellings could not be
+collapsed into one renderer: `t` is what a client reading a text-format boolean
+compares against, and `true` is what a SQL literal has to say, since `t` parses as an
+identifier. So the wire form is decided by `wire_text_value` and the literal form
+stays with `arrow_array_value_to_string`, which the write path shares to re-emit rows
+as literals (`write_sql_cl/rows.rs:110`). Binary format was already correct.
 
 ### Character
 
@@ -202,7 +308,8 @@ silent `NULL` into an explicit `22003` for binary clients on >29-digit
 `DECIMAL(38,0)` values — a strict improvement, but a visible behavior change.
 
 `Decimal256` is unreachable and unusable: DuckDB rejects `p > 38` outright, and
-arrow-pg 0.14 has **no `Decimal256` arm** in `into_pg_type` (only `Decimal128`),
+arrow-pg has **no `Decimal256` arm** in `into_pg_type` (only `Decimal128`) —
+still true at 0.15.0, the version in `Cargo.lock` today —
 so advertising it fails every `SELECT` on that column with
 `XX000 Unsupported Datatype Decimal256(...)`. See
 [Why not `Decimal256`?](#why-not-decimal256).
@@ -248,7 +355,7 @@ produces:
 - `TIME` → correct value (`12:34:56`), wrong type.
 - `INTERVAL` → Arrow's rendering (`1 days`), not PostgreSQL's (`1 day`).
 
-Also note DataFusion 53's parser **drops the timezone** when `TIMESTAMPTZ` is
+Also note DataFusion's parser **drops the timezone** when `TIMESTAMPTZ` is
 used as a cast target (`CAST(x AS TIMESTAMPTZ)` yields `Timestamp(ns, None)`).
 That does not affect column typing, which VaireDB controls, but it does affect
 explicit casts written by clients.
@@ -390,26 +497,30 @@ rather than stringifying it.
 
 ## Text vs binary divergence
 
-`encoding.rs` renders text cells with VaireDB's own
-`arrow_array_value_to_string`, and routes binary cells (and all arrays) to
-`arrow_pg::encoder::encode_value`. The two paths do not fail together, so a
-column can work in `psql` and break in JDBC:
+`encoding.rs` renders text cells itself (`wire_text_value`, falling through to
+`arrow_array_value_to_string` for every type whose wire form and literal form agree),
+and routes binary cells (and all arrays) to `arrow_pg::encoder::encode_value`. The two
+paths do not fail together, so a column can work in `psql` and break in JDBC:
 
 | Condition | Text format | Binary format |
 |---|---|---|
-| `Boolean` value | renders `true`/`false`; PostgreSQL renders `t`/`f` | correct |
-| `Decimal128` value > 29 digits | renders correctly | `22003` error |
-| `FixedSizeList` column | renders via `ArrayFormatter` | **panic** in arrow-pg |
-| `LargeList` column | **panic** in arrow-pg | **panic** in arrow-pg |
+| `Boolean` value | ~~renders `true`/`false`~~ — **fixed**: `t`/`f`, as `boolout` does | correct |
+| `Decimal128` value > 29 digits | renders correctly | `22003` error — still open, upstream in arrow-pg |
+| `FixedSizeList` column | renders via `ArrayFormatter` | ~~**panic** in arrow-pg~~ — **unreachable**: `T[n]` is rewritten to `T[]` at DDL, so no `FixedSizeList` column is ever created |
+| `LargeList` column | ~~**panic** in arrow-pg~~ — **unreachable**: nothing in `parse_data_type` maps to `LargeList` | ~~**panic**~~ — same |
 
-The panics are an availability concern, not just a correctness one: they unwind
-inside the pgwire connection task.
+The panics would have been an availability concern, not just a correctness one — they
+unwind inside the pgwire connection task. Both are now closed by never advertising the
+type rather than by guarding the encoder, which is the stronger fix: there is no path
+left that could reach it.
 
-## DuckDB types to restrict
+## DuckDB types to restrict — ✅ done
 
 Per framing point 2, these DuckDB types have no clean path to DataFusion or to
 the wire and should be **rejected at DDL time** (`0A000`) rather than accepted
-and broken on first read:
+and broken on first read. All of them now are, except the last row — see
+[the eight refused types](#what-the-type-layer-work-changed) for the client-facing
+reasons and `TIMESTAMP_S`/`_MS`/`_NS`, which were mapped rather than refused:
 
 | DuckDB type | Why it cannot be served |
 |---|---|
@@ -423,19 +534,21 @@ and broken on first read:
 | `TIMETZ` / `TIME WITH TIME ZONE` | DuckDB's Arrow bridge drops the offset (`12:34:56+02` → `Time64(µs)` `12:34:56`) — silent data loss upstream of the coordinator. |
 | `TIMESTAMP_S` / `_MS` / `_NS` | No `parse_data_type` arm; read back as ISO `T`-separated text. Cheap to support properly (all three are valid Arrow `Timestamp` units), so restrict *or* map — do not leave as text. |
 
-Rejecting at DDL is strictly better than the status quo for all of these: today
-`MAP`, `VARIANT`, `HUGEINT` and `BIT` are accepted at `CREATE TABLE`, accept
-`INSERT`s, and only break on the first `SELECT` — after the data is written.
+Rejecting at DDL was strictly better than the status quo for all of these: `MAP`,
+`VARIANT`, `HUGEINT` and `BIT` were accepted at `CREATE TABLE`, accepted `INSERT`s,
+and only broke on the first `SELECT` — after the data was written.
 
-## The alias gap
+## The alias gap — ✅ closed
 
 `parse_data_type` matches the declared string, so an unrecognized **alias** of a
-supported type degrades to text even though the canonical name works. Recognized
-today: `INT8`, `INT4`, `INT`, `INT2`, `BOOL`, `FLOAT4`, `FLOAT8`, `REAL`,
-`DOUBLE PRECISION`, `BYTEA`, `TEXT`, `STRING`, `NUMERIC`, `JSONB`
-(`CHAR`/`BPCHAR` work via the `Utf8` catch-all). Missing:
+supported type degraded to text even though the canonical name worked. Already
+recognized at the time of the audit: `INT8`, `INT4`, `INT`, `INT2`, `BOOL`, `FLOAT4`,
+`FLOAT8`, `REAL`, `DOUBLE PRECISION`, `BYTEA`, `TEXT`, `STRING`, `NUMERIC`, `JSONB`
+(`CHAR`/`BPCHAR` work via the `Utf8` catch-all). Every alias below is now recognized
+too — `BITSTRING` by being refused alongside `BIT`, the rest by mapping to the
+canonical type:
 
-| Alias | Canonical | Effect |
+| Alias | Canonical | Effect it had |
 |---|---|---|
 | `BINARY`, `VARBINARY` | `BLOB` | **Silent data loss** — non-UTF-8 bytes read back `NULL`. |
 | `LONG` | `BIGINT` | Numbers arrive as strings. |
@@ -453,12 +566,19 @@ today: `INT8`, `INT4`, `INT`, `INT2`, `BOOL`, `FLOAT4`, `FLOAT8`, `REAL`,
 - **Typed drivers break.** `Describe`/`RowDescription` is built from the same
   Arrow schema (`get_result_schema`), so JDBC `getTimestamp()`/`getLong()` on a
   fallback column sees `text`.
-- **Predicates and ordering go lexicographic.** `SchedulerTableProvider` does
-  not override `supports_filters_pushdown`, so `filter_exprs` is always empty
-  and DataFusion evaluates every filter itself — over the advertised type.
-  `WHERE ts > '2024-01-01 12:00:00'` on a `TIMESTAMPTZ` column compares strings
-  against DuckDB's `2024-01-01T10:00:00Z` rendering; `ORDER BY` on a `UBIGINT`
-  column sorts digit-by-digit.
+- **Predicates and ordering go lexicographic.** DataFusion evaluates every filter
+  over the *advertised* type, so `WHERE ts > '2024-01-01 12:00:00'` on a
+  `TIMESTAMPTZ` column compares strings against DuckDB's `2024-01-01T10:00:00Z`
+  rendering, and `ORDER BY` on a `UBIGINT` column sorts digit-by-digit. Both of
+  those particular columns are now typed properly, but the general consequence
+  survives for whatever still lands on the fallback, and it is the reason
+  [predicate push-down](gap-analysis-operator-literal.md) sends **no** predicate at
+  all to a shard for a column the catch-all produced. The coordinator compares such
+  a column's text; the shard compares the type it actually stored; and the
+  disagreement is not always a wrong answer — on a `UUID` or `JSON` column a literal
+  DuckDB cannot convert makes the shard's query *fail*, which no amount of
+  re-filtering upstream can undo. A column the client really declared as text
+  (`VARCHAR`, `TEXT`, `CHAR`) is unaffected: equality and `IN` on it are pushed.
 - **Failures are silent.** `coerce_batch_to_schema` uses the *safe* cast, so
   overflow and invalid UTF-8 become `NULL` rather than errors.
 - **Unsupported types fail late**, after data has been written.
@@ -493,31 +613,49 @@ casting, and it avoids the nanosecond range limit on stored values.
 
 ## Prioritized remediation
 
-1. **Fix `scalar_to_write_param` / extend `WriteParam`** — parameterized writes
-   into `NUMERIC`, `TIMESTAMP`, `TIMESTAMPTZ`, `TIME` and `INTERVAL` columns fail
-   outright today, on the most ordinary statement shape there is. Must land with
-   or before item 2. Add e2e coverage for every type in the recommended mapping.
-2. **Extend `parse_data_type`** per the recommended target mapping — one change
-   that closes the unsigned integers, all three broken temporal types,
-   `BINARY`/`VARBINARY` and every missing alias.
-3. **Honor declared `DECIMAL(p,s)`** — removes the trailing-zero rendering and
-   the silent `NULL` on large decimals, and enables the coercion fast path.
-4. **Reject unsupported types at DDL time** (`0A000`) — everything in
-   [DuckDB types to restrict](#duckdb-types-to-restrict). Fail the
-   `CREATE TABLE`, not the first `SELECT`. Decide explicitly whether an unknown
-   declared type should degrade to text at all, or be rejected.
-5. **Guard the encoder against panicking types** — never advertise
-   `FixedSizeList` or `LargeList`; consider extending `is_list` in
-   `encoding.rs` so a `LargeList` column cannot reach arrow-pg's text path.
-6. **Consider raising `TIMESTAMP` to ✅** by documenting or working around
-   DataFusion's nanosecond literal range (rewriting out-of-range literals to
-   microsecond-typed literals in the read-path AST transform).
+Items 1–5 are **done**; the ordering constraint in item 1 was honored. See
+[what the type-layer work changed](#what-the-type-layer-work-changed) for the details
+and [the recomputed verdicts](#recomputed-after-the-type-layer-work) for the result.
+
+1. ~~**Fix `scalar_to_write_param` / extend `WriteParam`**~~ — **done**, and landed
+   before item 2 as the sequencing required. Rather than extending the `WriteParam`
+   oneof with typed variants, each `ScalarValue` is rendered as a **SQL literal the
+   shard's engine parses** — the narrower interim fix this document proposed, chosen
+   because the shard binds from a literal anyway. Decimals render at their declared
+   scale, timestamps and times as clock values rather than counts of microseconds, and
+   intervals are hand-rendered in the units DuckDB names (Arrow's `Debug` form is not
+   parseable). The `other => Display` fall-through is gone: a type with **no** literal
+   form — an array, a struct, a map — is refused by name with the reason and the
+   alternative, instead of being stringified into something the shard would misread.
+   e2e coverage exists for every type in the recommended mapping.
+2. ~~**Extend `parse_data_type`**~~ — **done**, per the recommended target mapping:
+   the unsigned integers, all three broken temporal types, `BINARY`/`VARBINARY` and
+   every missing alias, in one change.
+3. ~~**Honor declared `DECIMAL(p,s)`**~~ — **done.** A bare `DECIMAL` gets DuckDB's own
+   `(18,3)` rather than a hardcoded `(38,10)`, which removed both the trailing-zero
+   rendering and the silent `NULL` on large decimals and enabled the coercion fast
+   path.
+4. ~~**Reject unsupported types at DDL time**~~ — **done**, `0A000`, for all eight
+   types, at `CREATE TABLE`, `ADD COLUMN` and `ALTER COLUMN ... TYPE`, with an
+   alternative named in each message. The explicit decision on the last part: an
+   *unknown* declared type still degrades to text, because a type this build does not
+   know is not the same as a type it knows cannot be served — refusing it would break
+   forward compatibility with any type DuckDB adds whose values are faithful as text.
+5. ~~**Guard the encoder against panicking types**~~ — **done** by not advertising
+   either: `T[n]` is rewritten to `T[]` at DDL so no `FixedSizeList` is ever created,
+   and nothing maps to `LargeList`.
+6. **Consider raising `TIMESTAMP` to ✅** by working around DataFusion's nanosecond
+   literal range. **Deferred** — the range is enforced in DataFusion's own planner,
+   above anything the coordinator controls, so the fix belongs upstream. The type
+   itself is ✅; only a literal outside 1677–2262 is affected.
 7. **Fix the `STRUCT` DDL re-render** (or bypass sqlparser rendering for
    shard-local DDL) — the only blocker to `Struct` support, which arrow-pg
-   already handles as `record`.
+   already handles as `record`. **Deferred**, and now the top remaining item.
 8. **Wire-type fidelity for `JSON` and `UUID`** — correct OIDs (`json`, `uuid`)
    once the Arrow side carries a distinguishable type. Both are cosmetic today:
    values are already faithful.
+9. **`NUMERIC` above 29 digits in binary format** — still `22003` from arrow-pg's
+   encoder while the text format renders it correctly. Upstream, and narrow.
 
 ## Why not `Decimal256`?
 
@@ -530,7 +668,7 @@ anything reaching the wire:
 - **DuckDB `DECIMAL` never exceeds 128 bits.** Width is capped at 38, so
   `Decimal128` holds every legal DuckDB decimal *exactly*. The `NULL` is caused
   by the hardcoded `(38,10)` target, not by 128-bit capacity.
-- **arrow-pg 0.14 cannot map it.** `into_pg_type` has a `Decimal128` arm and no
+- **arrow-pg cannot map it** (re-checked at 0.15.0). `into_pg_type` has a `Decimal128` arm and no
   `Decimal256`, so it falls to the catch-all:
   `XX000 Unsupported Datatype Decimal256(48, 10)` (and `Unsupported List
   Datatype` inside a list). That function backs both `Describe` and result

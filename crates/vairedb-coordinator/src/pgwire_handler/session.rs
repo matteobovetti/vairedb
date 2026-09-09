@@ -12,13 +12,20 @@
 //! (nothing was shipped) and lets a single-shard transaction — the common ORM
 //! case — be applied as one genuine DuckDB transaction.
 //!
-//! `SET`/`SHOW` session parameters belong here too when they gain support.
+//! The connection's runtime parameters live here for the same reason — `SET`
+//! changes one client's view and nothing else's. Their own logic is in
+//! [`crate::pgwire_handler::session_params`].
+//!
+//! So does a `COPY ... FROM STDIN` in progress: the client is mid-upload, and the
+//! sink taking its rows has to be the same one the `COPY` statement opened.
 
 use std::sync::Arc;
 
 use tokio::sync::{Mutex, MutexGuard};
 
 use crate::catalog::ShardMeta;
+use crate::pgwire_handler::copy_stream::CopySink;
+use crate::pgwire_handler::session_params::SessionParams;
 use crate::replication::BatchStatement;
 
 /// Where a connection stands with respect to an explicit transaction block.
@@ -220,11 +227,15 @@ fn node_set_key(shard: &ShardMeta) -> String {
 
 /// One connection's session state, held in pgwire's session extensions.
 ///
-/// The transaction is behind an async mutex because it is mutated across the
-/// `await` points of planning and shipping a write.
+/// Each field is behind its own async mutex because both are mutated across
+/// `await` points — the transaction across planning and shipping a write, the
+/// parameters across the handler's own async dispatch. Separate locks so a `SHOW`
+/// never waits on a write being shipped.
 #[derive(Default)]
 pub(crate) struct SessionState {
     transaction: Mutex<Transaction>,
+    params: Mutex<SessionParams>,
+    copy_in: Mutex<Option<CopySink>>,
 }
 
 impl SessionState {
@@ -232,13 +243,35 @@ impl SessionState {
     /// belongs to. pgwire drops the extensions when the connection closes, so a
     /// buffered transaction cannot outlive its client.
     pub(crate) fn for_client<C: pgwire::api::ClientInfo>(client: &C) -> Arc<Self> {
-        client
-            .session_extensions()
-            .get_or_insert_with(Self::default)
+        client.session_extensions().get_or_insert_with(|| Self {
+            transaction: Mutex::default(),
+            // Seeded from the `ParameterStatus` values this client was sent at
+            // startup, so `SHOW` reports what it was already told rather than a
+            // second copy of the same defaults.
+            params: Mutex::new(SessionParams::for_client(client)),
+            copy_in: Mutex::default(),
+        })
     }
 
     pub(crate) async fn transaction(&self) -> MutexGuard<'_, Transaction> {
         self.transaction.lock().await
+    }
+
+    /// The `COPY ... FROM STDIN` this connection is in the middle of, if any.
+    ///
+    /// A copy in progress belongs to one connection: the client is mid-upload and
+    /// the protocol allows nothing else until it finishes, so the sink lives here
+    /// rather than on the handler — which is a single `Arc` shared by every
+    /// connection. It is dropped with the connection, so a client that disconnects
+    /// mid-copy cannot leave a half-fed sink behind.
+    pub(crate) async fn copy_in(&self) -> MutexGuard<'_, Option<CopySink>> {
+        self.copy_in.lock().await
+    }
+
+    /// The connection's runtime parameters — what `SET`, `SHOW` and `RESET` read
+    /// and write.
+    pub(crate) async fn params(&self) -> MutexGuard<'_, SessionParams> {
+        self.params.lock().await
     }
 }
 

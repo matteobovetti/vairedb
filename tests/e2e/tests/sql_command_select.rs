@@ -322,6 +322,286 @@ async fn test_where_range_scan() {
     drop_table(&client, &tbl).await;
 }
 
+// ============================================================================
+// Predicate and limit push-down — the same answers, computed on the shards
+//
+// A predicate the coordinator sends to a shard is re-parsed and re-evaluated by
+// a different engine, so these tests are about the answer not changing. They
+// are ordinary SELECTs on purpose: the push-down is invisible in the result,
+// and that is exactly the property worth pinning.
+// ============================================================================
+
+// A predicate reaches the shard as SQL text, so a value containing a quote is the case
+// that separates a rendered literal from a concatenated string. The row must come back,
+// and the statement around it must not be altered by its own data.
+#[tokio::test]
+async fn test_pushed_predicate_on_a_string_with_a_quote() {
+    let client = ready_client().await;
+    let tbl = create_table(
+        &client,
+        "q_push_quote",
+        &format!("(id INTEGER NOT NULL, name VARCHAR NOT NULL) {CREATE_OPTS}"),
+    )
+    .await;
+
+    execute(
+        &client,
+        &format!(
+            "INSERT INTO {tbl} (id, name) VALUES \
+             (1, 'o''brien'), (2, 'plain'), (3, 'a''b''c')"
+        ),
+    )
+    .await
+    .unwrap();
+
+    let rows = simple_query_rows(
+        &client,
+        &format!("SELECT id FROM {tbl} WHERE name = 'o''brien'"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        ints(&rows, 0),
+        vec![1],
+        "the quoted value must match itself"
+    );
+
+    let rows = simple_query_rows(
+        &client,
+        &format!("SELECT id FROM {tbl} WHERE name LIKE 'a''%' ORDER BY id"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ints(&rows, 0), vec![3]);
+
+    drop_table(&client, &tbl).await;
+}
+
+// The one disagreement push-down cannot survive: PostgreSQL and DataFusion treat `\` as
+// LIKE's default escape character, DuckDB has no default escape at all. Pushing this
+// pattern makes the shard match nothing, and rows a shard never returns are rows the
+// coordinator's own filter cannot recover — so the predicate has to stay put. The answer
+// below is PostgreSQL's.
+#[tokio::test]
+async fn test_like_with_the_default_escape_answers_as_postgres_does() {
+    let client = ready_client().await;
+    let tbl = create_table(
+        &client,
+        "q_push_like_escape",
+        &format!("(id INTEGER NOT NULL, name VARCHAR NOT NULL) {CREATE_OPTS}"),
+    )
+    .await;
+
+    execute(
+        &client,
+        &format!(
+            "INSERT INTO {tbl} (id, name) VALUES \
+             (1, 'a_b'), (2, 'axb'), (3, '50%off'), (4, '50xoff')"
+        ),
+    )
+    .await
+    .unwrap();
+
+    // `\_` is a literal underscore, so only the row that really holds one matches.
+    let rows = simple_query_rows(
+        &client,
+        &format!("SELECT id FROM {tbl} WHERE name LIKE 'a\\_b' ORDER BY id"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        ints(&rows, 0),
+        vec![1],
+        "an escaped underscore must match only the literal underscore"
+    );
+
+    // Same for `%`: the escaped one is a per-cent sign, the bare one is the wildcard.
+    let rows = simple_query_rows(
+        &client,
+        &format!("SELECT id FROM {tbl} WHERE name LIKE '50\\%%' ORDER BY id"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ints(&rows, 0), vec![3]);
+
+    drop_table(&client, &tbl).await;
+}
+
+// AND/OR mixed in one predicate: each conjunct is pushed as its own fragment and the
+// fragments are re-joined with AND on the shard, so an OR that lost its grouping would
+// silently return the wrong rows.
+#[tokio::test]
+async fn test_pushed_predicate_keeps_or_grouping() {
+    let client = ready_client().await;
+    let tbl = unique_table_name("q_push_or");
+    setup_op_table(&client, &tbl).await;
+
+    let rows = simple_query_rows(
+        &client,
+        &format!("SELECT id FROM {tbl} WHERE (cat = 'a' OR cat = 'b') AND amt >= 20 ORDER BY id"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ints(&rows, 0), vec![2, 3, 4]);
+
+    // The NULL row must not be admitted by a pushed predicate either: `amt >= 20` is
+    // unknown for it, not true.
+    let rows = simple_query_rows(
+        &client,
+        &format!("SELECT id FROM {tbl} WHERE amt >= 20 OR amt IS NULL ORDER BY id"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ints(&rows, 0), vec![2, 3, 4, 5, 6]);
+
+    drop_table(&client, &tbl).await;
+}
+
+// A pushed LIMIT is per shard, and the shards do not agree on which rows are "first".
+// So the row *count* is the contract, and the query's own ORDER BY still has to see
+// every row it needs — which is why DataFusion does not push a limit under a sort.
+#[tokio::test]
+async fn test_pushed_limit_returns_the_requested_count() {
+    let client = ready_client().await;
+    let tbl = create_table(
+        &client,
+        "q_push_limit",
+        &format!("(id INTEGER NOT NULL) {CREATE_OPTS}"),
+    )
+    .await;
+
+    let values = (1..=40)
+        .map(|i| format!("({i})"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    execute(&client, &format!("INSERT INTO {tbl} (id) VALUES {values}"))
+        .await
+        .unwrap();
+
+    for limit in [1usize, 7, 40, 100] {
+        let rows = simple_query_rows(&client, &format!("SELECT id FROM {tbl} LIMIT {limit}"))
+            .await
+            .unwrap();
+        assert_eq!(
+            rows.len(),
+            limit.min(40),
+            "LIMIT {limit} across the shards returned the wrong number of rows"
+        );
+    }
+
+    // ORDER BY ... LIMIT still ranks the whole table, not each shard's prefix.
+    let rows = simple_query_rows(
+        &client,
+        &format!("SELECT id FROM {tbl} ORDER BY id DESC LIMIT 3"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ints(&rows, 0), vec![40, 39, 38]);
+
+    // And a limit combined with a predicate counts rows that satisfy it, not rows the
+    // shard happened to read first.
+    let rows = simple_query_rows(
+        &client,
+        &format!("SELECT id FROM {tbl} WHERE id > 30 ORDER BY id LIMIT 4"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ints(&rows, 0), vec![31, 32, 33, 34]);
+
+    drop_table(&client, &tbl).await;
+}
+
+// A predicate on a text column: equality and LIKE are pushed, ordering comparisons are
+// not (see `scheduler::filter_pushdown`). Both must give the PostgreSQL answer.
+#[tokio::test]
+async fn test_pushed_predicate_on_a_text_column() {
+    let client = ready_client().await;
+    let tbl = unique_table_name("q_push_text");
+    setup_op_table(&client, &tbl).await;
+
+    let rows = simple_query_rows(
+        &client,
+        &format!("SELECT id FROM {tbl} WHERE cat IN ('a', 'c') ORDER BY id"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ints(&rows, 0), vec![1, 2, 5, 6]);
+
+    let rows = simple_query_rows(
+        &client,
+        &format!("SELECT DISTINCT cat FROM {tbl} WHERE cat > 'a' ORDER BY cat"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(strings(&rows, 0), vec!["b".to_string(), "c".to_string()]);
+
+    drop_table(&client, &tbl).await;
+}
+
+// A `UUID` and a `JSON` column are both advertised to the client as text, because text is a
+// faithful rendering of either. A *predicate* on one is not faithful, though: the shard
+// stores a UUID as a 128-bit integer and parses a JSON literal as JSON, so a literal it
+// cannot convert is a conversion *error* there — `Could not convert string 'notauuid' to
+// INT128` — where the coordinator would simply match no row. An error is the one outcome
+// re-filtering at the coordinator cannot undo, so no predicate is pushed onto such a column.
+// What the client must see is PostgreSQL's answer: no rows.
+#[tokio::test]
+async fn test_predicate_on_a_column_that_is_text_in_name_only() {
+    let client = ready_client().await;
+    let tbl = create_table(
+        &client,
+        "q_push_opaque",
+        &format!("(id INTEGER NOT NULL, uid UUID NOT NULL, body JSON NOT NULL) {CREATE_OPTS}"),
+    )
+    .await;
+
+    execute(
+        &client,
+        &format!(
+            "INSERT INTO {tbl} (id, uid, body) VALUES \
+             (1, '123e4567-e89b-12d3-a456-426614174000', '{{\"a\":1}}'), \
+             (2, '00000000-0000-0000-0000-000000000002', '{{\"a\":2}}')"
+        ),
+    )
+    .await
+    .unwrap();
+
+    // A literal that is not a UUID at all: no rows, and no error.
+    let rows = simple_query_rows(
+        &client,
+        &format!("SELECT id FROM {tbl} WHERE uid = 'notauuid'"),
+    )
+    .await
+    .unwrap();
+    assert!(
+        rows.is_empty(),
+        "a non-UUID literal must match nothing rather than fail the query"
+    );
+
+    // Same for a literal that is not JSON.
+    let rows = simple_query_rows(
+        &client,
+        &format!("SELECT id FROM {tbl} WHERE body = 'not json at all'"),
+    )
+    .await
+    .unwrap();
+    assert!(
+        rows.is_empty(),
+        "a malformed JSON literal must match nothing"
+    );
+
+    // And the predicate still *works* — it is only the shard-side copy that was dropped.
+    let rows = simple_query_rows(
+        &client,
+        &format!("SELECT id FROM {tbl} WHERE uid = '123e4567-e89b-12d3-a456-426614174000'"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(ints(&rows, 0), vec![1]);
+
+    drop_table(&client, &tbl).await;
+}
+
 #[tokio::test]
 async fn test_distinct() {
     let client = ready_client().await;

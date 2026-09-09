@@ -14,6 +14,7 @@ prost-types = { workspace = true }
 redb = { workspace = true }
 pgwire = { workspace = true }
 datafusion-pg-catalog = { workspace = true }
+datafusion-pg-functions = { workspace = true }
 arrow-pg = { workspace = true }
 arrow = { workspace = true }
 tracing = { workspace = true }
@@ -33,6 +34,9 @@ sha2 = { workspace = true }
 async-trait = "0.1"
 futures = "0.3"
 tokio-stream = "0.1"
+# The copy sub-protocol's payload type: pgwire takes `CopyData::new(Bytes)` but does
+# not re-export `bytes`, so the COPY path needs it by name.
+bytes = "1"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time"] }
