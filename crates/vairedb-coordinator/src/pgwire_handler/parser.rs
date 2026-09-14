@@ -52,10 +52,14 @@ use crate::pgwire_handler::error_enrichment::{
 };
 use crate::pgwire_handler::introspection;
 use crate::pgwire_handler::pg_aggregate_widening;
+use crate::pgwire_handler::pg_float_division;
+use crate::pgwire_handler::pg_integer_literals;
+use crate::pgwire_handler::pg_not_in_nulls;
 use crate::pgwire_handler::pg_operators;
 use crate::pgwire_handler::pg_param_types;
 use crate::pgwire_handler::pg_set_op_types;
 use crate::pgwire_handler::pg_using_join_merge;
+use crate::pgwire_handler::pg_using_join_qualifiers;
 use crate::pgwire_handler::query_router::{self, QueryType};
 use crate::pgwire_handler::session_params;
 use crate::pgwire_handler::views;
@@ -98,10 +102,19 @@ fn pg_parser() -> &'static PostgresCompatibilityParser {
 /// `RESET` has one exception: neither parser has the statement at all, so it is
 /// recognized here and rewritten to the `SET … TO DEFAULT` PostgreSQL defines it
 /// to be — see [`session_params::parse_reset`].
+///
+/// One correction happens on the *text*, before either parse: sqlparser has no binary,
+/// octal or hexadecimal integer literal and silently turns `0b101` into `0` and `0x1F`
+/// into a byte string, which no AST rewrite can undo because the digits are gone by then.
+/// [`pg_integer_literals`] respells them in decimal here, so both paths parse the same
+/// numbers.
 pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     if let Some(statements) = session_params::parse_reset(sql) {
         return Ok(statements);
     }
+
+    let normalized = pg_integer_literals::normalize_non_decimal_integers(sql)?;
+    let sql = normalized.as_ref();
 
     let statements = pg_parser().parse(sql)?;
 
@@ -402,6 +415,13 @@ pub(super) fn prepare_select_for_planning(
         // wrote them — `SIMILAR TO` is a `SIMILAR TO` here and a function call after.
         anonymized_reads::reject_meaningless_reads(&prepared, catalog)?;
     }
+    // After the view expansion, so a `USING` join inside a definition's body is respelled
+    // like a client's own, and on the AST because both halves of that respelling are
+    // decisions the planner has already taken by the time there is a plan: a bare `id` has
+    // been resolved to one side's field and a `USING` constraint has become a schema with
+    // two fields named `id`. See `pg_using_join_qualifiers`, which leaves every statement
+    // that does not qualify a key to `pg_using_join_merge` on the plan.
+    pg_using_join_qualifiers::split_qualified_using_keys(&mut prepared)?;
     // Translate PG TO_CHAR format strings to strftime specifiers so DataFusion's
     // native to_char formats correctly on the read path.
     transform_to_char_format_for_read(&mut prepared);
@@ -462,6 +482,19 @@ pub(super) async fn plan_select(
     // this plan reports, so a type the plan does not carry yet is one the client's value
     // never gets. See `pg_param_types`.
     let plan = pg_param_types::resolve_placeholder_types(plan);
+    // After the placeholders, because an untyped `$N` has no type to divide at and `x / $1`
+    // would be skipped for want of one; and before `coerce_types`, so the call this inserts
+    // is type-checked by the analyzer like any other. On the plan and not on the AST
+    // because `a / b` is an error at `numeric` and an infinity at `float8`, and the parse
+    // cannot tell the two apart. See `pg_float_division`.
+    let plan = pg_float_division::guard_float_division(plan)
+        .map_err(|e| enrich_datafusion_error(&e, &select_ctx))?;
+    // Before the optimizer, and only before it: decorrelation is the pass that turns a
+    // `NOT IN (subquery)` into the anti join whose NULL handling is what diverges, so
+    // afterwards there is no `InSubquery` left to judge. Reads nullability, which is why it
+    // is here on the plan rather than beside the AST rewrite that respells the shapes this
+    // one refuses. See `pg_not_in_nulls`.
+    pg_not_in_nulls::reject_null_unaware_not_in(&plan)?;
     // Before `coerce_types`, and only before it: coercion is the pass that inserts the casts
     // making a set operation's branches agree, so afterwards there is no disagreement left to
     // refuse. See `pg_set_op_types`.

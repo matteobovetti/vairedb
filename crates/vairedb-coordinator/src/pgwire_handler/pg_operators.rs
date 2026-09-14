@@ -23,14 +23,16 @@ use std::ops::ControlFlow;
 
 use pgwire::error::{PgWireError, PgWireResult};
 
+use vairedb_common::bytea_in::BYTEA_IN_UDF_NAME;
 use vairedb_common::proto::vairedb::v1::VdbErrorCode;
 
 use crate::error::CoordinatorError;
 use crate::pgwire_handler::error_enrichment::make_vdb_error;
+use crate::pgwire_handler::pg_subscripts;
 use crate::sqlparser::ast::{
-    BinaryOperator, DataType, Expr, Function, FunctionArg, FunctionArgExpr, FunctionArgumentList,
-    FunctionArguments, Ident, ObjectName, Statement, UnaryOperator, Value, ValueWithSpan,
-    visit_expressions, visit_expressions_mut,
+    BinaryOperator, CastKind, DataType, Expr, Function, FunctionArg, FunctionArgExpr,
+    FunctionArgumentList, FunctionArguments, Ident, ObjectName, Statement, UnaryOperator, Value,
+    ValueWithSpan, visit_expressions, visit_expressions_mut,
 };
 
 /// Rewrite the PostgreSQL operators DataFusion lacks, and refuse the expressions it
@@ -78,6 +80,21 @@ fn rewrite_expr(expr: &mut Expr) -> PgWireResult<()> {
                  truncate explicitly with substr()",
             ));
         }
+        // A cast to `bytea`, which Arrow performs by copying the characters: the four bytes
+        // of `'\xDEADBEEF'` came back as the ten of its text. PostgreSQL's own conversion
+        // runs as a UDF instead ([`vairedb_common::bytea_in`]), which is what lets the same
+        // rule serve the executors that run the projection.
+        //
+        // Rewritten from the AST rather than from the logical plan because the AST is where
+        // the client's `::bytea` is still distinguishable: by planning time it is an
+        // ordinary `CAST(… AS Binary)`, and VaireDB's own `Utf8` → `Binary` casts — a
+        // `COPY`, a schema rebuild — must keep Arrow's meaning. Only the two spellings a
+        // client writes, so a `TRY_CAST` is left as it was.
+        Expr::Cast {
+            kind: CastKind::Cast | CastKind::DoubleColon,
+            data_type: DataType::Bytea,
+            ..
+        } => {}
         Expr::AllOp {
             compare_op, right, ..
         } if matches!(right.as_ref(), Expr::Subquery(_)) => {
@@ -91,6 +108,14 @@ fn rewrite_expr(expr: &mut Expr) -> PgWireResult<()> {
         } if matches!(right.as_ref(), Expr::Subquery(_)) => {
             let quantifier = if *is_some { "SOME" } else { "ANY" };
             return Err(quantified_subquery_unsupported(compare_op, quantifier));
+        }
+        // An out-of-range array subscript answers NULL in PostgreSQL and the last element
+        // in DataFusion. The clamp is inside the brackets and the subscript stays a
+        // subscript, which is what lets the write path apply the same one — see
+        // [`super::pg_subscripts`].
+        Expr::CompoundFieldAccess { access_chain, .. } => {
+            pg_subscripts::clamp_to_pg_semantics(access_chain);
+            return Ok(());
         }
         Expr::Function(func) => {
             reject_discarded_window_clauses(func)?;
@@ -125,6 +150,12 @@ fn rewrite_expr(expr: &mut Expr) -> PgWireResult<()> {
     }
 
     match std::mem::replace(expr, Expr::value(Value::Null)) {
+        // `x::bytea` becomes `vaire_bytea_in(x)`. The argument keeps whatever it was, so a
+        // literal is folded by the simplifier and a column is decoded per row.
+        Expr::Cast { expr: inner, .. } => {
+            *expr = call(BYTEA_IN_UDF_NAME, vec![*inner]);
+            Ok(())
+        }
         // `^` is exponentiation in PostgreSQL and in DuckDB; DataFusion's planner reads
         // it as bitwise XOR and then rejects the node. `power()` is what both dialects
         // mean, so the parsed meaning is preserved rather than reinterpreted.

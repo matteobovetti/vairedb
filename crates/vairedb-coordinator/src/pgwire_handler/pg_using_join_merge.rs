@@ -47,19 +47,25 @@
 //! what makes `SELECT id` and `SELECT *` agree with each other, whatever the two tables
 //! happen to be called.
 //!
-//! ## What this does not fix
+//! ## What this does not fix, and who does
 //!
 //! A key column reached by an **explicit qualifier** — `SELECT l.id, r.id FROM l FULL
-//! JOIN r USING (id)` — where PostgreSQL still reports the raw per-side values, NULL and
-//! all. After this rewrite both report the merged value.
+//! JOIN r USING (id)` — where PostgreSQL reports the raw per-side values, NULL and all.
+//! Merging both key columns puts the merged value under those two names as well, and this
+//! rewrite has no way not to: PostgreSQL's join output has *three* addressable names here
+//! (`id`, `l.id`, `r.id`) and the merged one belongs to the join rather than to either side,
+//! while a `DFSchema` has two fields to put them in — and the merged column has to live in
+//! whichever of the two every consumer reads, which, per the paragraph above, is both.
 //!
-//! It is not a corner that was skipped; it is one DataFusion's plan cannot represent.
-//! PostgreSQL's join output has *three* addressable names here (`id`, `l.id`, `r.id`) and
-//! the merged one belongs to the join rather than to either side. A `DFSchema` has two
-//! fields to put them in, and the merged column has to live in whichever of the two every
-//! consumer reads — which, per the paragraph above, is both. Recorded as its own row in
-//! `docs/specs/gap-analysis-join.md`, with a test pinning it, rather than left to be
-//! discovered.
+//! So the third name is added before there is a plan at all: [`super::pg_using_join_qualifiers`]
+//! respells a statement that qualifies a key into the `ON` spelling plus an explicit
+//! `COALESCE`, which has three names for three values. That leaves this rewrite the
+//! statements where the key is only ever reached unqualified — `SELECT id`, `SELECT *`,
+//! `GROUP BY id` — which is exactly the set it answers correctly, and takes the qualified
+//! spellings out of its reach before it runs. The two together are the closure of § 2.7's
+//! `USING`-join rows in `docs/specs/gap-analysis.md`; what neither reaches (a `NATURAL`
+//! join's qualified key, and the merged key beside the same key per side under one name) is
+//! listed there and in the other module's doc.
 //!
 //! ## Where this runs
 //!
@@ -403,7 +409,7 @@ mod tests {
     /// tells it they are one column. PostgreSQL accepts the predicate. That is a planning
     /// refusal on **every** `USING` and `NATURAL` join and not only the two this rewrite
     /// merges, which is what says it is upstream's and not this one's — and `l.id` is a
-    /// spelling of the same predicate that works today, and now carries the merged value.
+    /// spelling of the same predicate that works today.
     #[tokio::test]
     async fn a_where_clause_on_the_key_is_refused_by_the_planner() {
         for sql in [
@@ -422,8 +428,10 @@ mod tests {
                 "`{sql}` failed for some other reason: {err}"
             );
         }
-        // The qualified spelling plans, and answers PostgreSQL's rows because the rewrite
-        // put the merged value in `l.id`.
+        // The qualified spelling plans. Against the merge alone it filters on the merged
+        // value and keeps three rows; on the read path the AST respelling gets there first
+        // and the predicate is the left side's own key, which is PostgreSQL's `3, 4` —
+        // pinned in `pg_using_join_qualifiers`.
         assert_eq!(
             answer("SELECT l.id FROM l FULL JOIN r USING (id) WHERE l.id > 2").await,
             ["3", "4", "5"]
@@ -440,14 +448,16 @@ mod tests {
         );
     }
 
-    /// The divergence the module doc records, pinned so it is a decision and not a
-    /// surprise: PostgreSQL answers `4 | ` and ` | 5` for the two unmatched rows here,
-    /// because a qualified `l.id` is the left side's own key and nothing merged. VaireDB
-    /// answers the merged value in both, since the merged column has to live in the fields
-    /// every other consumer reads and a `DFSchema` has nowhere else to put it.
+    /// What this rewrite does to a qualified key on its own, pinned because it is the reason
+    /// [`super::super::pg_using_join_qualifiers`] exists: the merged value under `l.id` and
+    /// `r.id` too, where PostgreSQL answers `4 | ` and ` | 5` for the two unmatched rows.
     ///
-    /// The `ON` spelling is the one that answers this question correctly today — see
-    /// `an_inner_or_left_join_is_left_alone`, which plans it untouched.
+    /// No statement reaches this on the read path any more — the AST respelling turns a
+    /// statement that qualifies a key into the `ON` spelling first, and an `ON` join is one
+    /// this rewrite leaves alone. So this is the merge in isolation, kept as the measurement
+    /// of what a plan schema with two fields can and cannot say; the read path's answer to
+    /// the same query is in that module's
+    /// `a_qualified_key_reports_each_side_own_value`.
     #[tokio::test]
     async fn a_qualified_key_reports_the_merged_value_too() {
         assert_eq!(

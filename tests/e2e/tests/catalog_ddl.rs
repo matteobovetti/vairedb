@@ -14,8 +14,8 @@ use common::*;
 //
 // What this file covers is the DDL that WORKS. The gap surface of the same three
 // statements — CREATE TABLE AS SELECT, non-column ALTER operations, DROP of a
-// non-table object — is `sql_command_ddl.rs`, the executable counterpart of rows
-// 5-7 of docs/specs/gap-analysis-command.md.
+// non-table object — is `sql_command_ddl.rs`, the executable counterpart of the
+// `ALTER TABLE` and `DROP` rows of docs/specs/gap-analysis.md § 2.1.
 
 #[tokio::test]
 async fn test_node_ids_are_correct() {

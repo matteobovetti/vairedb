@@ -1,8 +1,8 @@
 //! Refusal of every spelling of "let the database allocate my ids".
 //!
 //! VaireDB has no sequences, and this is a decided limitation rather than an
-//! unimplemented feature (`docs/specs/gap-analysis-command.md`, *Decided
-//! limitations → No sequences*). A sequence is one monotonic counter, and neither
+//! unimplemented feature (`docs/specs/gap-analysis.md`, § 3.1 *No sequences*). A
+//! sequence is one monotonic counter, and neither
 //! implementation available to a shared-nothing cluster is worth having:
 //! broadcasting `CREATE SEQUENCE` gives each shard its own counter, so the "unique"
 //! ids collide across shards — and because replication is statement shipping, a

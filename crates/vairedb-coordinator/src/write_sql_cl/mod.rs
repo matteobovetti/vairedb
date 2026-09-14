@@ -101,7 +101,7 @@ pub fn rewrite_index_name_to_shard_local(stmt: &mut Statement, shard_suffix: &st
 /// because the write path ships SQL *text* over gRPC for a core node to execute on
 /// DuckDB (see `write_router::generate_shard_local_sql`). The read path hands the
 /// AST to DataFusion directly, so no VaireDB component re-parses this output —
-/// which matters because `Display` is lossy (`0x1F` renders as `X'1F'`).
+/// which matters because `Display` is lossy (`x'1F'` renders as `X'1F'`).
 pub fn statement_to_sql(stmt: &Statement) -> String {
     stmt.to_string()
 }

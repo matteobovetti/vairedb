@@ -64,6 +64,11 @@ enum VdbErrorCode {
   // A window function used where one is not allowed — a WHERE, GROUP BY or HAVING
   // clause, or nested inside another window function (42P20).
   VDB_ERROR_CODE_WINDOWING_ERROR = 1023;
+  // `nth_value(x, n)` called with an n that is not greater than zero. PostgreSQL
+  // gives this one input its own SQLSTATE (22016) because the alternative is a
+  // column of NULLs that reads as "no such row" for every row (see § 2.7 of the
+  // gap analysis).
+  VDB_ERROR_CODE_INVALID_ARGUMENT_FOR_NTH_VALUE = 1024;
 
   // Storage errors (2000-2999)
   VDB_ERROR_CODE_SHARD_NOT_FOUND = 2000;

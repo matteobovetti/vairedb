@@ -32,4 +32,6 @@ Complete these steps in order before opening a PR:
 
 ## Documentation
 
-All documentation lives in `docs/`. The architecture is split into individual files under `docs/architecture/`, with `docs/architecture/ARCHITECTURE.md` serving as the index.
+All documentation lives in `docs/`. The architecture is split into individual files under `docs/specs/`, with `docs/specs/ARCHITECTURE.md` serving as the index.
+
+Also the online documentation project is inside `docs/vairedb.io`.

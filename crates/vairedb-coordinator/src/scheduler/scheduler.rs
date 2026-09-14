@@ -231,6 +231,40 @@ pub(crate) fn register_postgres_functions(
     if let Err(e) = vairedb_common::udaf::register_ordered_set_aggregates(registry) {
         tracing::warn!(error = %e, "failed to register the ordered-set aggregates");
     }
+    // PostgreSQL's float division, which the read path rewrites `/` into so a zero divisor
+    // raises `22012` instead of answering an infinity. Also here rather than in the
+    // coordinator alone: the rewrite happens on the logical plan the client submits, so the
+    // scheduler decodes the name and an executor runs it. See
+    // [`crate::pgwire_handler::pg_float_division`].
+    if let Err(e) = vairedb_common::float_div::register_float_division(registry) {
+        tracing::warn!(error = %e, "failed to register the checked float division");
+    }
+    // PostgreSQL's three-valued `NOT IN` over a candidate list, which the read path
+    // rewrites a `HAVING max(k) NOT IN (q)` into: that one clause cannot carry the anti-join
+    // respelling, because no correlated subquery over an aggregate can be planned. Here for
+    // the same reason as the division above — the call is on the plan the client submits, so
+    // the scheduler decodes the name and an executor runs it. See
+    // [`crate::pgwire_handler::compat_rewrite::rewrite_not_in_subqueries`].
+    if let Err(e) = vairedb_common::not_in::register_not_in(registry) {
+        tracing::warn!(error = %e, "failed to register the list-valued NOT IN");
+    }
+    // PostgreSQL's `bytea` input conversion, which the read path rewrites `::bytea` into so
+    // `'\xDEADBEEF'` is four bytes and not the ten characters Arrow's string-to-binary cast
+    // copies. Here for the same reason as the two above — the call is in the AST the client
+    // submits, so the scheduler decodes the name and an executor runs it. See
+    // [`crate::pgwire_handler::pg_operators`].
+    if let Err(e) = vairedb_common::bytea_in::register_bytea_in(registry) {
+        tracing::warn!(error = %e, "failed to register the bytea input conversion");
+    }
+    // PostgreSQL's `nth_value`, which refuses an offset of zero instead of answering NULL
+    // for every row. Unlike the four above it is not a name the read path rewrites into:
+    // it *replaces* DataFusion's function under DataFusion's own name, so a registry that
+    // misses it silently keeps the wrong answer rather than failing to resolve a call.
+    // That makes registering it on every node the whole of the fix. See
+    // [`vairedb_common::nth_value`].
+    if let Err(e) = vairedb_common::nth_value::register_nth_value(registry) {
+        tracing::warn!(error = %e, "failed to register the checked nth_value");
+    }
 }
 
 /// Build, initialize, and spawn the Ballista `SchedulerServer` on `listen_addr`,

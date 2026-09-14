@@ -318,70 +318,80 @@ impl ExtendedQueryHandler for VaireDbQueryHandler {
             return Ok(Response::EmptyQuery);
         };
 
-        if prepared.query_type == QueryType::SessionParam {
-            // Answered from the connection's own parameter map — no plan, no shard,
-            // and no bind parameters to decode: a runtime parameter takes a literal
-            // or a bare word, never a `$1`. Routed before the write path because a
-            // `SHOW` returns rows, which the write path has no way to produce.
-            let result = async {
-                self.check_transaction_allows(stmt, &prepared.query_type, &session)
-                    .await?;
-                session_params::handle_session_param(stmt, &session, &portal.result_column_format)
+        match prepared.query_type {
+            QueryType::SessionParam => {
+                // Answered from the connection's own parameter map — no plan, no shard,
+                // and no bind parameters to decode: a runtime parameter takes a literal
+                // or a bare word, never a `$1`. Routed before the write path because a
+                // `SHOW` returns rows, which the write path has no way to produce.
+                let result = async {
+                    self.check_transaction_allows(stmt, &prepared.query_type, &session)
+                        .await?;
+                    session_params::handle_session_param(
+                        stmt,
+                        &session,
+                        &portal.result_column_format,
+                    )
                     .await
-            }
-            .await;
-            self.note_failure_in_transaction(result.is_err(), &session)
+                }
                 .await;
-            return result;
-        }
-
-        if prepared.query_type == QueryType::Explain {
-            // The plan is the answer, so it was built at Parse and is reused here
-            // verbatim. Bind parameters are not decoded: `EXPLAIN` reports the shape
-            // of a query, and a placeholder's value does not change it — a client
-            // that binds one gets the same plan a `$1` in a SELECT would produce.
-            let result = async {
-                self.check_transaction_allows(stmt, &prepared.query_type, &session)
-                    .await?;
-                let plan = prepared.plan.as_ref().ok_or_else(|| {
-                    make_vdb_error(VdbErrorCode::InternalError, "missing plan for EXPLAIN")
-                })?;
-                let is_catalog = self.is_catalog_query(stmt);
-                let ctx = if is_catalog {
-                    &self.local_ctx
-                } else {
-                    &self.session_ctx
-                };
-                introspection::execute_introspection(
-                    ctx,
-                    plan,
-                    &portal.result_column_format,
-                    &introspection::error_context(stmt),
-                )
-                .await
+                self.note_failure_in_transaction(result.is_err(), &session)
+                    .await;
+                return result;
             }
-            .await;
-            self.note_failure_in_transaction(result.is_err(), &session)
-                .await;
-            return result;
-        }
-
-        if prepared.query_type == QueryType::Select {
-            // Read path: bind typed parameters into the cached logical plan.
-            let result = async {
-                self.check_transaction_allows(stmt, &prepared.query_type, &session)
-                    .await?;
-                let plan = prepared.plan.as_ref().ok_or_else(|| {
-                    make_vdb_error(VdbErrorCode::InternalError, "missing plan for SELECT")
-                })?;
-                let param_values = self.decode_param_values(portal)?;
-                self.execute_select_plan(prepared, plan, param_values, &portal.result_column_format)
+            QueryType::Explain => {
+                // The plan is the answer, so it was built at Parse and is reused here
+                // verbatim. Bind parameters are not decoded: `EXPLAIN` reports the shape
+                // of a query, and a placeholder's value does not change it — a client
+                // that binds one gets the same plan a `$1` in a SELECT would produce.
+                let result = async {
+                    self.check_transaction_allows(stmt, &prepared.query_type, &session)
+                        .await?;
+                    let plan = prepared.plan.as_ref().ok_or_else(|| {
+                        make_vdb_error(VdbErrorCode::InternalError, "missing plan for EXPLAIN")
+                    })?;
+                    let is_catalog = self.is_catalog_query(stmt);
+                    let ctx = if is_catalog {
+                        &self.local_ctx
+                    } else {
+                        &self.session_ctx
+                    };
+                    introspection::execute_introspection(
+                        ctx,
+                        plan,
+                        &portal.result_column_format,
+                        &introspection::error_context(stmt),
+                    )
                     .await
-            }
-            .await;
-            self.note_failure_in_transaction(result.is_err(), &session)
+                }
                 .await;
-            return result;
+                self.note_failure_in_transaction(result.is_err(), &session)
+                    .await;
+                return result;
+            }
+            QueryType::Select => {
+                // Read path: bind typed parameters into the cached logical plan.
+                let result = async {
+                    self.check_transaction_allows(stmt, &prepared.query_type, &session)
+                        .await?;
+                    let plan = prepared.plan.as_ref().ok_or_else(|| {
+                        make_vdb_error(VdbErrorCode::InternalError, "missing plan for SELECT")
+                    })?;
+                    let param_values = self.decode_param_values(portal)?;
+                    self.execute_select_plan(
+                        prepared,
+                        plan,
+                        param_values,
+                        &portal.result_column_format,
+                    )
+                    .await
+                }
+                .await;
+                self.note_failure_in_transaction(result.is_err(), &session)
+                    .await;
+                return result;
+            }
+            _ => {}
         }
 
         // Write/DDL path: parameters (if any) are bound on DuckDB. Decode them to

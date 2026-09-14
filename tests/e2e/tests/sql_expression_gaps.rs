@@ -1821,6 +1821,126 @@ async fn test_division_by_zero_is_a_data_error_not_an_internal_error() {
     drop_table(&client, &tbl).await;
 }
 
+/// REWRITE + DISTRIBUTED. The same divisor at `float8`, where the read path did not raise
+/// at all.
+///
+/// `1 / 0` and `7.0 / 0` reach Arrow's integer and decimal kernels, which raise; IEEE 754
+/// float division has no error to raise, so `1.0::float8 / 0` answered `inf`. That made the
+/// divergence both silent *and* inconsistent inside one database — the type of a literal
+/// decided whether a client was told about a bad divisor or handed a value that every
+/// `sum`, `avg` and comparison above it carried up as if it were data.
+///
+/// So the coordinator rewrites every float division into a checked call that divides with
+/// the same Arrow kernel and raises for the rows PostgreSQL raises for. This test is the
+/// distributed half of that: the call is inserted by the coordinator's planner but resolved
+/// by name on the core node running the stage, so a registration missing on either side
+/// fails a query that was already accepted.
+///
+/// The three rows PostgreSQL does *not* raise for are asserted alongside, because a guard
+/// that raised for them would trade a silent wrong answer for a loud one.
+#[tokio::test]
+async fn test_a_float_zero_divisor_raises_rather_than_answering_infinity() {
+    let client = ready_client().await;
+    let tbl = create_table(
+        &client,
+        "expr_fdz",
+        &format!(
+            "(id INTEGER NOT NULL, v DOUBLE PRECISION, r REAL, z DOUBLE PRECISION NOT NULL) \
+             {CREATE_OPTS}"
+        ),
+    )
+    .await;
+    execute(
+        &client,
+        &format!(
+            "INSERT INTO {tbl} (id, v, r, z) VALUES \
+             (1, 3.0, 3.0, 0.0), (2, 6.0, 6.0, 0.0), (3, NULL, NULL, 0.0), \
+             (4, 'nan', 'nan', 0.0)"
+        ),
+    )
+    .await
+    .unwrap();
+
+    for sql in [
+        // The gap's own statement, both operands constant — folded at plan time, which is
+        // also where PostgreSQL raises it.
+        "SELECT 1.0::float8 / 0".to_string(),
+        "SELECT 1.0::float8 / 0.0::float8".to_string(),
+        // A column dividend over a column divisor: the row-by-row path, on a shard.
+        format!("SELECT v / z FROM {tbl} WHERE id = 1"),
+        // `real` is checked at its own width rather than widened into `double precision`.
+        format!("SELECT r / 0 FROM {tbl} WHERE id = 1"),
+        // A mixed float/integer division is a float division, so the integer zero is the
+        // divisor of a checked call and not of Arrow's integer kernel.
+        format!("SELECT v / (id - id) FROM {tbl} WHERE id = 1"),
+        // The shape that made this Tier 1: an aggregate over a poisoned column, which
+        // returned a single plausible `inf` with nothing in it to tell a client apart from
+        // a real total.
+        format!("SELECT sum(v / z) FROM {tbl} WHERE id <= 2"),
+        format!("SELECT avg(v / z) OVER () FROM {tbl} WHERE id <= 2"),
+        // And in a predicate, where the infinity used to decide which rows came back.
+        format!("SELECT id FROM {tbl} WHERE v / z > 0"),
+    ] {
+        assert_sqlstate(&client, &sql, SQLSTATE_DIVISION_BY_ZERO).await;
+    }
+
+    // The carve-out: a NaN dividend over zero is NaN in PostgreSQL, not an error, because
+    // the result is already the value that says "not a number".
+    assert_eq!(
+        scalar(&client, &format!("SELECT v / z FROM {tbl} WHERE id = 4")).await,
+        "NaN"
+    );
+
+    // Division is strict, so a NULL dividend is NULL however bad the divisor is.
+    let rows = simple_query_rows(&client, &format!("SELECT v / z FROM {tbl} WHERE id = 3"))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0], None);
+
+    // Per row and not per statement: a zero divisor no row reaches raises nothing, which is
+    // what makes an ordinary division over a real column cost nothing until it divides by
+    // zero. Measured against PostgreSQL 17, where this returns no rows.
+    let rows = simple_query_rows(&client, &format!("SELECT v / z FROM {tbl} WHERE id > 100"))
+        .await
+        .unwrap();
+    assert!(rows.is_empty(), "no rows to divide, no error");
+
+    // Nothing else moved. An ordinary float division answers what it answered before —
+    // through the same rewritten call, on the same shards.
+    assert_eq!(
+        scalar_number(&client, &format!("SELECT v / 2 FROM {tbl} WHERE id = 2")).await,
+        3.0
+    );
+    assert_eq!(
+        scalar_number(
+            &client,
+            &format!("SELECT sum(v / 3) FROM {tbl} WHERE id <= 2")
+        )
+        .await,
+        3.0
+    );
+
+    // And neither did the types a client reads off Describe. A rewrite that changed a
+    // result OID would have traded a wrong value for a wrong type, which is the same class
+    // of gap one row over: `real / real` is still `real`, and a float over an integer is
+    // still `double precision`.
+    assert_eq!(
+        describe_result_types(&client, &format!("SELECT v / v FROM {tbl}")).await,
+        vec![Type::FLOAT8]
+    );
+    assert_eq!(
+        describe_result_types(&client, &format!("SELECT r / r FROM {tbl}")).await,
+        vec![Type::FLOAT4]
+    );
+    assert_eq!(
+        describe_result_types(&client, &format!("SELECT v / id FROM {tbl}")).await,
+        vec![Type::FLOAT8]
+    );
+
+    drop_table(&client, &tbl).await;
+}
+
 /// REWRITE. A zero divisor on the **write path**. The read path above raises `22012`; a
 /// shard answered **NULL** and the statement reported the rows it changed, so the client
 /// was told a write succeeded that had stored a null where it asked for a number. It is
@@ -2154,8 +2274,703 @@ async fn test_a_pg_catalog_function_over_a_column_survives_distribution() {
     // serialization of the plan `\gdesc` builds, not `format_type`'s argument coercion. The
     // signature is `OneOf(Exact(Int32, Int32), … Exact(Int64, Int64))` with no `(Utf8, …)`
     // arm, so an untyped literal OID is refused where PostgreSQL coerces it to `oid`.
-    // See `gap-analysis.md` § 6.2 item 5 and item 13.
+    // See `gap-analysis.md` § 4 items 18 and 23.
     assert_unsupported(&client, "SELECT format_type('23', 0)").await;
+
+    drop_table(&client, &tbl).await;
+}
+
+// ============================================================================
+// 15. Literals and subscripts read the way PostgreSQL reads them
+// ============================================================================
+//
+// Four forms where DataFusion and DuckDB agree with each other and not with PostgreSQL
+// (§ 2.7 rows 2–5 of the gap analysis). Agreeing with each other is what made them
+// dangerous: the split-brain probes above compare the two paths against each other, and
+// these four answered the same wrong thing on both, so nothing flagged them. Each test
+// therefore writes out PostgreSQL 17's answer, measured, and asserts it on the read path
+// and on the write path separately.
+//
+// The read path's `::bytea` is rewritten to a UDF (`vaire_bytea_in`) that a *core node*
+// runs, so these also cover the wire registration: a name only the coordinator knows
+// plans fine and then fails on the executor.
+
+/// The single scalar a `SELECT <expr>` returns, or `None` where it returned NULL — which
+/// for the subscript rows is the answer itself, and is what [`scalar`] panics on.
+async fn maybe_scalar(client: &Client, sql: &str) -> Option<String> {
+    let rows = simple_query_rows(client, sql)
+        .await
+        .unwrap_or_else(|e| panic!("`{sql}` should be answerable: {e}"));
+    assert_eq!(rows.len(), 1, "`{sql}` returns one row");
+    rows[0][0].clone()
+}
+
+/// `0b101` is 5, `0o17` is 15 and `0x1F` is 31 — PostgreSQL 16's non-decimal integer
+/// literals, which sqlparser has neither form of.
+///
+/// It did not fail to parse them, which is the whole problem. `0b101` tokenized as `0`
+/// aliased `b101`, so the client got **`0`** under a column name it never wrote, and
+/// `0x1F` tokenized as SQL's byte-string syntax, so a number came back as the *bytes*
+/// `1f`. Both paths start from the same tokenizer, so both were wrong the same way and no
+/// comparison between them could show it.
+#[tokio::test]
+async fn test_a_non_decimal_integer_literal_is_the_number_it_spells() {
+    let client = ready_client().await;
+    let tbl = create_table(
+        &client,
+        "expr_radix",
+        &format!("(id INTEGER NOT NULL, n BIGINT) {CREATE_OPTS}"),
+    )
+    .await;
+
+    for (sql, want) in [
+        ("SELECT 0b101", 5.0),
+        ("SELECT 0o17", 15.0),
+        ("SELECT 0x1F", 31.0),
+        // Every prefix in both letter cases: only lowercase `0x` is a form the tokenizer
+        // has an opinion about, and the other five arrive as a number beside a word.
+        ("SELECT 0B101", 5.0),
+        ("SELECT 0O17", 15.0),
+        ("SELECT 0X1f", 31.0),
+        // `_` groups digits, and the literal is an operand like any other.
+        ("SELECT 0b1_0000_0000", 256.0),
+        ("SELECT 0x1F + 1", 32.0),
+        ("SELECT -0x10", -16.0),
+    ] {
+        assert_eq!(scalar_number(&client, sql).await, want, "`{sql}`");
+    }
+
+    // Typed exactly as the decimal spelling is: `bigint`'s largest value is a value, not an
+    // overflow, so the conversion cannot be what decides a width.
+    assert_eq!(
+        scalar(&client, "SELECT 0x7fffffffffffffff").await,
+        "9223372036854775807"
+    );
+
+    // The write path, where the same literal used to reach a shard as `X'1F'` and fail
+    // there with `42804`: a VALUES row, an assignment, a predicate, and the shard key.
+    execute(
+        &client,
+        &format!("INSERT INTO {tbl} (id, n) VALUES (0b1, 0x1F)"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        scalar_number(&client, &format!("SELECT n FROM {tbl} WHERE id = 1")).await,
+        31.0
+    );
+    execute(&client, &format!("UPDATE {tbl} SET n = 0o17 WHERE id = 0x1"))
+        .await
+        .unwrap();
+    assert_eq!(
+        scalar_number(&client, &format!("SELECT n FROM {tbl} WHERE id = 1")).await,
+        15.0
+    );
+    assert_eq!(
+        execute(&client, &format!("DELETE FROM {tbl} WHERE n = 0b1111"))
+            .await
+            .unwrap(),
+        1,
+        "the DELETE predicate reads 0b1111 as 15"
+    );
+
+    // Over-reach, in three directions. Text that only looks like a literal is text; SQL's
+    // own byte-string syntax shares a token with `0x…` and still means bytes (PostgreSQL
+    // reads `x'1F'` as a bit string — a different row, in § 2.2); and a malformed literal is
+    // refused rather than turned into some other number.
+    assert_eq!(scalar(&client, "SELECT '0x1F'").await, "0x1F");
+    assert_ne!(scalar(&client, "SELECT x'1F'").await, "31");
+    for sql in [
+        "SELECT 0b102",
+        "SELECT 0o18",
+        "SELECT 0x",
+        "SELECT 0x1f_",
+        "SELECT 0x1f.5",
+    ] {
+        assert_sqlstate(&client, sql, SQLSTATE_SYNTAX_ERROR).await;
+    }
+    // And the decimal digits a client actually sends are not rewritten at all.
+    assert_eq!(scalar_number(&client, "SELECT 10").await, 10.0);
+    assert_eq!(scalar_number(&client, "SELECT 0.5").await, 0.5);
+
+    drop_table(&client, &tbl).await;
+}
+
+/// A subscript outside the array is NULL for an element and empty for a slice.
+///
+/// Both engines borrowed Python's rule instead — a negative index counts back from the
+/// end — so `tags[-1]` read the **last element** where PostgreSQL reads nothing, and a
+/// negative slice invented or dropped rows: `tags[-3:-1]` was the whole array and
+/// `tags[-1:2]` was empty. The slice half is the worse one, because a wrong element is one
+/// value and a wrong slice changes how many values there are.
+#[tokio::test]
+async fn test_an_out_of_range_subscript_is_null_and_an_empty_slice() {
+    let client = ready_client().await;
+    let tbl = create_table(
+        &client,
+        "expr_subscript",
+        &format!(
+            "(id INTEGER NOT NULL, tags INTEGER[], v INTEGER, part INTEGER[]) {CREATE_OPTS}"
+        ),
+    )
+    .await;
+    execute(
+        &client,
+        &format!("INSERT INTO {tbl} (id, tags) VALUES (1, ARRAY[10, 20, 30]), (2, ARRAY[10, 20, 30])"),
+    )
+    .await
+    .unwrap();
+
+    // An element, over a literal array and over a column.
+    for subscript in ["-1", "0", "4"] {
+        assert_eq!(
+            maybe_scalar(&client, &format!("SELECT (ARRAY[10, 20, 30])[{subscript}]")).await,
+            None,
+            "(ARRAY[10, 20, 30])[{subscript}] is NULL in PostgreSQL"
+        );
+        assert_eq!(
+            maybe_scalar(
+                &client,
+                &format!("SELECT tags[{subscript}] FROM {tbl} WHERE id = 1")
+            )
+            .await,
+            None,
+            "tags[{subscript}] is NULL in PostgreSQL"
+        );
+    }
+    // The in-range index still reads its element: the clamp is a clamp, not a refusal.
+    assert_eq!(
+        maybe_scalar(&client, &format!("SELECT tags[1] FROM {tbl} WHERE id = 1")).await,
+        Some("10".to_string())
+    );
+    assert_eq!(
+        maybe_scalar(&client, &format!("SELECT tags[3] FROM {tbl} WHERE id = 1")).await,
+        Some("30".to_string())
+    );
+
+    // A slice: a low lower bound is the start of the array, and an upper bound before the
+    // start selects nothing.
+    for (slice, want) in [
+        ("2:3", "{20,30}"),
+        ("-1:2", "{10,20}"),
+        ("0:2", "{10,20}"),
+        ("2:9", "{20,30}"),
+        ("-3:-1", "{}"),
+    ] {
+        assert_eq!(
+            maybe_scalar(&client, &format!("SELECT (ARRAY[10, 20, 30])[{slice}]")).await,
+            Some(want.to_string()),
+            "(ARRAY[10, 20, 30])[{slice}]"
+        );
+    }
+
+    // The write path reads the same subscript the same way. `tags[-1]` in an assignment
+    // stored `30`, and a predicate on it matched no rows where PostgreSQL matches every
+    // row — a row count the client had no way to question.
+    execute(
+        &client,
+        &format!("UPDATE {tbl} SET v = tags[-1], part = tags[-3:-1] WHERE id = 1"),
+    )
+    .await
+    .unwrap();
+    execute(
+        &client,
+        &format!("UPDATE {tbl} SET v = tags[1], part = tags[2:3] WHERE id = 2"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        maybe_scalar(&client, &format!("SELECT v FROM {tbl} WHERE id = 1")).await,
+        None,
+        "an out-of-range element stores NULL, not the last element"
+    );
+    assert_eq!(
+        maybe_scalar(&client, &format!("SELECT part FROM {tbl} WHERE id = 1")).await,
+        Some("{}".to_string()),
+        "an out-of-range slice stores an empty array, not the whole one"
+    );
+    assert_eq!(
+        maybe_scalar(&client, &format!("SELECT v FROM {tbl} WHERE id = 2")).await,
+        Some("10".to_string())
+    );
+    assert_eq!(
+        maybe_scalar(&client, &format!("SELECT part FROM {tbl} WHERE id = 2")).await,
+        Some("{20,30}".to_string())
+    );
+    assert_eq!(
+        execute(&client, &format!("DELETE FROM {tbl} WHERE tags[-1] IS NULL"))
+            .await
+            .unwrap(),
+        2,
+        "every row's tags[-1] is NULL, so the DELETE removes both"
+    );
+
+    drop_table(&client, &tbl).await;
+}
+
+/// `'\xDEADBEEF'::bytea` is four bytes.
+///
+/// PostgreSQL reads the text through its own `bytea` input conversion, which has two
+/// formats: hex after a `\x` prefix, and backslash escapes otherwise. Neither engine did
+/// — DataFusion cast `Utf8`→`Binary` bytewise and stored the **10 ASCII characters** of
+/// the literal, and DuckDB's own `VARCHAR`→`BLOB` cast read `\xDE` as one byte and the
+/// remaining `ADBEEF` as six characters, for seven. Three different answers to one cast,
+/// none of them PostgreSQL's.
+#[tokio::test]
+async fn test_a_bytea_literal_is_decoded_the_way_postgres_decodes_it() {
+    let client = ready_client().await;
+    let tbl = create_table(
+        &client,
+        "expr_bytea",
+        &format!("(id INTEGER NOT NULL, a BYTEA, s VARCHAR) {CREATE_OPTS}"),
+    )
+    .await;
+
+    // The read path, in binary format so the bytes are the assertion rather than a
+    // rendering of them. The UDF runs on a core node, so this covers the registration on
+    // both sides of the wire too.
+    for (literal, want) in [
+        ("'\\xDEADBEEF'", vec![0xDE, 0xAD, 0xBE, 0xEF]),
+        ("'\\xdeadbeef'", vec![0xDE, 0xAD, 0xBE, 0xEF]),
+        // Whitespace between pairs is skipped, as PostgreSQL's decoder does.
+        ("'\\xDE AD BE EF'", vec![0xDE, 0xAD, 0xBE, 0xEF]),
+        // No `\x` prefix is the escape format: `\\` is one backslash and `\NNN` is octal.
+        ("'a\\101b'", b"aAb".to_vec()),
+        ("'a\\\\b'", b"a\\b".to_vec()),
+        ("'\\000'", vec![0]),
+        ("'abc'", b"abc".to_vec()),
+        ("''", vec![]),
+    ] {
+        let sql = format!("SELECT {literal}::bytea");
+        let rows = client
+            .query(&sql, &[])
+            .await
+            .unwrap_or_else(|e| panic!("`{sql}` should be answerable: {e}"));
+        let got: Vec<u8> = rows[0].get(0);
+        assert_eq!(got, want, "`{sql}`");
+        // And it is a `bytea` to a driver, not a string that happens to hold hex.
+        assert_eq!(describe_result_types(&client, &sql).await, vec![Type::BYTEA]);
+    }
+
+    // `CAST(… AS BYTEA)` is the same cast written the other way.
+    let rows = client
+        .query("SELECT CAST('\\x41' AS BYTEA)", &[])
+        .await
+        .unwrap();
+    assert_eq!(rows[0].get::<_, Vec<u8>>(0), vec![0x41]);
+
+    // The write path stores the same four bytes — where a shard, handed the literal
+    // verbatim, would have stored seven.
+    execute(
+        &client,
+        &format!("INSERT INTO {tbl} (id, a) VALUES (1, '\\xDEADBEEF'::bytea)"),
+    )
+    .await
+    .unwrap();
+    execute(
+        &client,
+        &format!("UPDATE {tbl} SET a = 'a\\101b'::bytea WHERE id = 1"),
+    )
+    .await
+    .unwrap();
+    let rows = client
+        .query(&format!("SELECT a FROM {tbl} WHERE id = $1"), &[&1i32])
+        .await
+        .unwrap();
+    assert_eq!(rows[0].get::<_, Vec<u8>>(0), b"aAb".to_vec());
+
+    // Over-reach: the forms the write path must keep accepting. A NULL cast, a parameter
+    // bound as bytea, and a plain parameter into a declared BYTEA column are all left
+    // alone — only a *string literal* is translated, and only a non-literal is refused.
+    execute(
+        &client,
+        &format!("INSERT INTO {tbl} (id, a) VALUES (2, NULL::bytea)"),
+    )
+    .await
+    .unwrap();
+    client
+        .execute(
+            &format!("INSERT INTO {tbl} (id, a) VALUES ($1, $2)"),
+            &[&3i32, &vec![0xDEu8, 0xAD]],
+        )
+        .await
+        .expect("a bytea parameter is not a cast and must still be written");
+    let rows = client
+        .query(&format!("SELECT a FROM {tbl} WHERE id = $1"), &[&3i32])
+        .await
+        .unwrap();
+    assert_eq!(rows[0].get::<_, Vec<u8>>(0), vec![0xDE, 0xAD]);
+    // And every other cast is still every other cast: only `bytea` is rewritten.
+    assert_eq!(scalar(&client, "SELECT '41'::INTEGER").await, "41");
+    execute(
+        &client,
+        &format!("UPDATE {tbl} SET s = 41::VARCHAR WHERE id = 1"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        scalar(&client, &format!("SELECT s FROM {tbl} WHERE id = 1")).await,
+        "41"
+    );
+
+    drop_table(&client, &tbl).await;
+}
+
+/// A `bytea` literal that does not decode is refused with PostgreSQL's message *and*
+/// PostgreSQL's SQLSTATE — and the same pair on both paths.
+///
+/// Two codes, because PostgreSQL raises two: `byteain` reports `22P02` for an escape it
+/// cannot read and the hex decoder it calls reports `22023` for a bad hex body. Measured,
+/// not inferred. The read path raises inside an executor, where the error is serialized to
+/// text and loses its type, so keeping the code takes a named exception in the
+/// coordinator's classifier — without it these arrive as `XX000`, which tells a driver the
+/// server broke and invites a retry that cannot succeed.
+#[tokio::test]
+async fn test_a_bytea_literal_that_does_not_decode_is_refused() {
+    let client = ready_client().await;
+    let tbl = create_table(
+        &client,
+        "expr_bytea_bad",
+        &format!("(id INTEGER NOT NULL, a BYTEA) {CREATE_OPTS}"),
+    )
+    .await;
+
+    // `message` is PostgreSQL's wording as the write path reports it, at parse time and
+    // unescaped; `wording` is the part of it that survives being rendered into a
+    // scheduler's error string, which is the only form the read path's failure arrives in.
+    for (literal, sqlstate, message, wording) in [
+        (
+            "'\\xzz'",
+            SQLSTATE_INVALID_PARAMETER_VALUE,
+            "invalid hexadecimal digit: \"z\"",
+            "invalid hexadecimal digit",
+        ),
+        (
+            "'\\xdeadbee'",
+            SQLSTATE_INVALID_PARAMETER_VALUE,
+            "invalid hexadecimal data: odd number of digits",
+            "invalid hexadecimal data: odd number of digits",
+        ),
+        (
+            "'a\\1'",
+            SQLSTATE_INVALID_TEXT_REPRESENTATION,
+            "invalid input syntax for type bytea",
+            "invalid input syntax for type bytea",
+        ),
+        (
+            "'a\\400'",
+            SQLSTATE_INVALID_TEXT_REPRESENTATION,
+            "invalid input syntax for type bytea",
+            "invalid input syntax for type bytea",
+        ),
+    ] {
+        let read = format!("SELECT {literal}::bytea");
+        let err = assert_sqlstate(&client, &read, sqlstate).await;
+        assert!(
+            err.message().contains(wording),
+            "`{read}` should say {wording:?}: {}",
+            err.message()
+        );
+
+        let write = format!("INSERT INTO {tbl} (id, a) VALUES (1, {literal}::bytea)");
+        let err = assert_sqlstate(&client, &write, sqlstate).await;
+        assert!(
+            err.message().contains(message),
+            "`{write}` should say {message:?}: {}",
+            err.message()
+        );
+    }
+
+    // The refusals are refusals, not partial writes.
+    assert_eq!(row_count(&client, &tbl).await, 0);
+
+    drop_table(&client, &tbl).await;
+}
+
+/// REFUSAL. A `::bytea` the write path cannot decode itself is refused by name.
+///
+/// A write is executed verbatim by a shard, and only a *literal* can be decoded on the
+/// coordinator. `s::bytea` over a column would reach DuckDB as its own `VARCHAR`→`BLOB`
+/// cast, which reads a different escape syntax and stores different bytes — silently, and
+/// per row, so no single value in the statement could be inspected to see it. Refusing is
+/// the honest answer, and the read path answers the same expression, which is why the
+/// message names the two ways to write it instead.
+#[tokio::test]
+async fn test_a_bytea_cast_the_write_path_cannot_decode_is_refused() {
+    let client = ready_client().await;
+    let tbl = create_table(
+        &client,
+        "expr_bytea_rej",
+        &format!("(id INTEGER NOT NULL, a BYTEA, s VARCHAR) {CREATE_OPTS}"),
+    )
+    .await;
+    execute(
+        &client,
+        &format!("INSERT INTO {tbl} (id, s) VALUES (1, '\\x41')"),
+    )
+    .await
+    .unwrap();
+
+    for sql in [
+        format!("UPDATE {tbl} SET a = s::bytea"),
+        format!("UPDATE {tbl} SET a = CAST(s AS BYTEA) WHERE id = 1"),
+        format!("UPDATE {tbl} SET a = (s || 'x')::bytea"),
+        format!("INSERT INTO {tbl} (id, a) SELECT 2, s::bytea FROM {tbl}"),
+        format!("DELETE FROM {tbl} WHERE a = s::bytea"),
+    ] {
+        let err = assert_sqlstate(&client, &sql, SQLSTATE_FEATURE_NOT_SUPPORTED).await;
+        assert!(
+            err.message().contains("CAST to BYTEA"),
+            "`{sql}` should name the cast it refuses: {}",
+            err.message()
+        );
+    }
+
+    // Over-reach, probed in the same test: the read path answers the expression that the
+    // write path refuses, the same cast over a *literal* is written, and nothing above
+    // changed a row on its way to being refused.
+    assert_eq!(
+        client
+            .query(&format!("SELECT s::bytea FROM {tbl}"), &[])
+            .await
+            .expect("the read path decodes a column, so it must still answer")[0]
+            .get::<_, Vec<u8>>(0),
+        vec![0x41]
+    );
+    execute(
+        &client,
+        &format!("UPDATE {tbl} SET a = '\\x41'::bytea WHERE id = 1"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(row_count(&client, &tbl).await, 1);
+
+    drop_table(&client, &tbl).await;
+}
+
+/// A subscript and a `::bytea` are labelled the way PostgreSQL labels them.
+///
+/// PostgreSQL names an unaliased column after the thing it read — the array for a
+/// subscript, the column for a cast — and both rewrites above put a function call where
+/// that name came from, so without this the client would have received `vaire_bytea_in(s)`
+/// or `t.a[nullif(greatest(1, 0), 0)]` as a column name. A driver reads columns by name,
+/// so a rewrite that changes one is a wrong answer to a question the client did ask.
+#[tokio::test]
+async fn test_a_subscript_and_a_bytea_cast_keep_postgresqls_column_label() {
+    let client = ready_client().await;
+    let tbl = create_table(
+        &client,
+        "expr_sub_label",
+        &format!("(id INTEGER NOT NULL, tags INTEGER[], s VARCHAR) {CREATE_OPTS}"),
+    )
+    .await;
+
+    for (projection, want) in [
+        ("tags[1]", "tags"),
+        ("tags[1:2]", "tags"),
+        ("s::bytea", "s"),
+        ("CAST(s AS BYTEA)", "s"),
+        ("'\\x41'::bytea", "bytea"),
+        ("(ARRAY[1, 2, 3])[1]", "array"),
+    ] {
+        let sql = format!("SELECT {projection} FROM {tbl}");
+        assert_eq!(
+            describe_result_labels(&client, &sql).await,
+            vec![want.to_string()],
+            "`{sql}`"
+        );
+    }
+
+    // An explicit alias wins, as always.
+    assert_eq!(
+        describe_result_labels(&client, &format!("SELECT tags[1] AS first FROM {tbl}")).await,
+        vec!["first".to_string()]
+    );
+
+    drop_table(&client, &tbl).await;
+}
+
+/// GAP. `length()` and `octet_length()` over `bytea` count bytes in PostgreSQL.
+///
+/// Found while closing the cast above, and pre-existing: neither function has a `Binary`
+/// arm in DataFusion, so both refuse the argument — `octet_length` by name, and `length`
+/// worse than that, by trying to coerce the bytes to `Utf8` and failing inside the
+/// optimizer on any value that is not valid UTF-8. A refusal is not a wrong answer, so this
+/// is not one of § 2.7's rows; it is recorded here because `length(a)` is how a client asks
+/// a `bytea` column its size.
+#[tokio::test]
+#[ignore = "gap: length()/octet_length() have no Binary argument, so bytea sizes are unaskable"]
+async fn test_the_length_of_a_bytea_is_its_byte_count() {
+    let client = ready_client().await;
+    let tbl = create_table(
+        &client,
+        "expr_bytea_len",
+        &format!("(id INTEGER NOT NULL, a BYTEA) {CREATE_OPTS}"),
+    )
+    .await;
+    execute(
+        &client,
+        &format!("INSERT INTO {tbl} (id, a) VALUES (1, '\\xDEADBEEF'::bytea)"),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        scalar_number(&client, &format!("SELECT length(a) FROM {tbl}")).await,
+        4.0
+    );
+    assert_eq!(
+        scalar_number(&client, &format!("SELECT octet_length(a) FROM {tbl}")).await,
+        4.0
+    );
+    assert_eq!(
+        scalar_number(&client, "SELECT length('\\xDEADBEEF'::bytea)").await,
+        4.0
+    );
+
+    drop_table(&client, &tbl).await;
+}
+
+// ============================================================================
+// 16. nth_value refuses the offset PostgreSQL refuses
+// ============================================================================
+
+// REFUSAL, DISTRIBUTED. `nth_value(x, 0)` — the narrowest row of § 2.7, and the one whose
+// wrong answer is hardest to see: DataFusion finds that `0` names no row of the frame and
+// returns NULL, for every row, in every partition. That is the same answer
+// `nth_value(x, 4)` gives over a three-row frame, so a client cannot tell "you asked for
+// nothing" from "there was nothing there". PostgreSQL raises `22016` before evaluating.
+//
+// Distributed because the guard runs inside the executor that evaluates the window, per
+// partition — which is what keeps an empty input answering no rows instead of raising —
+// so the SQLSTATE has to survive the trip back through the scheduler as text.
+#[tokio::test]
+async fn test_a_zero_nth_value_offset_raises_rather_than_answering_null() {
+    let client = ready_client().await;
+    let tbl = setup_window_table(&client, "expr_nth").await;
+
+    // The gap. Both the partitioned and the whole-table window raise, and the message
+    // names the function so a client reading it knows which argument to change.
+    for sql in [
+        format!("SELECT nth_value(n, 0) OVER (PARTITION BY g ORDER BY id) FROM {tbl}"),
+        format!("SELECT nth_value(id, 0) OVER () FROM {tbl}"),
+    ] {
+        let err = assert_sqlstate(&client, &sql, SQLSTATE_INVALID_ARGUMENT_FOR_NTH_VALUE).await;
+        assert!(
+            err.message().contains("nth_value"),
+            "the refusal names the function: {}",
+            err.message()
+        );
+    }
+
+    // A zero offset written at a width the planner reads as something other than a plain
+    // integer literal reaches the same guard.
+    assert_sqlstate(
+        &client,
+        &format!("SELECT nth_value(id, 0::bigint) OVER () FROM {tbl}"),
+        SQLSTATE_INVALID_ARGUMENT_FOR_NTH_VALUE,
+    )
+    .await;
+
+    // The over-reach probe, and the reason the guard is on the value and not on the
+    // function: every offset PostgreSQL accepts still answers exactly what it answered
+    // before. Over the whole partition ordered by id, group 1 is ids 1..3 and group 2 is
+    // ids 4..6, so the first is 1 and 4 and the second is 2 and 5.
+    let rows = simple_query_rows(
+        &client,
+        &format!(
+            "SELECT g, \
+             nth_value(id, 1) OVER (PARTITION BY g ORDER BY id \
+             ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING), \
+             nth_value(id, 2) OVER (PARTITION BY g ORDER BY id \
+             ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) \
+             FROM {tbl} ORDER BY g, id"
+        ),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("a positive offset should be answerable: {e}"));
+    assert_eq!(
+        rows.iter()
+            .map(|r| (r[0].as_deref(), r[1].as_deref(), r[2].as_deref()))
+            .collect::<Vec<_>>(),
+        vec![
+            (Some("1"), Some("1"), Some("2")),
+            (Some("1"), Some("1"), Some("2")),
+            (Some("1"), Some("1"), Some("2")),
+            (Some("2"), Some("4"), Some("5")),
+            (Some("2"), Some("4"), Some("5")),
+            (Some("2"), Some("4"), Some("5")),
+        ]
+    );
+
+    // An offset past the end of the frame is PostgreSQL's NULL, and stays one — the answer
+    // a zero offset used to be indistinguishable from.
+    let rows = simple_query_rows(
+        &client,
+        &format!(
+            "SELECT nth_value(id, 4) OVER (PARTITION BY g ORDER BY id \
+             ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) \
+             FROM {tbl} ORDER BY g, id LIMIT 1"
+        ),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("an offset past the frame should be answerable: {e}"));
+    assert_eq!(rows[0][0], None, "a 4th row of a 3-row frame is NULL");
+
+    // The deliberate superset of § 5: a negative offset counts from the end of the frame.
+    // PostgreSQL raises `22016` for this too, and VaireDB answers it on purpose — which is
+    // why the guard fires on exactly zero and not on every offset below one.
+    let rows = simple_query_rows(
+        &client,
+        &format!(
+            "SELECT g, nth_value(id, -1) OVER (PARTITION BY g ORDER BY id \
+             ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) \
+             FROM {tbl} ORDER BY g, id LIMIT 4"
+        ),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("a negative offset is a superset and must keep working: {e}"));
+    assert_eq!(
+        rows.iter()
+            .map(|r| (r[0].as_deref(), r[1].as_deref()))
+            .collect::<Vec<_>>(),
+        vec![
+            (Some("1"), Some("3")),
+            (Some("1"), Some("3")),
+            (Some("1"), Some("3")),
+            (Some("2"), Some("6")),
+        ]
+    );
+
+    // PostgreSQL evaluates the offset per partition, so a statement whose input has no
+    // rows has nothing to raise about: no rows, no error. This is the reason the guard is
+    // a window function and not a check on the plan — a planning-time refusal would raise
+    // here, where PostgreSQL returns an empty result.
+    let rows = simple_query_rows(
+        &client,
+        &format!("SELECT nth_value(n, 0) OVER (PARTITION BY g) FROM {tbl} WHERE false"),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("an empty input raises nothing in PostgreSQL: {e}"));
+    assert!(rows.is_empty(), "no rows, and no error");
+
+    // `first_value` and `last_value` share DataFusion's implementation with `nth_value`
+    // and take no offset, so neither is touched by the guard.
+    let rows = simple_query_rows(
+        &client,
+        &format!(
+            "SELECT first_value(id) OVER w, last_value(id) OVER w FROM {tbl} \
+             WINDOW w AS (PARTITION BY g ORDER BY id \
+             ROWS BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED FOLLOWING) \
+             ORDER BY g, id LIMIT 1"
+        ),
+    )
+    .await
+    .unwrap_or_else(|e| panic!("first_value/last_value should be answerable: {e}"));
+    assert_eq!(
+        (rows[0][0].as_deref(), rows[0][1].as_deref()),
+        (Some("1"), Some("3"))
+    );
 
     drop_table(&client, &tbl).await;
 }

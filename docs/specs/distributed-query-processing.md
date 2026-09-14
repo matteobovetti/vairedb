@@ -67,7 +67,7 @@ Client SQL (DML)
 
 Shard identification is a gate, not a guess: a write whose target shards cannot be
 determined is rejected before anything is sent, rather than routed somewhere plausible.
-See [SQL command gap analysis](gap-analysis-command.md) for which forms that rules out.
+See [the gap analysis](gap-analysis.md#21-statements) for which forms that rules out.
 
 ## Query Optimization
 
@@ -92,5 +92,5 @@ that *errors* has lost it altogether. So what may be pushed is a whitelist of sh
 identical meaning in both engines rather than everything the unparser will render, and it
 excludes columns whose declared type the coordinator reports as `text` without the shard
 storing them as text. See
-[gap-analysis-operator-literal.md](gap-analysis-operator-literal.md#-closed-filter-pushdown-which-would-have-broken-the-moment-it-was-enabled)
-for the shapes that qualify and the measurements behind each exclusion.
+[the gap analysis](gap-analysis.md#25-operators-literals-and-casts) for the four
+narrowings this produces and the reasoning behind each exclusion.

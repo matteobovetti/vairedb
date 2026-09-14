@@ -243,11 +243,24 @@ fn classify_execution_message(msg: &str) -> VdbErrorCode {
 /// transported error that is stable.
 ///
 /// So this runs only when classification already gave up — `EngineError` or
-/// `InternalError`, the two "we do not know" answers — and only for divide-by-zero,
-/// where the cost of the wrong answer is concrete: `XX000` tells a driver the server
-/// broke and the statement is worth retrying, and `1 / 0` will fail identically every
-/// time. Widening this to more codes would erode the reason the classifier is
-/// variant-based, so it stays a named exception rather than a general fallback.
+/// `InternalError`, the two "we do not know" answers — and only for the three named cases
+/// below, where the cost of the wrong answer is concrete: `XX000` tells a driver the server
+/// broke and the statement is worth retrying, and none of these will ever succeed on a
+/// retry. Widening this into a general message-based fallback would erode the reason the
+/// classifier is variant-based, so each case is added by name:
+///
+/// * **divide-by-zero**, `22012`;
+/// * **a `bytea` input that does not decode**, `22P02` or `22023`. The read path rewrites
+///   `'…'::bytea` into a UDF that runs inside an executor, so a malformed literal raises
+///   there; the write path refuses the same literal at parse time with the same SQLSTATE, and
+///   a client that moves a cast from a `SELECT` to an `INSERT` should not see the code
+///   change. The wording is owned by [`vairedb_common::bytea_in`] rather than repeated here.
+/// * **`nth_value(x, 0)`**, `22016`. A window is evaluated inside an executor, and the guard
+///   that refuses a zero offset raises there, per partition — which is what makes it match
+///   PostgreSQL over an empty input. `22016` is a code PostgreSQL spends on this one
+///   argument of this one function, so reporting `XX000` instead would lose the only signal
+///   that says which argument was wrong. The wording is owned by
+///   [`vairedb_common::nth_value`].
 fn reclassify_transported_data_error(e: &DataFusionError, code: VdbErrorCode) -> VdbErrorCode {
     if !matches!(
         code,
@@ -255,8 +268,15 @@ fn reclassify_transported_data_error(e: &DataFusionError, code: VdbErrorCode) ->
     ) {
         return code;
     }
-    if is_divide_by_zero(&e.to_string().to_lowercase()) {
+    let message = e.to_string();
+    if is_divide_by_zero(&message.to_lowercase()) {
         return VdbErrorCode::DivisionByZero;
+    }
+    if let Some(bytea_code) = vairedb_common::bytea_in::error_code_of_message(&message) {
+        return bytea_code;
+    }
+    if let Some(nth_value_code) = vairedb_common::nth_value::error_code_of_message(&message) {
+        return nth_value_code;
     }
     code
 }
@@ -393,6 +413,9 @@ pub(crate) fn classify_error(err: &CoordinatorError) -> (VdbErrorCode, String) {
         CoordinatorError::SqlParse(e) => format!("SQL syntax error: {}", e),
         // Already written for the client, and already naming what to write instead.
         CoordinatorError::Unsupported(msg) => msg.clone(),
+        // PostgreSQL's own wording for the same bad input, which is the point of the
+        // variant — the code beside it is PostgreSQL's too.
+        CoordinatorError::InvalidValue { message, .. } => message.clone(),
         CoordinatorError::NodeExecFailed(node_err) => {
             tracing::error!(
                 node_id = %node_err.node_id,
@@ -1236,6 +1259,61 @@ mod tests {
             match enrich_datafusion_error(&err, &ErrorContext::default()) {
                 pgwire::error::PgWireError::UserError(info) => {
                     assert_eq!(info.code, "22012", "for {err:?}");
+                }
+                other => panic!("expected UserError, got: {other:?}"),
+            }
+        }
+    }
+
+    /// The second named exception: a `bytea` literal the read path's UDF could not decode.
+    /// The write path refuses the same literal at parse time with these codes, so this is
+    /// what keeps `'\xzz'::bytea` from reporting `22023` in an `INSERT` and `XX000` in a
+    /// `SELECT`.
+    #[test]
+    fn a_transported_bytea_input_error_reports_postgresqls_sqlstate() {
+        for (raised, want) in [
+            ("invalid hexadecimal digit: \\\"z\\\"", "22023"),
+            ("invalid hexadecimal data: odd number of digits", "22023"),
+            ("invalid input syntax for type bytea", "22P02"),
+        ] {
+            let ballista = format!(
+                "Job 3QdcFzH failed: Job failed due to stage 1 failed: Task failed due to \
+                 runtime execution error: DataFusionError(Execution(\"{raised}\"))"
+            );
+            let err = DataFusionError::Internal(ballista);
+            match enrich_datafusion_error(&err, &ErrorContext::default()) {
+                pgwire::error::PgWireError::UserError(info) => {
+                    assert_eq!(info.code, want, "for {raised}");
+                }
+                other => panic!("expected UserError, got: {other:?}"),
+            }
+        }
+    }
+
+    /// The third named exception: `nth_value(x, 0)`, refused inside the executor that
+    /// evaluates the window. `22016` is PostgreSQL's code for this one argument, and the
+    /// local shape is here too because the coordinator evaluates some windows itself —
+    /// the client must not see the SQLSTATE change with the plan.
+    #[test]
+    fn a_transported_non_positive_nth_value_offset_reports_postgresqls_sqlstate() {
+        const RAISED: &str = "argument of nth_value must be greater than zero";
+        let ballista = format!(
+            "Job 3QdcFzH failed: Job failed due to stage 1 failed: Task failed due to \
+             runtime execution error: DataFusionError(Execution(\"{RAISED}\"))"
+        );
+        for err in [
+            DataFusionError::Execution(RAISED.into()),
+            DataFusionError::Execution(ballista.clone()),
+            DataFusionError::Internal(ballista.clone()),
+            DataFusionError::Context(
+                "collect".into(),
+                Box::new(DataFusionError::Execution(ballista.clone())),
+            ),
+            DataFusionError::External(Box::new(std::io::Error::other(ballista))),
+        ] {
+            match enrich_datafusion_error(&err, &ErrorContext::default()) {
+                pgwire::error::PgWireError::UserError(info) => {
+                    assert_eq!(info.code, "22016", "for {err:?}");
                 }
                 other => panic!("expected UserError, got: {other:?}"),
             }

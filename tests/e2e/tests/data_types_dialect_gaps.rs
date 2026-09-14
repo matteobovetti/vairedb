@@ -18,7 +18,7 @@ use tokio_postgres::Client;
 //
 // Data type mapping is out of scope here: every type case — working and broken —
 // lives in `data_types_round_trips.rs`, the executable counterpart of
-// docs/specs/gap-analysis-data-type.md.
+// docs/specs/gap-analysis.md § 2.2.
 //
 // Cleanup safety: CREATE TABLE failures roll back partial DDL on written nodes
 // (DROP TABLE IF EXISTS), so an xfail cannot poison the shared cluster. Every test
@@ -208,4 +208,4 @@ async fn test_to_char_nested_in_update_assignment() {
 
 // Data types are not covered here: every type-mapping case — working and broken —
 // lives in `data_types_round_trips.rs`, the executable counterpart of
-// docs/specs/gap-analysis-data-type.md.
+// docs/specs/gap-analysis.md § 2.2.

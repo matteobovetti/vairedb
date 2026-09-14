@@ -2,9 +2,9 @@ mod common;
 use common::*;
 use tokio_postgres::Client;
 
-// Rows 8-36 of docs/specs/gap-analysis-command.md — every statement the doc
-// marks ❌. See `sql_command_select.rs` for the file layout and the
-// passing/#[ignore] convention.
+// Every statement docs/specs/gap-analysis.md refuses — the ❌ table of its § 2.1
+// and the 🚫 decisions in its § 3.1 and § 3.2. See `sql_command_select.rs` for
+// the file layout and the passing/#[ignore] convention.
 //
 //     cd tests/e2e && cargo test --test sql_command_unsupported -- --ignored --test-threads=1
 //
@@ -23,21 +23,21 @@ use tokio_postgres::Client;
 //   * `test_<x>_<target behavior>` + `#[ignore]` — the PostgreSQL-correct
 //     behavior, written so it fails by construction until the gap closes.
 //
-// Sections follow the doc's "Open gaps, ranked" order, then the statements it
-// leaves unranked, then the two groups it declares 🚫 not planned — the ones with
-// a PostgreSQL rewrite, and the single-node DuckDB concerns. Statements in those
-// last two groups get NO xfail: there is no target behavior to write, and their
-// test exists to keep them rejected.
+// Sections follow the doc's ❌ table, then the two groups it declares 🚫 not
+// planned — the shared-nothing decisions (§ 3.1) and the DuckDB-only forms that
+// have a PostgreSQL rewrite (§ 3.2). Statements in those last two groups get NO
+// xfail: there is no target behavior to write, and their test exists to keep them
+// rejected.
 //
-// Some rows are covered by their sibling files instead, because they belong to
-// a statement family that file already owns:
-//   * row 25 `MERGE INTO` / upsert -> `sql_command_dml.rs`;
+// Some statements are covered by their sibling files instead, because they belong
+// to a family that file already owns:
+//   * `MERGE INTO` / upsert -> `sql_command_dml.rs`;
 //   * `DROP SEQUENCE`, which lands in the DROP TABLE handler, and the object-kind
-//     refusals around it -> `sql_command_ddl.rs` (row 7);
+//     refusals around it -> `sql_command_ddl.rs`;
 //   * `TRUNCATE`, now routed per shard by the same broadcast machinery ->
 //     `sql_command_ddl.rs`;
-//   * row 33 transaction control, no longer a gap: BEGIN/COMMIT/ROLLBACK/
-//     SAVEPOINT are supported via a buffered block -> `sql_command_transaction.rs`.
+//   * transaction control, no longer a gap: BEGIN/COMMIT/ROLLBACK/SAVEPOINT are
+//     supported via a buffered block -> `sql_command_transaction.rs`.
 
 /// A small two-column table with one row per shard bucket, for the statements
 /// that need something to operate on.

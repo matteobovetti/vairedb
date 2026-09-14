@@ -7,9 +7,10 @@ use std::ops::ControlFlow;
 
 use crate::pgwire_handler::parser::translate_format_arg;
 use crate::pgwire_handler::pg_operators::{is_byte_order_collation, similar_to_regex_from_ast};
+use crate::pgwire_handler::pg_subscripts::clamp_to_pg_semantics;
 use crate::sqlparser::ast::{
     AlterColumnOperation, AlterTableOperation, ArrayElemTypeDef, BinaryOperator, CaseWhen,
-    CreateTableOptions, DataType, Expr, Function, FunctionArg, FunctionArgExpr,
+    CastKind, CreateTableOptions, DataType, Expr, Function, FunctionArg, FunctionArgExpr,
     FunctionArgumentList, FunctionArguments, Ident, MergeClauseKind, ObjectName, ObjectNamePart,
     OrderByOptions, Statement, UnaryOperator, Value, ValueWithSpan,
     helpers::attached_token::AttachedToken, visit_expressions_mut,
@@ -181,6 +182,46 @@ fn transform_pg_semantics(expr: &mut Expr) {
             };
             *expr = *inner;
         }
+        // An out-of-range array subscript. PostgreSQL answers NULL for an element and an
+        // empty array for a slice; DuckDB counts a negative index back from the end, so
+        // `a[-1]` read the last element and `a[-3:-1]` read the whole array. The clamp is
+        // the read path's own — a subscript is still a subscript afterwards, which is what
+        // lets one implementation of the rule serve both paths. See
+        // [`crate::pgwire_handler::pg_subscripts`].
+        Expr::CompoundFieldAccess { access_chain, .. } => {
+            clamp_to_pg_semantics(access_chain);
+        }
+        // A cast to `bytea`. PostgreSQL runs the text through its own input conversion, so
+        // `'\xDEADBEEF'::bytea` is the four bytes `DE AD BE EF`; DuckDB's `VARCHAR` → `BLOB`
+        // cast reads its *own* escape syntax, where `\xDE` is one byte and `ADBEEF` is six
+        // characters, and stored seven. The coordinator therefore decodes the literal itself
+        // ([`vairedb_common::bytea_in`], the same decoder the read path's UDF uses) and emits
+        // the bytes as hex.
+        //
+        // `unhex` and not `X'…'`: measured on DuckDB 1.5.5, `X'DEADBEEF'` is the *VARCHAR*
+        // `xDEADBEEF`, so it would store nine characters rather than four bytes.
+        // `unhex('…')` is a `BLOB`.
+        //
+        // Only a literal reaches here — [`super::reject`] has already refused the casts this
+        // cannot translate — so a failure to decode is impossible and the arm falls through
+        // rather than raising.
+        Expr::Cast {
+            kind: CastKind::Cast | CastKind::DoubleColon,
+            data_type: DataType::Bytea,
+            expr: inner,
+            ..
+        } => {
+            let Expr::Value(value) = inner.as_ref() else {
+                return;
+            };
+            let Value::SingleQuotedString(text) = &value.value else {
+                return;
+            };
+            let Ok(bytes) = vairedb_common::bytea_in::decode(text) else {
+                return;
+            };
+            *expr = call("unhex", vec![string(&hex_of(&bytes))]);
+        }
         // A zero divisor. PostgreSQL raises `22012` and writes nothing; DuckDB — with
         // the `integer_division` setting the shards run under, which is what makes `7/2`
         // answer `3` — answers **NULL** for `7/0`, `7.0/0` and `7 % 0` alike. So the
@@ -293,6 +334,17 @@ fn null() -> Expr {
 /// A single-quoted string literal.
 fn string(s: &str) -> Expr {
     Expr::value(Value::SingleQuotedString(s.to_string()))
+}
+
+/// `bytes` as uppercase hexadecimal, the argument `unhex` takes.
+fn hex_of(bytes: &[u8]) -> String {
+    use std::fmt::Write;
+    bytes.iter().fold(String::new(), |mut out, b| {
+        // Infallible into a `String`, and the alternative — `map` plus `collect` — allocates
+        // one `String` per byte.
+        let _ = write!(out, "{b:02X}");
+        out
+    })
 }
 
 /// Build a plain `name(args…)` call — no `DISTINCT`, no `FILTER`, no window.

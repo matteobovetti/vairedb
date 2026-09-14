@@ -234,6 +234,11 @@ pub const SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE: &str = "22003";
 /// (`ntile(0)`, a negative `LIMIT`, an unrecognized `SET` value).
 pub const SQLSTATE_INVALID_PARAMETER_VALUE: &str = "22023";
 
+/// `InvalidTextRepresentation` — the text is not a valid input for the type it is
+/// being read as (`'a\1'::bytea`). PostgreSQL splits a bad literal between this and
+/// `22023` by *which* rule it broke, and a client that keys on the code reads both.
+pub const SQLSTATE_INVALID_TEXT_REPRESENTATION: &str = "22P02";
+
 /// `UndefinedObject` — the name is not one the server has, and the client's mistake
 /// is the name itself rather than a missing feature. What `SET`/`SHOW`/`RESET`
 /// report for a configuration parameter VaireDB does not model, so a typo stays
@@ -244,6 +249,11 @@ pub const SQLSTATE_UNDEFINED_OBJECT: &str = "42704";
 /// server started (`server_version`, `is_superuser`). PostgreSQL reports the same
 /// for its `internal`-context settings.
 pub const SQLSTATE_CANT_CHANGE_RUNTIME_PARAM: &str = "55P02";
+
+/// `InvalidArgumentForNthValue` — `nth_value(x, 0)`, the one input PostgreSQL spends a
+/// whole SQLSTATE on. Pinned rather than folded into `22023` because the alternative to
+/// raising is a column of NULLs a client reads as "the window had no such row".
+pub const SQLSTATE_INVALID_ARGUMENT_FOR_NTH_VALUE: &str = "22016";
 
 /// Assert `sql` fails with exactly `sqlstate`, and return the error. Stronger than
 /// [`assert_rejected`]: use it where the SQLSTATE is the contract, so a client can

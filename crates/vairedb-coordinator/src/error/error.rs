@@ -61,6 +61,15 @@ pub enum CoordinatorError {
     #[error("{0}")]
     Unsupported(String),
 
+    /// A literal that is not a valid input for the type it is cast to, refused at parse
+    /// time with the message *and* the SQLSTATE PostgreSQL raises for that same input —
+    /// which is why the code travels with the message instead of being derived from the
+    /// variant: PostgreSQL reports `'a\12'::bytea` as `22P02` and `'\xzz'::bytea` as
+    /// `22023`, and a client that moved the cast from a `SELECT` to an `INSERT` should read
+    /// the same pair either way. See [`vairedb_common::bytea_in`].
+    #[error("{message}")]
+    InvalidValue { message: String, code: VdbErrorCode },
+
     #[error("table not found: {0}")]
     TableNotFound(String),
 
@@ -126,6 +135,7 @@ impl CoordinatorError {
             CoordinatorError::Anonymization(_) => VdbErrorCode::FeatureNotSupported,
             CoordinatorError::SqlParse(_) => VdbErrorCode::SqlSyntaxError,
             CoordinatorError::Unsupported(_) => VdbErrorCode::FeatureNotSupported,
+            CoordinatorError::InvalidValue { code, .. } => *code,
             CoordinatorError::Serialization(_) => VdbErrorCode::SerializationError,
             CoordinatorError::Internal(_) => VdbErrorCode::InternalError,
             CoordinatorError::Grpc(status) => match status.code() {

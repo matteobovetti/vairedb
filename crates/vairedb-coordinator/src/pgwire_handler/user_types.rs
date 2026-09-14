@@ -1,8 +1,8 @@
 //! Refusal of user-defined types — `CREATE TYPE`, `CREATE DOMAIN`, `ALTER TYPE`.
 //!
 //! VaireDB has no user-defined types, and this is a decided limitation rather than
-//! an unimplemented feature (`docs/specs/gap-analysis-command.md`, *Decided
-//! limitations → No user-defined types*). Three things stand in the way, and none of
+//! an unimplemented feature (`docs/specs/gap-analysis.md`, § 3.1 *No user-defined
+//! types*). Three things stand in the way, and none of
 //! them is work waiting for a turn:
 //!
 //! * **The catalog models tables.** A type is cluster-wide state that every
@@ -11,7 +11,7 @@
 //!   would come back without the type and reject every write naming it.
 //! * **The type does not survive the wire boundary.** The coordinator's emulated
 //!   `pg_catalog` has no `pg_type` row to give a user type an OID, and a shard's
-//!   enum column already reads back as text (`gap-analysis-data-type.md`), so a
+//!   enum column already reads back as text (`gap-analysis.md` § 2.2), so a
 //!   client could neither resolve the type nor receive a value tagged with it.
 //! * **What an enum or a domain buys is a value check**, and a value check is
 //!   shard-local — `VARCHAR` plus validation gives the same guarantee today, and a

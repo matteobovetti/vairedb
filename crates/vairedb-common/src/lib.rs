@@ -4,10 +4,15 @@
 //! the protobuf-generated gRPC types ([`proto`]), error classification and
 //! sanitization ([`error`]), the cross-node scan-plan payload ([`scan_plan`]),
 //! YAML config loading ([`config`]), and the functions a distributed stage
-//! resolves by name on whichever node runs it ([`udaf`], [`pg_udf`]).
+//! resolves by name on whichever node runs it ([`udaf`], [`pg_udf`],
+//! [`float_div`], [`not_in`], [`bytea_in`], [`nth_value`]).
 
+pub mod bytea_in;
 pub mod config;
 pub mod error;
+pub mod float_div;
+pub mod not_in;
+pub mod nth_value;
 pub mod pg_udf;
 pub mod scan_plan;
 pub mod udaf;

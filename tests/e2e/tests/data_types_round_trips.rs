@@ -9,7 +9,7 @@ use tokio_postgres::types::Type;
 
 // End-to-end data type map. One file for every type VaireDB can be asked to
 // store, whether it works or not — the executable counterpart of
-// docs/specs/gap-analysis-data-type.md.
+// docs/specs/gap-analysis.md § 2.2 and § 3.3.
 //
 // Values must survive the coordinator -> DuckDB -> coordinator round trip, and the
 // advertised type must be the PostgreSQL type the client asked for. Both halves
@@ -1229,6 +1229,11 @@ async fn test_timestamp_precision_variants() {
 // BYTEA is rewritten to DuckDB BLOB on the write path (`transform_to_duckdb`) and
 // both spellings have a `parse_data_type` arm, so bytes survive intact and the
 // column is advertised as bytea.
+//
+// The value is written in PostgreSQL's own hex input format, `'\xDEADBEEF'::bytea`, which
+// the coordinator decodes itself — see `sql_expression_gaps.rs` § 15 and gap-analysis.md
+// § 2.7 row 5. Without the cast the literal is coerced by the shard instead, and DuckDB's
+// escape syntax is not PostgreSQL's; that remaining case is the `#[ignore]`d test below.
 #[tokio::test]
 async fn test_bytea_round_trip() {
     let client = ready_client().await;
@@ -1243,7 +1248,7 @@ async fn test_bytea_round_trip() {
     execute(
         &client,
         &format!(
-            "INSERT INTO {tbl} (id, a, b) VALUES (1, '\\xDE\\xAD\\xBE\\xEF', '\\xDE\\xAD\\xBE\\xEF')"
+            "INSERT INTO {tbl} (id, a, b) VALUES (1, '\\xDEADBEEF'::bytea, '\\xDEADBEEF'::bytea)"
         ),
     )
     .await
@@ -1257,6 +1262,122 @@ async fn test_bytea_round_trip() {
     let b: Vec<u8> = rows[0].get(1);
     assert_eq!(a, vec![0xDE, 0xAD, 0xBE, 0xEF], "BYTEA must survive intact");
     assert_eq!(b, vec![0xDE, 0xAD, 0xBE, 0xEF], "BLOB must survive intact");
+
+    drop_table(&client, &tbl).await;
+}
+
+// GAP. A string literal coerced *implicitly* into a bytea column, with no cast to hang the
+// decoding on. PostgreSQL reads it with `byteain` — `'\xDEADBEEF'` is four bytes — and a
+// shard reads it with DuckDB's own VARCHAR->BLOB conversion, where `\xDE` is one byte and
+// `ADBEEF` is six characters, so seven bytes are stored.
+//
+// The cast form is closed (`test_bytea_round_trip` above): the coordinator decodes the
+// literal itself and emits the bytes. This form needs the *target column's* type, which
+// `write_sql_cl::transform_to_duckdb` does not have — it is handed a statement, not a
+// schema — so closing it means resolving the column types of an INSERT's target before the
+// dialect rewrite runs. See gap-analysis.md § 2.7 row 5.
+#[tokio::test]
+#[ignore = "gap: an implicit string -> bytea coercion is read by the shard, not by byteain"]
+async fn test_a_bytea_column_decodes_an_uncast_literal_the_way_postgres_does() {
+    let client = ready_client().await;
+    let tbl = create_table(
+        &client,
+        "tr_bytea_implicit",
+        &format!("(id INTEGER NOT NULL, a BYTEA NOT NULL) {CREATE_OPTS}"),
+    )
+    .await;
+
+    execute(
+        &client,
+        &format!("INSERT INTO {tbl} (id, a) VALUES (1, '\\xDEADBEEF')"),
+    )
+    .await
+    .unwrap();
+
+    let rows = client
+        .query(&format!("SELECT a FROM {tbl} WHERE id = $1"), &[&1i32])
+        .await
+        .expect("binary-format bytea read should succeed");
+    assert_eq!(
+        rows[0].get::<_, Vec<u8>>(0),
+        vec![0xDE, 0xAD, 0xBE, 0xEF],
+        "an uncast literal must be read by PostgreSQL's bytea input conversion"
+    );
+
+    drop_table(&client, &tbl).await;
+}
+
+// GAP. A `DEFAULT '\xDEADBEEF'::bytea` in a `CREATE TABLE` is neither decoded by the
+// coordinator nor refused, so the shard reads the literal with DuckDB's own escape syntax
+// and the default is seven bytes instead of four. (Single-byte hex agrees by coincidence —
+// DuckDB reads `\x41` as one byte too — which is exactly what makes it easy to miss.)
+//
+// The cast is closed everywhere an INSERT, UPDATE, DELETE or MERGE can carry it. A DDL
+// default is a third surface: `write_sql_cl::transform_to_duckdb` walks a CREATE TABLE's
+// column *types* and not its column options, and `reject_duckdb_divergent` does not visit
+// DDL expressions at all. Opening both to a DDL statement widens what else they would judge
+// there — a CHECK constraint's `~` or `SIMILAR TO`, a default with a division — so it is a
+// row of its own rather than a rider on the cast. See gap-analysis.md § 2.7 row 5.
+#[tokio::test]
+#[ignore = "gap: a CREATE TABLE DEFAULT expression is not translated to DuckDB"]
+async fn test_a_bytea_default_is_decoded_the_way_postgres_decodes_it() {
+    let client = ready_client().await;
+    let tbl = create_table(
+        &client,
+        "tr_bytea_default",
+        &format!("(id INTEGER NOT NULL, a BYTEA DEFAULT '\\xDEADBEEF'::bytea) {CREATE_OPTS}"),
+    )
+    .await;
+
+    execute(&client, &format!("INSERT INTO {tbl} (id) VALUES (1)"))
+        .await
+        .unwrap();
+
+    let rows = client
+        .query(&format!("SELECT a FROM {tbl} WHERE id = $1"), &[&1i32])
+        .await
+        .expect("binary-format bytea read should succeed");
+    assert_eq!(
+        rows[0].get::<_, Vec<u8>>(0),
+        vec![0xDE, 0xAD, 0xBE, 0xEF],
+        "a DEFAULT is the same cast and must decode the same way"
+    );
+
+    drop_table(&client, &tbl).await;
+}
+
+// GAP. `bytea` in *text* format carries PostgreSQL's `\x` prefix: `\xdeadbeef`, not
+// `deadbeef`. The bytes are right and their spelling is not, so a client using the simple
+// query protocol — psql, a JDBC statement without parameters, anything that reads the value
+// as a string — gets hex it cannot tell from a text column holding hex digits, and feeding
+// it back in produces different bytes. The binary format, which every driver uses for a
+// parameterized read, is correct today; this is the text encoder in `arrow_pg`.
+#[tokio::test]
+#[ignore = "gap: text-format bytea is rendered without PostgreSQL's \\x prefix"]
+async fn test_bytea_renders_in_postgresqls_hex_format_in_text_mode() {
+    let client = ready_client().await;
+    let tbl = create_table(
+        &client,
+        "tr_bytea_text",
+        &format!("(id INTEGER NOT NULL, a BYTEA NOT NULL) {CREATE_OPTS}"),
+    )
+    .await;
+
+    execute(
+        &client,
+        &format!("INSERT INTO {tbl} (id, a) VALUES (1, '\\xDEADBEEF'::bytea)"),
+    )
+    .await
+    .unwrap();
+
+    let rows = simple_query_rows(&client, &format!("SELECT a FROM {tbl}"))
+        .await
+        .unwrap();
+    assert_eq!(
+        rows[0][0].as_deref(),
+        Some("\\xdeadbeef"),
+        "text-format bytea is PostgreSQL's hex format, prefix included"
+    );
 
     drop_table(&client, &tbl).await;
 }
@@ -1705,8 +1826,8 @@ async fn test_enum_column_ordering() {
 // SERIAL is a PostgreSQL pseudo-type: a column backed by a sequence. VaireDB has
 // no sequences **by decision**, not by omission — a per-shard counter hands out the
 // same numbers on every shard, and each replica of a shard would advance its own
-// copy — so this is a rejection test, not an xfail. See the "Decided limitation:
-// no sequences" section of `docs/specs/gap-analysis-command.md`.
+// copy — so this is a rejection test, not an xfail. See "No sequences" in
+// § 3.1 of `docs/specs/gap-analysis.md`.
 #[tokio::test]
 async fn test_serial_column_is_refused_with_the_reason() {
     let client = ready_client().await;

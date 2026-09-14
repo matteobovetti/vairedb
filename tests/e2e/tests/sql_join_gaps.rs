@@ -4,7 +4,7 @@ use tokio_postgres::Client;
 use tokio_postgres::types::Type;
 
 // The read path's join and set-operation surface: the executable counterpart of
-// `docs/specs/gap-analysis-join.md`.
+// `docs/specs/gap-analysis.md` § 2.6, plus rows 7-8 of its § 2.7.
 //
 // This axis exists because a join is the one read whose answer depends on how the data is
 // laid out. Every table here is created with `CREATE_OPTS` — three shards, hash-sharded on
@@ -569,37 +569,41 @@ async fn test_full_join_using_merges_the_key_column() {
     drop_table(&client, &r).await;
 }
 
-// What the merge costs, pinned so it is a recorded decision rather than a discovery: a key
-// column reached by an **explicit qualifier**. PostgreSQL answers the raw per-side value
-// there — `4` with a NULL beside it, and a NULL beside `5` — because `l.id` is the left
-// side's own column and only the unqualified `id` is merged. VaireDB answers the merged
-// value in both.
+// A key column reached by an **explicit qualifier**, which PostgreSQL answers with the raw
+// per-side value: `l.id` is the left side's own column, so the row only `r` has reports NULL
+// there and not the merged key. Only the unqualified `id` is merged.
 //
-// It is not a corner that was skipped. PostgreSQL's join output has three addressable
-// names here (`id`, `l.id`, `r.id`) and DataFusion's schema has two fields to hold them, so
-// the merged column has to live in whichever fields every other consumer reads — which is
-// both of them. The `ON` spelling below is the query that answers this question today.
+// THREE-VALUED, and the reason it needed its own repair: PostgreSQL's join output has three
+// addressable names here (`id`, `l.id`, `r.id`) and a DataFusion schema has two fields, so
+// the plan-level merge could only put the merged value under both qualified names too. The
+// third name is added before there is a plan instead — `pg_using_join_qualifiers` respells
+// the statement as `ON l.id = r.id` with an explicit `COALESCE` for the unqualified key — so
+// the two spellings below are now the same query and answer the same rows.
 #[tokio::test]
-async fn test_a_qualified_using_key_reports_the_merged_value() {
+async fn test_a_qualified_using_key_reports_each_side_own_value() {
     let client = ready_client().await;
     let (l, r) = setup_pair(&client, "jg_fullusing_qual").await;
 
+    let raw_sides = vec![
+        ("1".into(), "NULL".into()),
+        ("2".into(), "2".into()),
+        ("3".into(), "3".into()),
+        ("4".into(), "NULL".into()),
+        ("NULL".into(), "5".into()),
+    ];
     assert_eq!(
         pairs(
             &client,
-            &format!("SELECT l.id, r.id FROM {l} l FULL JOIN {r} r USING (id) ORDER BY l.id")
+            &format!(
+                "SELECT l.id, r.id FROM {l} l FULL JOIN {r} r USING (id) \
+                 ORDER BY COALESCE(l.id, r.id)"
+            )
         )
         .await,
-        vec![
-            ("1".into(), "1".into()),
-            ("2".into(), "2".into()),
-            ("3".into(), "3".into()),
-            ("4".into(), "4".into()),
-            ("5".into(), "5".into()),
-        ]
+        raw_sides
     );
-    // The `ON` spelling is untouched by the merge and reports the raw sides, which is
-    // PostgreSQL's answer for the query above.
+    // The `ON` spelling, which was the only one that answered this correctly before and has
+    // to keep agreeing with the `USING` one now.
     assert_eq!(
         pairs(
             &client,
@@ -609,14 +613,81 @@ async fn test_a_qualified_using_key_reports_the_merged_value() {
             )
         )
         .await,
+        raw_sides
+    );
+    // A right join keeps only `r`'s rows, and `5` is the one whose left key is NULL.
+    assert_eq!(
+        pairs(
+            &client,
+            &format!("SELECT l.id, r.id FROM {l} l RIGHT JOIN {r} r USING (id) ORDER BY r.id")
+        )
+        .await,
         vec![
-            ("1".into(), "NULL".into()),
             ("2".into(), "2".into()),
             ("3".into(), "3".into()),
-            ("4".into(), "NULL".into()),
             ("NULL".into(), "5".into()),
         ]
     );
+    // The merged column and a per-side one in the same select list: three names, three
+    // values, once the per-side column is given a name of its own.
+    assert_eq!(
+        pairs(
+            &client,
+            &format!(
+                "SELECT id, l.id AS l_id FROM {l} l FULL JOIN {r} r USING (id) ORDER BY id"
+            )
+        )
+        .await,
+        vec![
+            ("1".into(), "1".into()),
+            ("2".into(), "2".into()),
+            ("3".into(), "3".into()),
+            ("4".into(), "4".into()),
+            ("5".into(), "NULL".into()),
+        ]
+    );
+
+    drop_table(&client, &l).await;
+    drop_table(&client, &r).await;
+}
+
+// REFUSAL, for the two shapes the respelling cannot serve — refused with `0A000` rather than
+// answered with the qualifier reporting the merged value.
+//
+// A wildcard wants the key merged into one column and a qualifier wants the two apart. And
+// the merged key beside the same key per side under *one* name is what PostgreSQL answers
+// with two result columns both called `id`, which a plan schema cannot hold at all: naming
+// one of them is the way out, and the message says so.
+#[tokio::test]
+async fn test_a_qualified_using_key_beside_a_wildcard_or_its_own_name_is_refused() {
+    let client = ready_client().await;
+    let (l, r) = setup_pair(&client, "jg_fullusing_refuse").await;
+
+    for (sql, expected) in [
+        (
+            format!("SELECT *, l.id FROM {l} l FULL JOIN {r} r USING (id)"),
+            "wildcard is not supported beside a qualified reference",
+        ),
+        (
+            format!("SELECT l.*, r.id FROM {l} l FULL JOIN {r} r USING (id)"),
+            "wildcard is not supported beside a qualified reference",
+        ),
+        (
+            format!("SELECT id, l.id FROM {l} l FULL JOIN {r} r USING (id)"),
+            "are not supported in the same query block",
+        ),
+        (
+            format!("SELECT id, r.w FROM {l} l FULL JOIN {r} r USING (id) ORDER BY l.id"),
+            "are not supported in the same query block",
+        ),
+    ] {
+        let err = assert_sqlstate(&client, &sql, "0A000").await;
+        assert!(
+            err.message().contains(expected),
+            "`{sql}` should be refused with `{expected}`, got: {}",
+            err.message()
+        );
+    }
 
     drop_table(&client, &l).await;
     drop_table(&client, &r).await;
@@ -627,7 +698,8 @@ async fn test_a_qualified_using_key_reports_the_merged_value() {
 // to it where PostgreSQL sees one merged column. It refuses rather than answering a
 // different question, and it refuses on **every** `USING` and `NATURAL` join — inner
 // included — so this is not a cost of the merge above. The qualified spelling works, and
-// on a full join it now carries the merged value.
+// filters on that side's own key: `l.id > 2` keeps the rows `l` has, so the row only `r` has
+// is not one of them.
 #[tokio::test]
 async fn test_a_where_clause_on_a_using_key_is_refused() {
     let client = ready_client().await;
@@ -654,7 +726,7 @@ async fn test_a_where_clause_on_a_using_key_is_refused() {
             &format!("SELECT l.id FROM {l} l FULL JOIN {r} r USING (id) WHERE l.id > 2")
         )
         .await,
-        vec!["3", "4", "5"]
+        vec!["3", "4"]
     );
 
     drop_table(&client, &l).await;
@@ -1246,6 +1318,11 @@ async fn test_outer_join_without_an_equijoin_key_keeps_its_unmatched_rows() {
 // one-column derived table whose filter carries all three NULL rules; see
 // `compat_rewrite::rewrite_not_in_subqueries` and
 // `scheduler::with_postgres_sql_options`.
+//
+// Two shapes cannot take that spelling, and each has its own test below: an **aggregate** on
+// the left, which cannot move inside a subquery and is answered by a UDF over an `array_agg`
+// of the candidates instead; and a **correlated** subquery, which no spelling reaches and
+// which is refused rather than answered wrongly.
 #[tokio::test]
 async fn test_not_in_a_subquery_is_null_aware() {
     let client = ready_client().await;
@@ -1344,8 +1421,8 @@ async fn test_not_in_a_subquery_is_null_aware() {
         .await,
         vec!["2", "3"]
     );
-    // In a `HAVING` clause, over the grouped column. The aggregate spelling of the same
-    // predicate is the gap below: only a grouped *column* can be rewritten.
+    // In a `HAVING` clause, over the grouped column. An *aggregate* on the left takes a
+    // second spelling, which `test_not_in_over_an_aggregate_is_null_aware` measures.
     assert_eq!(
         column(
             &client,
@@ -1359,92 +1436,23 @@ async fn test_not_in_a_subquery_is_null_aware() {
     drop_table(&client, &r).await;
 }
 
-// THREE-VALUED, and the two shapes the rewrite above declines to enter. This test pins
-// today's answer so a regression is visible;
-// `test_not_in_over_an_aggregate_or_a_correlated_subquery` asserts PostgreSQL's.
+// THREE-VALUED, over an **aggregate** left side — the shape the anti-join spelling cannot
+// carry, because `MAX(k)` cannot move inside a subquery: DataFusion plans no correlated
+// subquery over an aggregate, and a hand-written `NOT EXISTS (… WHERE r.k = MAX(l.k))` fails
+// the same way. Before this closed, the query below answered `10, 30, NULL` — one row too
+// many, and the row was the NULL one.
 //
-// The rewrite is applied only where NULL and false are indistinguishable — a clause that
-// keeps a row when the predicate is *true*, reached through `AND`/`OR` — and only to a left
-// side it can move inside a subquery. That leaves two shapes:
-//
-// * under a `NOT`, where two-valued and three-valued differ. Measured on the cluster,
-//   DataFusion's simplifier already recovers PostgreSQL's answer here by turning the double
-//   negation into a semi join, so this one is pinned as **correct** rather than as a gap.
-// * a left side holding an **aggregate**, i.e. `HAVING MAX(k) NOT IN (q)`. Every available
-//   spelling puts that aggregate inside a subquery, and DataFusion cannot plan a correlated
-//   subquery over an aggregate at all — a hand-written `NOT EXISTS (… WHERE r.k = MAX(l.k))`
-//   fails the same way. Rewriting would trade a wrong answer for a plan error naming a
-//   clause the client did not write, so the predicate is left as written.
-//
-// * a **correlated** subquery. A derived table cannot see the outer row without `LATERAL`,
-//   so wrapping one would turn a wrong answer into a failure to resolve a column — worse for
-//   a client whose query runs today.
+// So the candidates are delivered as a *value* instead of as a join side —
+// `array_agg` over the subquery — and the whole three-valued rule is evaluated in Rust by
+// `vairedb_common::not_in`, a UDF registered on the coordinator and on every core node. No
+// join, so nothing about the anti join's null-unawareness can reach the answer, and the
+// aggregate stays where the client wrote it. See `compat_rewrite::null_aware_not_in`.
 #[tokio::test]
-async fn test_not_in_over_an_aggregate_or_a_correlated_subquery_is_wrong() {
+async fn test_not_in_over_an_aggregate_is_null_aware() {
     let client = ready_client().await;
-    let (l, r) = setup_pair(&client, "jg_notin_gap").await;
+    let (l, r) = setup_pair(&client, "jg_notin_agg").await;
 
-    // Already PostgreSQL's answer, and not by way of the rewrite: `NOT (k NOT IN q)` is
-    // simplified to a semi join before the null-awareness of the anti join can matter.
-    assert_eq!(
-        column(
-            &client,
-            &format!("SELECT id FROM {l} WHERE NOT (k NOT IN (SELECT k FROM {r})) ORDER BY id")
-        )
-        .await,
-        vec!["2"]
-    );
-    // The aggregate left side, which keeps the null-unaware answer: PostgreSQL drops the
-    // NULL group and answers `10, 30`.
-    assert_eq!(
-        column(
-            &client,
-            &format!(
-                "SELECT k FROM {l} GROUP BY k HAVING MAX(k) NOT IN (SELECT k FROM {r}) \
-                 ORDER BY k"
-            )
-        )
-        .await,
-        vec!["10", "30", "NULL"]
-    );
-    // The correlated subquery, which keeps it too: for id 4 the subquery holds `50` and the
-    // left key is NULL, so PostgreSQL's predicate is NULL and the row drops — it answers
-    // `1, 2, 3`.
-    assert_eq!(
-        column(
-            &client,
-            &format!(
-                "SELECT id FROM {l} WHERE k NOT IN \
-                 (SELECT k FROM {r} WHERE {r}.id > {l}.id) ORDER BY id"
-            )
-        )
-        .await,
-        vec!["1", "2", "3", "4"]
-    );
-    // `NOT EXISTS` expresses the row-level predicate correctly and is available today —
-    // row 19. It is not available over an aggregate, which is what closes the corner above.
-    assert_eq!(
-        column(
-            &client,
-            &format!(
-                "SELECT id FROM {l} WHERE NOT EXISTS \
-                 (SELECT 1 FROM {r} WHERE {r}.k = {l}.k) ORDER BY id"
-            )
-        )
-        .await,
-        vec!["1", "3", "4"]
-    );
-
-    drop_table(&client, &l).await;
-    drop_table(&client, &r).await;
-}
-
-#[tokio::test]
-#[ignore = "gap (row 23): NOT IN must be null-aware over an aggregate and over a correlated subquery"]
-async fn test_not_in_over_an_aggregate_or_a_correlated_subquery() {
-    let client = ready_client().await;
-    let (l, r) = setup_pair(&client, "jg_notin_want").await;
-
+    // The NULL group's `MAX(k)` is NULL, so its predicate is NULL and the group drops.
     assert_eq!(
         column(
             &client,
@@ -1456,6 +1464,153 @@ async fn test_not_in_over_an_aggregate_or_a_correlated_subquery() {
         .await,
         vec!["10", "30"]
     );
+    // A NULL among the candidates is NULL for every group that does not match, so a subquery
+    // holding one answers nothing at all.
+    assert_eq!(
+        column(
+            &client,
+            &format!(
+                "SELECT k FROM {l} GROUP BY k HAVING MAX(k) NOT IN (SELECT k FROM {l}) \
+                 ORDER BY k"
+            )
+        )
+        .await,
+        Vec::<String>::new()
+    );
+    // No candidates: the empty conjunction is true, for the NULL group too.
+    assert_eq!(
+        column(
+            &client,
+            &format!(
+                "SELECT k FROM {l} GROUP BY k \
+                 HAVING MAX(k) NOT IN (SELECT k FROM {r} WHERE k > 1000) ORDER BY k"
+            )
+        )
+        .await,
+        vec!["10", "20", "30", "NULL"]
+    );
+    // Beside another conjunct, and over an aggregate that is not the grouped column:
+    // `COUNT(*)` is 1 per group, which is not among `20, 99, 50`.
+    assert_eq!(
+        column(
+            &client,
+            &format!(
+                "SELECT k FROM {l} GROUP BY k \
+                 HAVING k > 15 AND COUNT(*) NOT IN (SELECT k FROM {r}) ORDER BY k"
+            )
+        )
+        .await,
+        vec!["20", "30"]
+    );
+    // Already PostgreSQL's answer, and by neither spelling: `NOT (k NOT IN q)` is simplified
+    // to a semi join before the anti join's null-unawareness can matter.
+    assert_eq!(
+        column(
+            &client,
+            &format!("SELECT id FROM {l} WHERE NOT (k NOT IN (SELECT k FROM {r})) ORDER BY id")
+        )
+        .await,
+        vec!["2"]
+    );
+    // A set-operation subquery takes the anti-join spelling: only the candidate list's column
+    // *count* has to be known here, and every branch of a `UNION` has the first branch's.
+    assert_eq!(
+        column(
+            &client,
+            &format!(
+                "SELECT id FROM {l} WHERE k NOT IN \
+                 (SELECT k FROM {r} UNION SELECT 99) ORDER BY id"
+            )
+        )
+        .await,
+        vec!["1", "3"]
+    );
+
+    drop_table(&client, &l).await;
+    drop_table(&client, &r).await;
+}
+
+// REFUSAL. A **correlated** `NOT IN (subquery)` is the one shape neither spelling can carry:
+// a derived table cannot see the outer row without `LATERAL`, which DataFusion does not have,
+// and the `array_agg` spelling is planned but not serializable — measured on this cluster as
+// `Proto serialization error: outer_ref(…) is not yet supported`, since only an equality
+// correlation is decorrelated before the plan is cut into stages.
+//
+// Left as written it answered `1, 2, 3, 4` where PostgreSQL answers `1, 2, 3`, so it is
+// refused instead — by `pg_not_in_nulls` on the plan, which is the only place the *nullability*
+// that decides this is visible. `test_not_in_over_a_correlated_subquery` asserts the answer
+// that would close it.
+#[tokio::test]
+async fn test_not_in_over_a_correlated_subquery_is_refused() {
+    let client = ready_client().await;
+    let (l, r) = setup_pair(&client, "jg_notin_corr").await;
+
+    let sql = format!(
+        "SELECT id FROM {l} WHERE k NOT IN \
+         (SELECT k FROM {r} WHERE {r}.id > {l}.id) ORDER BY id"
+    );
+    let err = assert_sqlstate(&client, &sql, SQLSTATE_FEATURE_NOT_SUPPORTED).await;
+    assert!(
+        err.message().contains("NOT EXISTS") && err.message().contains("IS NULL"),
+        "the refusal should name a spelling that works, and the NULL test it needs: {}",
+        err.message()
+    );
+
+    // Nullability decides it and not the shape: over `NOT NULL` columns the predicate is
+    // two-valued, the anti join is exactly PostgreSQL's answer, and the same correlated shape
+    // is answered as written. `r`'s ids from `l.id` up are `2, 3, 5` — so 2 and 3 match their
+    // own row and drop, and `1, 4` remain.
+    assert_eq!(
+        column(
+            &client,
+            &format!(
+                "SELECT id FROM {l} WHERE id NOT IN \
+                 (SELECT id FROM {r} WHERE {r}.id >= {l}.id) ORDER BY id"
+            )
+        )
+        .await,
+        vec!["1", "4"]
+    );
+    // `NOT EXISTS` is available (row 19) but is not the same predicate: it is two-valued, so
+    // it keeps id 4 where PostgreSQL's `NOT IN` drops it. That is why the refusal asks for an
+    // `IS NULL` test rather than presenting this as a substitution.
+    assert_eq!(
+        column(
+            &client,
+            &format!(
+                "SELECT id FROM {l} WHERE NOT EXISTS \
+                 (SELECT 1 FROM {r} WHERE {r}.k = {l}.k AND {r}.id > {l}.id) ORDER BY id"
+            )
+        )
+        .await,
+        vec!["1", "2", "3", "4"]
+    );
+    // With that test added, it is — `1, 2, 3`, PostgreSQL's answer for the refused query.
+    assert_eq!(
+        column(
+            &client,
+            &format!(
+                "SELECT id FROM {l} WHERE k IS NOT NULL AND NOT EXISTS \
+                 (SELECT 1 FROM {r} WHERE {r}.id > {l}.id AND \
+                 ({r}.k = {l}.k OR {r}.k IS NULL)) ORDER BY id"
+            )
+        )
+        .await,
+        vec!["1", "2", "3"]
+    );
+
+    drop_table(&client, &l).await;
+    drop_table(&client, &r).await;
+}
+
+#[tokio::test]
+#[ignore = "gap (row 23): NOT IN over a correlated subquery must answer instead of being refused"]
+async fn test_not_in_over_a_correlated_subquery() {
+    let client = ready_client().await;
+    let (l, r) = setup_pair(&client, "jg_notin_corr_gap").await;
+
+    // For id 4 the subquery holds `50` and the left key is NULL, so the predicate is NULL and
+    // the row drops.
     assert_eq!(
         column(
             &client,

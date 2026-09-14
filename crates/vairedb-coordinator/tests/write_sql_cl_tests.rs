@@ -163,6 +163,91 @@ fn test_transform_preserves_other_types() {
     assert!(result.contains("VARCHAR"));
 }
 
+// PostgreSQL's `::bytea` is an input conversion, not a reinterpretation: `'\xDEADBEEF'` is
+// four bytes. DuckDB's own VARCHAR → BLOB cast reads its escape syntax and stores seven, so
+// the coordinator decodes the literal and ships the bytes as `unhex('…')` — measured on
+// DuckDB 1.5.5, where `X'DEADBEEF'` would have been the VARCHAR `xDEADBEEF`.
+#[test]
+fn test_transform_bytea_cast_becomes_unhex() {
+    for (sql, expected) in [
+        (
+            "INSERT INTO t (b) VALUES ('\\xDEADBEEF'::bytea)",
+            "unhex('DEADBEEF')",
+        ),
+        // The escape format decodes too: `a\101b` is the three bytes `aAb`.
+        (
+            "INSERT INTO t (b) VALUES (CAST('a\\101b' AS BYTEA))",
+            "unhex('614162')",
+        ),
+        ("UPDATE t SET b = ''::bytea", "unhex('')"),
+        ("DELETE FROM t WHERE b = '\\x00'::bytea", "unhex('00')"),
+    ] {
+        let mut stmts = parse_sql(sql).unwrap();
+        transform_to_duckdb(&mut stmts[0]);
+        let result = statement_to_sql(&stmts[0]);
+        assert!(result.contains(expected), "`{sql}` gave: {result}");
+        assert!(!result.contains("BYTEA"), "`{sql}` gave: {result}");
+    }
+}
+
+// A NULL needs no conversion and a placeholder is bound as a BLOB by the shard, so both
+// keep the cast — which DuckDB accepts, since `BYTEA` is one of its aliases for `BLOB`.
+#[test]
+fn test_transform_leaves_a_bytea_cast_it_need_not_translate() {
+    for sql in [
+        "INSERT INTO t (b) VALUES (NULL::bytea)",
+        "INSERT INTO t (b) VALUES ($1::bytea)",
+    ] {
+        let mut stmts = parse_sql(sql).unwrap();
+        transform_to_duckdb(&mut stmts[0]);
+        let result = statement_to_sql(&stmts[0]);
+        assert!(result.contains("BYTEA"), "`{sql}` gave: {result}");
+        assert!(!result.contains("unhex"), "`{sql}` gave: {result}");
+    }
+}
+
+// An out-of-range array subscript answers NULL in PostgreSQL and counts back from the end in
+// DuckDB, so `a[-1]` used to read the last element of a write's own predicate. The clamp is
+// the read path's, applied here through `transform_to_duckdb` — the wiring this checks.
+#[test]
+fn test_transform_clamps_array_subscripts_to_pg_semantics() {
+    for (sql, expected) in [
+        (
+            "UPDATE t SET x = 1 WHERE a[-1] IS NULL",
+            "a[nullif(greatest(-1, 0), 0)]",
+        ),
+        (
+            "INSERT INTO t (v) VALUES (a[i])",
+            "a[nullif(greatest(i, 0), 0)]",
+        ),
+        (
+            "DELETE FROM t WHERE a[-1:2] = ARRAY[1]",
+            "a[CASE WHEN -1 < 1 THEN 1 ELSE -1 END:CASE WHEN 2 < 0 THEN 0 ELSE 2 END]",
+        ),
+    ] {
+        let mut stmts = parse_sql(sql).unwrap();
+        transform_to_duckdb(&mut stmts[0]);
+        let result = statement_to_sql(&stmts[0]);
+        assert!(result.contains(expected), "`{sql}` gave: {result}");
+    }
+}
+
+// A struct field and a DuckDB stride are not PostgreSQL array subscripts, so the clamp does
+// not reach them — the guard against a correctness fix breaking a working statement.
+#[test]
+fn test_transform_leaves_a_field_name_and_a_stride_alone() {
+    for sql in [
+        "UPDATE t SET x = 1 WHERE s['name'] = 'a'",
+        "UPDATE t SET x = 1 WHERE a[1:6:2] = ARRAY[1]",
+    ] {
+        let mut stmts = parse_sql(sql).unwrap();
+        transform_to_duckdb(&mut stmts[0]);
+        let result = statement_to_sql(&stmts[0]);
+        assert!(!result.contains("greatest"), "`{sql}` gave: {result}");
+        assert!(!result.contains("CASE"), "`{sql}` gave: {result}");
+    }
+}
+
 #[test]
 fn test_transform_to_char_becomes_strftime() {
     let sql = "UPDATE t SET col = TO_CHAR(ts, 'YYYY-MM-DD') WHERE id = 1";

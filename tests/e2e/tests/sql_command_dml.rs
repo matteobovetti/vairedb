@@ -1,9 +1,9 @@
 mod common;
 use common::*;
 
-// INSERT / UPDATE / DELETE — rows 2-4 of docs/specs/gap-analysis-command.md
-// (✅ supported, each with documented restrictions) plus row 25 MERGE INTO
-// (✅ for the shapes that can be applied shard by shard). See
+// INSERT / UPDATE / DELETE — supported, each with the sharding restrictions
+// docs/specs/gap-analysis.md § 2.1 records — plus MERGE INTO, supported for the
+// shapes that can be applied shard by shard. See
 // `sql_command_select.rs` for the four-file layout and the passing/#[ignore]
 // convention.
 //

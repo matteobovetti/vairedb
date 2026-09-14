@@ -2,18 +2,17 @@ mod common;
 use common::*;
 use tokio_postgres::Client;
 
-// CREATE TABLE / ALTER TABLE / DROP / TRUNCATE — rows 5-7 of
-// docs/specs/gap-analysis-command.md. See `sql_command_select.rs` for the
+// CREATE TABLE / ALTER TABLE / DROP / TRUNCATE — the table-level DDL rows of
+// docs/specs/gap-analysis.md § 2.1. See `sql_command_select.rs` for the
 // four-file layout and the passing/#[ignore] convention.
 //
 //     cd tests/e2e && cargo test --test sql_command_ddl -- --ignored --test-threads=1
 //
-// It also owns TRUNCATE, which the doc lists in its write-path table with no row
-// number of its own: it is a table-level statement handled by the same
-// `ddl.rs` broadcast machinery.
+// It also owns TRUNCATE: a table-level statement handled by the same `ddl.rs`
+// broadcast machinery.
 //
-// This file owns the *gap* surface of the three DDL rows — what the doc marks
-// 🟡 and the one ✅ caveat. The DDL that already works, and the catalog state it
+// This file owns the *gap* surface of those DDL rows — what the doc marks
+// 🟡 and the CREATE TABLE caveat. The DDL that already works, and the catalog state it
 // produces, lives in its own files and is not duplicated here:
 //   * CREATE/ALTER/DROP TABLE happy paths + `vairedb_catalog.*` assertions ->
 //     `catalog_ddl.rs`;
@@ -30,10 +29,10 @@ use tokio_postgres::Client;
 // their rejection tests in `errors.rs` / `anonymization.rs`.
 
 // ============================================================================
-// CREATE TABLE — row 5 (✅), with the CREATE TABLE AS SELECT caveat
+// CREATE TABLE — supported, with the CREATE TABLE AS SELECT caveat
 // ============================================================================
 
-// The doc's row-5 caveat: `CREATE TABLE AS SELECT` carries no column list, so
+// The caveat: `CREATE TABLE AS SELECT` carries no column list, so
 // there is nothing to derive a shard key from. Whatever the coordinator does with
 // it, the one thing a client must never get is a silent OK for a table that then
 // cannot be read.

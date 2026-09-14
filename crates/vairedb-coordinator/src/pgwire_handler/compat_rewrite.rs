@@ -41,6 +41,8 @@ use datafusion_pg_catalog::sql::rules::{
     StripCallableQualifier, StripCollate,
 };
 
+use vairedb_common::not_in::NOT_IN_UDF_NAME;
+
 use crate::sqlparser::ast::{
     BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Join, JoinConstraint,
     JoinOperator, Query, Select, SelectItem, SetExpr, Statement, TableFactor, Value,
@@ -201,7 +203,7 @@ fn any_all_subquery_as_in(expr: &Expr) -> Option<Expr> {
 /// **returns no rows at all on a cluster**: a semi or anti join with no equijoin key does
 /// not survive Ballista's distributed planner, so the whole predicate silently becomes
 /// false. That defect is wider than this rewrite (plain `WHERE EXISTS (SELECT 1 FROM t)`
-/// has it too) and is recorded in `docs/specs/gap-analysis-join.md`; here it means the
+/// has it too) and is recorded in `docs/specs/gap-analysis.md` (§ 1.3); here it means the
 /// only subquery shape available is an anti join on a **bare equality**, and the two NULL
 /// tests have to be asked as uncorrelated `count(*)`s instead. Both are constant for the
 /// whole statement, so they are evaluated once, not per row — `q` is named three times
@@ -217,24 +219,38 @@ fn any_all_subquery_as_in(expr: &Expr) -> Option<Expr> {
 /// not support logical expression InSubquery`), which is loud, and under a `NOT`
 /// DataFusion's own simplifier already recovers PostgreSQL's answer.
 ///
-/// Three further shapes are left alone. In each case leaving them means today's behavior
-/// rather than a new error, which is the reason the guards are here rather than a
-/// refusal:
+/// **In `HAVING` and `QUALIFY`, an `x` holding a function call takes a different
+/// spelling.** `HAVING MAX(k) NOT IN (q)` cannot use any of the above, because every one
+/// of them puts `x` inside a subquery and DataFusion cannot plan a correlated subquery
+/// over an aggregate at all — `NOT EXISTS (… WHERE r.k = MAX(l.k))` fails with "Aggregate
+/// functions are not allowed in the WHERE clause", as does the `count(*)` form. So the
+/// aggregate stays in the clause the client wrote it in and the *candidates* come to it as
+/// a value instead:
 ///
-/// * in `HAVING` and `QUALIFY` only, an `x` containing a **function call** — the
-///   `HAVING MAX(k) NOT IN (q)` form. Every spelling above puts `x` inside a subquery, and
-///   DataFusion cannot plan *any* correlated subquery over an aggregate: `NOT EXISTS (…
-///   WHERE r.k = MAX(l.k))` fails with "Aggregate functions are not allowed in the WHERE
-///   clause", as does the `count(*)` form. Rewriting would turn a wrong answer into a plan
-///   error naming a clause the client did not write. The guard is *any* call rather than a
-///   list of aggregate names — a list would rot, and a scalar call in a `HAVING`
-///   predicate is rare enough that declining it costs almost nothing. `WHERE` and `ON`
-///   need no such guard: an aggregate cannot appear there at all.
+/// ```sql
+/// vaire_not_in((SELECT array_agg(key) FROM (q) AS q_ (key)), (x))
+/// ```
+///
+/// [`vairedb_common::not_in`] is that comparison, and it owns all three NULL rules
+/// together with the coercion between the element's type and the list's — which is why the
+/// predicate is one call rather than the disjunction above. The guard on `x` is *any*
+/// function call rather than a list of aggregate names: a list would have to track two
+/// engines' registries, and a scalar call takes the same spelling correctly.
+///
+/// Two shapes are still left alone, and in each case leaving them means today's behavior
+/// rather than a new error — which is the reason the guards are here rather than a refusal.
+/// Neither is left *silently* wrong, though: what this function declines,
+/// [`super::pg_not_in_nulls`] refuses on the plan, where it can see whether a NULL can
+/// reach the predicate at all.
+///
 /// * a **correlated** `q`. A derived table may not see the outer row without `LATERAL`,
-///   so wrapping a correlated `q` would turn a wrong answer into a resolution failure.
+///   and a correlated `array_agg` subquery does not survive plan serialization
+///   (`outer_ref(l.id) is not yet supported`), so there is no spelling to move it to.
 ///   [`subquery_is_self_contained`] decides this conservatively.
-/// * a `q` that is not a single-block `SELECT` of exactly one named column — a set
-///   operation, a wildcard, or the row-wise `(a, b) NOT IN (q)` form.
+/// * a `q` that does not project exactly one column that can be named — a wildcard, or the
+///   row-wise `(a, b) NOT IN (q)` form. A set operation *is* accepted: only the column
+///   count matters for the derived table, and every branch of a set operation has the same
+///   one.
 pub(super) fn rewrite_not_in_subqueries(stmt: &mut Statement) -> bool {
     use crate::sqlparser::ast::VisitMut;
 
@@ -362,24 +378,28 @@ fn null_aware_not_in(expr: &Expr, subquery: &Query, nth: usize, grouped: Grouped
     if matches!(expr, Expr::Tuple(_)) {
         return None;
     }
-    // `HAVING MAX(k) NOT IN (q)`: `expr` would move inside a subquery, and no correlated
-    // subquery over an aggregate can be planned. See this function's caller's doc.
-    if grouped == Grouped::Yes && holds_a_function_call(expr) {
-        return None;
-    }
 
     let rel = format!("vaire_notin_{nth}");
     let key = format!("{rel}_key");
-    let sql = format!(
-        // Parenthesized as a whole: the result is an `OR`, and it replaces a leaf that may
-        // sit under an `AND`. The AST keeps the grouping either way, but a rendered
-        // statement would not.
-        "SELECT ((SELECT count(*) FROM ({subquery}) AS {rel}_all ({key})) = 0 \
-         OR (({expr}) IS NOT NULL \
-         AND (SELECT count(*) FROM ({subquery}) AS {rel}_null ({key}) WHERE {key} IS NULL) = 0 \
-         AND NOT EXISTS (SELECT 1 FROM ({subquery}) AS {rel} ({key}) \
-         WHERE {rel}.{key} = ({expr}))))"
-    );
+    // `HAVING MAX(k) NOT IN (q)`: `expr` cannot move inside a subquery, so the candidates
+    // come to it as a list instead. See this function's caller's doc.
+    let sql = if grouped == Grouped::Yes && holds_a_function_call(expr) {
+        format!(
+            "SELECT {NOT_IN_UDF_NAME}(\
+             (SELECT array_agg({key}) FROM ({subquery}) AS {rel} ({key})), ({expr}))"
+        )
+    } else {
+        format!(
+            // Parenthesized as a whole: the result is an `OR`, and it replaces a leaf that
+            // may sit under an `AND`. The AST keeps the grouping either way, but a rendered
+            // statement would not.
+            "SELECT ((SELECT count(*) FROM ({subquery}) AS {rel}_all ({key})) = 0 \
+             OR (({expr}) IS NOT NULL \
+             AND (SELECT count(*) FROM ({subquery}) AS {rel}_null ({key}) WHERE {key} IS NULL) = 0 \
+             AND NOT EXISTS (SELECT 1 FROM ({subquery}) AS {rel} ({key}) \
+             WHERE {rel}.{key} = ({expr}))))"
+        )
+    };
     let mut statements = Parser::new(&PostgreSqlDialect {})
         .try_with_sql(&sql)
         .ok()?
@@ -397,16 +417,27 @@ fn null_aware_not_in(expr: &Expr, subquery: &Query, nth: usize, grouped: Grouped
     }
 }
 
-/// Whether `query` is a single-block `SELECT` of exactly one column that can be given a
-/// name — the only shape the one-column derived table can wrap.
+/// Whether `query` projects exactly one column that can be given a name — the only shape
+/// the one-column derived table can wrap.
+///
+/// A set operation is asked of its **leading branch**: a derived table's column alias list
+/// has to match the column count, and a set operation whose branches disagreed about that
+/// count would not have parsed as one. So `k NOT IN (SELECT k FROM r UNION SELECT k FROM s)`
+/// is rewritten, where a wildcard — whose column count is a fact about the catalog, not
+/// about the statement — is not.
 fn projects_one_named_column(query: &Query) -> bool {
-    let SetExpr::Select(select) = &*query.body else {
-        return false;
-    };
-    matches!(
-        select.projection.as_slice(),
-        [SelectItem::UnnamedExpr(_) | SelectItem::ExprWithAlias { .. }]
-    )
+    fn one_named_column(body: &SetExpr) -> bool {
+        match body {
+            SetExpr::Select(select) => matches!(
+                select.projection.as_slice(),
+                [SelectItem::UnnamedExpr(_) | SelectItem::ExprWithAlias { .. }]
+            ),
+            SetExpr::SetOperation { left, .. } => one_named_column(left),
+            SetExpr::Query(inner) => one_named_column(&inner.body),
+            _ => false,
+        }
+    }
+    one_named_column(&query.body)
 }
 
 /// Whether `expr` calls a function anywhere inside it.
@@ -929,19 +960,27 @@ mod tests {
         }
     }
 
-    /// The one clause-dependent guard: in a `HAVING` or `QUALIFY` the left side may be an
-    /// aggregate, and no correlated subquery over an aggregate can be planned — so the
-    /// predicate is left as written rather than turned into a plan error. A grouped
-    /// *column* on the left is still rewritten (see the test above).
+    /// The one clause-dependent spelling: in a `HAVING` or `QUALIFY` the left side may be an
+    /// aggregate, which cannot be moved inside a subquery — so the candidates come out as a
+    /// value instead and the comparison is the UDF's. A grouped *column* on the left keeps
+    /// the anti join (see the test above), which is the cheaper of the two.
     #[test]
-    fn leaves_an_aggregate_left_side_alone_in_a_grouped_clause() {
-        untouched("SELECT k FROM l GROUP BY k HAVING max(k) NOT IN (SELECT k FROM r)");
-        untouched(
+    fn respells_an_aggregate_left_side_with_the_list_udf() {
+        assert_eq!(
+            rewritten("SELECT k FROM l GROUP BY k HAVING max(k) NOT IN (SELECT k FROM r)"),
+            "SELECT k FROM l GROUP BY k HAVING vaire_not_in(\
+             (SELECT array_agg(vaire_notin_0_key) FROM (SELECT k FROM r) \
+             AS vaire_notin_0 (vaire_notin_0_key)), (max(k)))"
+        );
+        // And under a connective, where only the aggregate conjunct takes this spelling.
+        let mixed = rewritten(
             "SELECT k FROM l GROUP BY k \
              HAVING k > 1 AND count(*) NOT IN (SELECT k FROM r)",
         );
-        // The same call in a `WHERE` is not an aggregate and is rewritten: an aggregate
-        // cannot appear there at all, so the guard would only cost coverage.
+        assert!(mixed.contains("vaire_not_in("), "{mixed}");
+        assert!(mixed.contains("(count(*))"), "{mixed}");
+        // A call in a `WHERE` is not an aggregate, so it keeps the anti join: an aggregate
+        // cannot appear there at all, and the anti join does not materialize the candidates.
         assert!(
             rewritten("SELECT k FROM l WHERE abs(k) NOT IN (SELECT k FROM r)")
                 .contains("NOT EXISTS")
@@ -1028,16 +1067,29 @@ mod tests {
         );
     }
 
-    /// The shapes the one-column derived table cannot wrap. Each is left alone, so each
-    /// keeps whatever DataFusion does with it today.
+    /// The shapes the one-column derived table cannot wrap. Each is left alone, and
+    /// [`super::super::pg_not_in_nulls`] refuses on the plan whichever of them a NULL could
+    /// reach — so "left alone" is not "answered wrongly".
     #[test]
     fn leaves_the_shapes_the_wrapper_cannot_carry_alone() {
-        // Row-wise.
+        // Row-wise: there is no one column to alias, and a tuple cannot be compared against
+        // a one-column derived table.
         untouched("SELECT k FROM l WHERE (k, v) NOT IN (SELECT k, v FROM r)");
-        // A set operation, which has no single `Select` body to name a column of.
-        untouched("SELECT k FROM l WHERE k NOT IN (SELECT k FROM r UNION SELECT k FROM m)");
-        // A wildcard, which has no column count known here.
+        // A wildcard, whose column count is a fact about the catalog and not about the text.
         untouched("SELECT k FROM l WHERE k NOT IN (SELECT * FROM r)");
+    }
+
+    /// A set operation *is* wrapped: only its column count has to be known, and every branch
+    /// of a `UNION` has the count of the first — so the leftmost `Select` answers for all.
+    #[test]
+    fn wraps_a_set_operation_subquery() {
+        for sql in [
+            "SELECT k FROM l WHERE k NOT IN (SELECT k FROM r UNION SELECT k FROM m)",
+            "SELECT k FROM l WHERE k NOT IN (SELECT k FROM r EXCEPT SELECT k FROM m)",
+            "SELECT k FROM l WHERE k NOT IN ((SELECT k FROM r) UNION ALL (SELECT k FROM m))",
+        ] {
+            assert!(rewritten(sql).contains("NOT EXISTS"), "{sql}");
+        }
     }
 
     /// The rewrite leaves nothing behind for a second pass to find, which is what makes
@@ -1064,7 +1116,9 @@ mod tests {
         // sort-merge join and is *not* null-aware. The rewrite has to be correct here.
         let mut config = SessionConfig::new().with_target_partitions(4);
         config.options_mut().optimizer.prefer_hash_join = false;
-        let ctx = SessionContext::new_with_config(config);
+        let mut ctx = SessionContext::new_with_config(config);
+        // The aggregate spelling names it, exactly as the cluster's registries do.
+        vairedb_common::not_in::register_not_in(&mut ctx).expect("registering the list NOT IN");
 
         for (name, values) in [
             ("l", &[Some(10), Some(20), Some(30), None][..]),
@@ -1148,6 +1202,39 @@ mod tests {
             // match, so every row is true — including the one whose key is NULL.
             (
                 "SELECT k FROM l WHERE k NOT IN (SELECT k FROM r WHERE k > 1000)",
+                vec![-1, 10, 20, 30],
+                vec![-1, 10, 20, 30],
+            ),
+        ] {
+            assert_eq!(keys(&ctx, sql).await, without_the_rewrite, "{sql}");
+            assert_eq!(keys(&ctx, &rewritten(sql)).await, postgres, "{sql}");
+        }
+    }
+
+    /// The same contract for the aggregate left side, whose candidates arrive as a value and
+    /// whose comparison is [`vairedb_common::not_in`]'s rather than a join's. All three NULL
+    /// cases again, because the two spellings share nothing but the answer they must give.
+    #[tokio::test]
+    async fn the_rewritten_aggregate_predicate_is_null_aware() {
+        let ctx = keys_context();
+
+        for (sql, postgres, without_the_rewrite) in [
+            // The NULL group's `max(k)` is NULL, so its predicate is NULL and it drops.
+            (
+                "SELECT k FROM l GROUP BY k HAVING max(k) NOT IN (SELECT k FROM r)",
+                vec![10, 30],
+                vec![-1, 10, 30],
+            ),
+            // A NULL among the candidates is NULL for every group that does not match.
+            (
+                "SELECT k FROM l GROUP BY k HAVING max(k) NOT IN (SELECT k FROM l)",
+                Vec::new(),
+                vec![-1],
+            ),
+            // No candidates at all: `array_agg` over zero rows is a NULL list, which the UDF
+            // reads as the empty conjunction PostgreSQL evaluates to true — NULL group too.
+            (
+                "SELECT k FROM l GROUP BY k HAVING max(k) NOT IN (SELECT k FROM r WHERE k > 1000)",
                 vec![-1, 10, 20, 30],
                 vec![-1, 10, 20, 30],
             ),

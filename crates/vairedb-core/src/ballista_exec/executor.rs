@@ -158,6 +158,33 @@ fn build_session_state(
     vairedb_common::udaf::register_ordered_set_aggregates(&mut state)
         .map_err(|e| CoreError::engine("failed to register the ordered-set aggregates", e))?;
 
+    // Same reasoning for PostgreSQL's float division: the coordinator rewrites `/` into a
+    // call of it on the logical plan, so the stage that arrives here names it and *this*
+    // registry is what resolves it. Without it a query the coordinator accepted would fail
+    // at stage deserialization.
+    vairedb_common::float_div::register_float_division(&mut state)
+        .map_err(|e| CoreError::engine("failed to register the checked float division", e))?;
+
+    // Same reasoning for the list-valued `NOT IN`: the coordinator respells
+    // `HAVING max(k) NOT IN (q)` into a call of it before planning, so the stage that
+    // arrives here names it and *this* registry is what resolves it.
+    vairedb_common::not_in::register_not_in(&mut state)
+        .map_err(|e| CoreError::engine("failed to register the list-valued NOT IN", e))?;
+
+    // Same reasoning for the `bytea` input conversion: the coordinator rewrites `::bytea`
+    // into a call of it before planning, so the stage that arrives here names it and *this*
+    // registry is what resolves it.
+    vairedb_common::bytea_in::register_bytea_in(&mut state)
+        .map_err(|e| CoreError::engine("failed to register the bytea input conversion", e))?;
+
+    // PostgreSQL's `nth_value` matters here more than the five above, not less: it shadows
+    // DataFusion's function under DataFusion's own name, so a stage naming `nth_value`
+    // resolves *something* from this registry either way. Without this line it resolves
+    // DataFusion's, and `nth_value(x, 0)` goes back to answering NULL for every row on the
+    // one node that evaluates the window.
+    vairedb_common::nth_value::register_nth_value(&mut state)
+        .map_err(|e| CoreError::engine("failed to register the checked nth_value", e))?;
+
     Ok(state)
 }
 

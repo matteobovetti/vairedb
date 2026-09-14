@@ -31,6 +31,7 @@ pub fn sqlstate_for_code(code: VdbErrorCode) -> &'static str {
         VdbErrorCode::InvalidTextRepresentation => "22P02",
         VdbErrorCode::GroupingError => "42803",
         VdbErrorCode::WindowingError => "42P20",
+        VdbErrorCode::InvalidArgumentForNthValue => "22016",
         VdbErrorCode::ShardNotFound => "42P01",
         VdbErrorCode::WriteConflict => "40001",
         VdbErrorCode::EngineError => "XX000",
@@ -154,6 +155,18 @@ mod tests {
         assert_eq!(sqlstate_for_code(VdbErrorCode::WindowingError), "42P20");
     }
 
+    // PostgreSQL spends a whole SQLSTATE on one argument of one function, and the
+    // reason is worth keeping: without it, `nth_value(x, 0)` answers a column of
+    // NULLs that a client reads as "the window had no such row" for every row. The
+    // code says the argument was wrong, not that the data was absent.
+    #[test]
+    fn maps_a_non_positive_nth_value_offset_to_its_own_sqlstate() {
+        assert_eq!(
+            sqlstate_for_code(VdbErrorCode::InvalidArgumentForNthValue),
+            "22016"
+        );
+    }
+
     // A guard on the map itself rather than on any one code: `sqlstate_for_code`
     // matches exhaustively, so a new proto variant cannot be forgotten here — but it
     // *can* be mapped to `XX000` by copying a neighbouring arm, which is the mistake
@@ -173,6 +186,7 @@ mod tests {
             VdbErrorCode::InvalidTextRepresentation,
             VdbErrorCode::GroupingError,
             VdbErrorCode::WindowingError,
+            VdbErrorCode::InvalidArgumentForNthValue,
         ] {
             assert!(!internal.contains(&code));
             assert_ne!(

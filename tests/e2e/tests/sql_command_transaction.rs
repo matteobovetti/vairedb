@@ -2,8 +2,9 @@ mod common;
 use common::*;
 use tokio_postgres::Client;
 
-// Row 33 of docs/specs/gap-analysis-command.md — transaction control
-// (BEGIN / START TRANSACTION / COMMIT / ROLLBACK / SAVEPOINT / RELEASE).
+// Transaction control (BEGIN / START TRANSACTION / COMMIT / ROLLBACK /
+// SAVEPOINT / RELEASE) — the "Transactions" row of docs/specs/gap-analysis.md
+// § 2.1, and § 3.4 items 1 and 4.
 //
 //     cd tests/e2e && cargo test --test sql_command_transaction -- --test-threads=1
 //

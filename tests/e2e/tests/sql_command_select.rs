@@ -2,15 +2,15 @@ mod common;
 use common::*;
 use tokio_postgres::Client;
 
-// SELECT — row 1 of docs/specs/gap-analysis-command.md (✅ supported, "full read
-// path"). One of five `sql_command_*` files that together make the command gap
-// doc executable:
+// SELECT — the full read path, the one statement docs/specs/gap-analysis.md
+// records no restriction for. One of five `sql_command_*` files that together
+// make the statement axis (§ 2.1 and § 3 of that doc) executable:
 //
-//   * `sql_command_select.rs`      — row 1 (SELECT)
-//   * `sql_command_dml.rs`         — rows 2-4 (INSERT/UPDATE/DELETE) + row 25 (MERGE)
-//   * `sql_command_ddl.rs`         — rows 5-7 (CREATE TABLE ✅, ALTER TABLE 🟡, DROP 🟡)
-//   * `sql_command_transaction.rs` — row 33 (BEGIN/COMMIT/ROLLBACK/SAVEPOINT)
-//   * `sql_command_unsupported.rs` — rows 8-36 (❌)
+//   * `sql_command_select.rs`      — SELECT
+//   * `sql_command_dml.rs`         — INSERT / UPDATE / DELETE + MERGE INTO
+//   * `sql_command_ddl.rs`         — CREATE TABLE, ALTER TABLE 🟡, DROP 🟡, TRUNCATE 🟡
+//   * `sql_command_transaction.rs` — BEGIN/COMMIT/ROLLBACK/SAVEPOINT
+//   * `sql_command_unsupported.rs` — every ❌ and 🚫 statement
 //
 // Suite convention, shared by all five:
 //   * plain `#[tokio::test]` — the command works end to end today; the test
@@ -31,11 +31,11 @@ use tokio_postgres::Client;
 // UnionExec + a top-level DataFusion operator) and the assertions are computed
 // from the inserted data, independent of which node a row lands on.
 //
-// Because the doc classifies SELECT ✅ with no sub-restrictions, this file is
-// all regression guard — there is no statement-level SELECT gap to xfail. The
-// neighbouring axes have their own files:
+// Because the doc records no restriction on SELECT, this file is all regression
+// guard — there is no statement-level SELECT gap to xfail. The neighbouring axes
+// have their own files:
 //   * data types in a projection -> `data_types_round_trips.rs`, the executable
-//     counterpart of docs/specs/gap-analysis-data-type.md;
+//     counterpart of docs/specs/gap-analysis.md § 2.2;
 //   * PG -> DataFusion/DuckDB expression translation (TO_CHAR, EXTRACT, ILIKE,
 //     `||`, date_trunc) -> `data_types_dialect_gaps.rs`;
 //   * shard-predicate routing (single-shard vs broadcast) -> `shard_routing.rs`;

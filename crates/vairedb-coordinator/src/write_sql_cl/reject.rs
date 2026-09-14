@@ -24,9 +24,13 @@
 
 use std::ops::ControlFlow;
 
+use vairedb_common::bytea_in;
+
 use crate::error::CoordinatorError;
 use crate::pgwire_handler::pg_operators::{is_byte_order_collation, similar_to_regex_from_ast};
-use crate::sqlparser::ast::{BinaryOperator, DataType, Expr, Statement, visit_expressions};
+use crate::sqlparser::ast::{
+    BinaryOperator, CastKind, DataType, Expr, Statement, Value, visit_expressions,
+};
 
 /// Refuse the expressions of `stmt` that DuckDB would answer differently from
 /// PostgreSQL and that cannot be translated.
@@ -100,6 +104,18 @@ fn check_expr(expr: &Expr) -> crate::error::Result<()> {
              expression so the divisions are not nested"
                 .to_string(),
         )),
+        // A cast to `bytea`, whose PostgreSQL meaning is a whole input conversion and not a
+        // reinterpretation of the bytes: `'\xDEADBEEF'::bytea` is four bytes in PostgreSQL,
+        // and DuckDB's `VARCHAR` → `BLOB` cast reads its own escape syntax and stores seven.
+        // A literal is translated by [`super::dialect`], which needs it decodable to do so;
+        // anything else is refused here, because the conversion cannot be expressed in
+        // DuckDB SQL and a shard would silently store different bytes.
+        Expr::Cast {
+            kind: CastKind::Cast | CastKind::DoubleColon,
+            data_type: DataType::Bytea,
+            expr: inner,
+            ..
+        } => reject_untranslatable_bytea_cast(inner),
         // A `SIMILAR TO` is translated by [`super::dialect`], which needs the pattern as
         // a literal to translate it. Refused here so that the translation itself can be
         // infallible, and with the read path's own message so a client that moved the
@@ -113,6 +129,53 @@ fn check_expr(expr: &Expr) -> crate::error::Result<()> {
             .map_err(|e| CoordinatorError::Unsupported(e.message())),
         _ => Ok(()),
     }
+}
+
+/// Refuse a cast to `bytea` that [`super::dialect`] cannot translate, and a literal whose
+/// text is not a `bytea` at all.
+///
+/// Three shapes are accepted, and each for its own reason:
+///
+/// * a **single-quoted string literal** that decodes, which the translation replaces with
+///   `unhex('…')`. A literal that does *not* decode is refused with PostgreSQL's own
+///   message and SQLSTATE rather than with `0A000`: the statement is not unsupported, the
+///   value is wrong, and `'\xzz'::bytea` fails identically on PostgreSQL.
+/// * `NULL`, because a NULL `bytea` is a NULL in DuckDB too — there is nothing to convert.
+/// * a **placeholder**, because a driver sending `bytea` sends it as a typed parameter and
+///   the shard binds it as a `BLOB`, where `::BYTEA` is the identity. Refusing `$1::bytea`
+///   would break the one shape that is already right. A parameter bound as *text* and cast
+///   to `bytea` is the residue this leaves, and it cannot be told apart from here: the
+///   inferred type is not known at parse time.
+///
+/// Everything else — a column, a function call, an expression — is refused. The conversion
+/// has no DuckDB spelling, so the alternative is a shard storing PostgreSQL-invisible bytes.
+fn reject_untranslatable_bytea_cast(inner: &Expr) -> crate::error::Result<()> {
+    match inner {
+        Expr::Value(value) => match &value.value {
+            Value::SingleQuotedString(text) => {
+                bytea_in::decode(text)
+                    .map(|_| ())
+                    .map_err(|e| CoordinatorError::InvalidValue {
+                        message: e.to_string(),
+                        code: e.error_code(),
+                    })
+            }
+            Value::Null | Value::Placeholder(_) => Ok(()),
+            _ => Err(untranslatable_bytea_cast()),
+        },
+        _ => Err(untranslatable_bytea_cast()),
+    }
+}
+
+/// The refusal for a cast to `bytea` VaireDB cannot perform on the write path.
+fn untranslatable_bytea_cast() -> CoordinatorError {
+    CoordinatorError::Unsupported(
+        "CAST to BYTEA is only supported on the write path for a string literal: PostgreSQL \
+         reads the text through its own bytea input conversion, where '\\xDEADBEEF' is four \
+         bytes, and a shard would instead reinterpret the characters and store different \
+         bytes; write the value as a literal, or send it as a bytea parameter"
+            .to_string(),
+    )
 }
 
 /// Whether `expr` is, or contains, a division or a modulo — the operators
@@ -135,6 +198,7 @@ mod tests {
     use super::*;
     use crate::sqlparser::dialect::PostgreSqlDialect;
     use crate::sqlparser::parser::Parser;
+    use vairedb_common::proto::vairedb::v1::VdbErrorCode;
 
     fn parse(sql: &str) -> Statement {
         Parser::new(&PostgreSqlDialect {})
@@ -156,6 +220,74 @@ mod tests {
         if let Err(e) = reject_duckdb_divergent(&parse(sql)) {
             panic!("`{sql}` should be accepted: {e}");
         }
+    }
+
+    /// A decodable string literal is the shape [`super::dialect`] translates, in both
+    /// spellings of the cast — plus the two that need no translation at all.
+    #[test]
+    fn a_bytea_cast_of_a_literal_is_left_to_the_translation() {
+        accepted("INSERT INTO t (b) VALUES ('\\xDEADBEEF'::bytea)");
+        accepted("INSERT INTO t (b) VALUES (CAST('a\\101b' AS BYTEA))");
+        accepted("UPDATE t SET b = ''::bytea");
+        accepted("INSERT INTO t (b) VALUES (NULL::bytea)");
+        // A driver's `bytea` parameter binds as a BLOB on the shard, where the cast is the
+        // identity — refusing this would break the one shape that is already right.
+        accepted("INSERT INTO t (b) VALUES ($1::bytea)");
+    }
+
+    /// A literal that is not a `bytea` is refused with PostgreSQL's own message, and with
+    /// PostgreSQL's own SQLSTATE rather than the `0A000` of an unsupported form — the
+    /// statement is fine and the value is not.
+    #[test]
+    fn a_bytea_literal_that_does_not_decode_is_refused_as_postgresql_does() {
+        for (sql, message, code) in [
+            (
+                "INSERT INTO t (b) VALUES ('\\xzz'::bytea)",
+                "invalid hexadecimal digit: \"z\"",
+                VdbErrorCode::InvalidParameterValue,
+            ),
+            (
+                "INSERT INTO t (b) VALUES ('\\xdeadbee'::bytea)",
+                "invalid hexadecimal data: odd number of digits",
+                VdbErrorCode::InvalidParameterValue,
+            ),
+            (
+                "UPDATE t SET b = 'a\\12'::bytea",
+                "invalid input syntax for type bytea",
+                VdbErrorCode::InvalidTextRepresentation,
+            ),
+        ] {
+            let err = reject_duckdb_divergent(&parse(sql)).expect_err("should be refused");
+            assert_eq!(err.to_string(), message, "`{sql}`");
+            assert_eq!(err.vdb_error_code(), code, "`{sql}`");
+        }
+    }
+
+    /// Everything else has no DuckDB spelling: the conversion is PostgreSQL's own, and a
+    /// shard would reinterpret the characters instead of converting them.
+    #[test]
+    fn a_bytea_cast_of_anything_but_a_literal_is_refused() {
+        for sql in [
+            "INSERT INTO t (b) SELECT s::bytea FROM u",
+            "UPDATE t SET b = s::bytea",
+            "UPDATE t SET b = concat(s, 'x')::bytea",
+            "DELETE FROM t WHERE b = s::bytea",
+        ] {
+            let msg = rejected(sql);
+            assert!(msg.contains("CAST to BYTEA"), "{msg}");
+            assert!(
+                msg.contains("four bytes"),
+                "the message says what PostgreSQL does instead: {msg}"
+            );
+        }
+    }
+
+    /// A `BYTEA` *column* is not a cast: declaring one is how a client stores bytes and is
+    /// translated to `BLOB` by [`super::dialect::transform_to_duckdb`], not refused.
+    #[test]
+    fn a_declared_bytea_column_is_not_a_refused_cast() {
+        accepted("CREATE TABLE t (b BYTEA)");
+        accepted("ALTER TABLE t ADD COLUMN b BYTEA");
     }
 
     /// A collation naming a real locale, in each of the four statement kinds the write
