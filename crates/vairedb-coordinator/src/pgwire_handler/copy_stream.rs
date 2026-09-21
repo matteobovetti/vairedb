@@ -47,20 +47,14 @@ use pgwire::messages::copy::{CopyData, CopyDone, CopyFail};
 use vairedb_common::proto::vairedb::v1::VdbErrorCode;
 
 use crate::catalog::TableMeta;
-use crate::pgwire_handler::copy::{CsvDialect, target_columns, validate_target_columns};
+use crate::pgwire_handler::copy::{
+    CsvDialect, ROWS_PER_BATCH, partial_copy_error, target_columns, validate_target_columns,
+};
 use crate::pgwire_handler::error_enrichment::make_vdb_error;
 use crate::pgwire_handler::handler::VaireDbQueryHandler;
 use crate::pgwire_handler::session::SessionState;
 use crate::sqlparser::ast::Statement;
 use crate::write_sql_cl;
-
-/// Rows decoded before a batch is shipped.
-///
-/// A multiple of the INSERT lane's own chunk size, so a batch turns into whole
-/// statements rather than one full chunk and a remainder. Ten of them is the
-/// trade-off between round trips to the shards and how much of the client's data
-/// is held in the coordinator at once.
-const ROWS_PER_BATCH: usize = 10 * write_sql_cl::ROWS_PER_STATEMENT;
 
 /// How much of the input may go by without completing a first record.
 ///
@@ -387,17 +381,7 @@ impl CopySink {
     /// Report a failure honestly: as a partial commit once rows are stored, and as
     /// itself while nothing is.
     fn partial(&self, e: PgWireError) -> PgWireError {
-        if self.rows == 0 {
-            return e;
-        }
-        make_vdb_error(
-            VdbErrorCode::PartialCommit,
-            format!(
-                "COPY partially applied: {} row(s) were written to \"{}\" and cannot be undone, then the copy failed. Inspect the table before retrying. Cause: {e}",
-                self.rows,
-                self.csv.table()
-            ),
-        )
+        partial_copy_error(self.csv.table(), self.rows, e)
     }
 }
 

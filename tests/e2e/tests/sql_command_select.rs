@@ -2,9 +2,10 @@ mod common;
 use common::*;
 use tokio_postgres::Client;
 
-// SELECT — the full read path, the one statement docs/specs/gap-analysis.md
-// records no restriction for. One of five `sql_command_*` files that together
-// make the statement axis (§ 2.1 and § 3 of that doc) executable:
+// SELECT — the full read path, and the statement docs/specs/gap-analysis.md
+// records one restriction for (row 25, a schema-qualified relation). One of five
+// `sql_command_*` files that together make the statement axis (§ 2.1 and § 3 of
+// that doc) executable:
 //
 //   * `sql_command_select.rs`      — SELECT
 //   * `sql_command_dml.rs`         — INSERT / UPDATE / DELETE + MERGE INTO
@@ -31,9 +32,9 @@ use tokio_postgres::Client;
 // UnionExec + a top-level DataFusion operator) and the assertions are computed
 // from the inserted data, independent of which node a row lands on.
 //
-// Because the doc records no restriction on SELECT, this file is all regression
-// guard — there is no statement-level SELECT gap to xfail. The neighbouring axes
-// have their own files:
+// This file is almost all regression guard: the doc records one statement-level
+// SELECT gap, row 25 — a filtered read of a schema-qualified relation — and one
+// xfail for it at the end. The neighbouring axes have their own files:
 //   * data types in a projection -> `data_types_round_trips.rs`, the executable
 //     counterpart of docs/specs/gap-analysis.md § 2.2;
 //   * PG -> DataFusion/DuckDB expression translation (TO_CHAR, EXTRACT, ILIKE,
@@ -377,11 +378,12 @@ async fn test_pushed_predicate_on_a_string_with_a_quote() {
     drop_table(&client, &tbl).await;
 }
 
-// The one disagreement push-down cannot survive: PostgreSQL and DataFusion treat `\` as
-// LIKE's default escape character, DuckDB has no default escape at all. Pushing this
-// pattern makes the shard match nothing, and rows a shard never returns are rows the
-// coordinator's own filter cannot recover — so the predicate has to stay put. The answer
-// below is PostgreSQL's.
+// PostgreSQL and DataFusion treat `\` as LIKE's default escape character; DuckDB has no
+// default escape at all. Pushing the pattern as written made the shard match nothing, and
+// rows a shard never returns are rows the coordinator's own filter cannot recover — so the
+// pushed fragment names the escape character instead of inheriting one, exactly as the write
+// path's re-render does. The answers below are PostgreSQL's, and now they are computed on
+// the shards.
 #[tokio::test]
 async fn test_like_with_the_default_escape_answers_as_postgres_does() {
     let client = ready_client().await;
@@ -511,8 +513,9 @@ async fn test_pushed_limit_returns_the_requested_count() {
     drop_table(&client, &tbl).await;
 }
 
-// A predicate on a text column: equality and LIKE are pushed, ordering comparisons are
-// not (see `scheduler::filter_pushdown`). Both must give the PostgreSQL answer.
+// A predicate on a text column: equality, `IN`, `LIKE` and the ordering comparisons are all
+// pushed (see `scheduler::filter_pushdown`). Every one of them must give the PostgreSQL
+// answer.
 #[tokio::test]
 async fn test_pushed_predicate_on_a_text_column() {
     let client = ready_client().await;
@@ -538,20 +541,105 @@ async fn test_pushed_predicate_on_a_text_column() {
     drop_table(&client, &tbl).await;
 }
 
+// An ordering comparison on a text column is evaluated by whichever engine holds the rows,
+// so it is only pushable while the two engines order text the same way. They do, and now by
+// construction rather than by coincidence: the shard pins and verifies `default_collation`
+// when it opens its database, and a `COLLATE` naming anything else is refused in an
+// expression and at DDL. The values below are the ones that tell byte order apart from a
+// case-insensitive collation — every capital sorts before every lowercase letter — so a
+// shard evaluating the comparison its own way would return the wrong rows, and the
+// coordinator, which only ever re-filters what a shard did send, could not put them back.
+#[tokio::test]
+async fn test_pushed_ordering_comparison_on_a_text_column() {
+    let client = ready_client().await;
+    let tbl = create_table(
+        &client,
+        "q_push_ord",
+        &format!("(id INTEGER NOT NULL, name VARCHAR NOT NULL) {CREATE_OPTS}"),
+    )
+    .await;
+
+    // One row per shard for each of the six names, so every shard has to answer each
+    // comparison and a shard that disagreed cannot hide behind an empty partition.
+    let names = ["Alice", "Bob", "Zoe", "alice", "bob", "zoe"];
+    for (n, name) in names.iter().enumerate() {
+        for bucket in 0..SHARD_COUNT as u64 {
+            let id = id_for_bucket(bucket, (n as i64 + 1) * 1000);
+            execute(
+                &client,
+                &format!("INSERT INTO {tbl} (id, name) VALUES ({id}, '{name}')"),
+            )
+            .await
+            .unwrap();
+        }
+    }
+    let per_name = SHARD_COUNT as i64;
+
+    for (predicate, want) in [
+        // Every capitalized name is below 'a'. A case-insensitive collation answers with
+        // nothing at all here, so this is the shape that would break loudest.
+        ("name < 'a'", vec!["Alice", "Bob", "Zoe"]),
+        ("name >= 'a'", vec!["alice", "bob", "zoe"]),
+        ("name > 'Zoe'", vec!["alice", "bob", "zoe"]),
+        ("name <= 'Bob'", vec!["Alice", "Bob"]),
+        // Two ordering comparisons wearing one keyword. 'Zoe' is above 'Z' because it is
+        // longer, which a byte comparison gets right and a collation need not.
+        ("name BETWEEN 'A' AND 'Z'", vec!["Alice", "Bob"]),
+        ("name BETWEEN 'B' AND 'b'", vec!["Bob", "Zoe", "alice"]),
+        // Mixed with the shapes it used to be separated from, since a fragment is pushed
+        // whole or not at all.
+        (
+            "name > 'B' AND name LIKE '%o%'",
+            vec!["Bob", "Zoe", "bob", "zoe"],
+        ),
+    ] {
+        let rows = simple_query_rows(
+            &client,
+            &format!("SELECT name FROM {tbl} WHERE {predicate} ORDER BY name, id"),
+        )
+        .await
+        .unwrap();
+        let got = strings(&rows, 0);
+        let expected: Vec<String> = want
+            .iter()
+            .flat_map(|name| std::iter::repeat_n(name.to_string(), per_name as usize))
+            .collect();
+        assert_eq!(
+            got, expected,
+            "`{predicate}` must answer as PostgreSQL does, on every shard"
+        );
+    }
+
+    // And the coordinator's own ordering is the same one, so the sort a client asks for
+    // agrees with the predicate that selected the rows.
+    let rows = simple_query_rows(
+        &client,
+        &format!("SELECT DISTINCT name FROM {tbl} ORDER BY name"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(strings(&rows, 0), names);
+
+    drop_table(&client, &tbl).await;
+}
+
 // A `UUID` and a `JSON` column are both advertised to the client as text, because text is a
 // faithful rendering of either. A *predicate* on one is not faithful, though: the shard
 // stores a UUID as a 128-bit integer and parses a JSON literal as JSON, so a literal it
 // cannot convert is a conversion *error* there — `Could not convert string 'notauuid' to
 // INT128` — where the coordinator would simply match no row. An error is the one outcome
-// re-filtering at the coordinator cannot undo, so no predicate is pushed onto such a column.
-// What the client must see is PostgreSQL's answer: no rows.
+// re-filtering at the coordinator cannot undo, so no predicate that names a *value* is
+// pushed onto such a column. What the client must see is PostgreSQL's answer: no rows.
+//
+// `IS [NOT] NULL` is the exception, and the last case below is the one that would fail if
+// pushing it were wrong: it names no value, so there is nothing for the shard to convert.
 #[tokio::test]
 async fn test_predicate_on_a_column_that_is_text_in_name_only() {
     let client = ready_client().await;
     let tbl = create_table(
         &client,
         "q_push_opaque",
-        &format!("(id INTEGER NOT NULL, uid UUID NOT NULL, body JSON NOT NULL) {CREATE_OPTS}"),
+        &format!("(id INTEGER NOT NULL, uid UUID, body JSON) {CREATE_OPTS}"),
     )
     .await;
 
@@ -560,7 +648,8 @@ async fn test_predicate_on_a_column_that_is_text_in_name_only() {
         &format!(
             "INSERT INTO {tbl} (id, uid, body) VALUES \
              (1, '123e4567-e89b-12d3-a456-426614174000', '{{\"a\":1}}'), \
-             (2, '00000000-0000-0000-0000-000000000002', '{{\"a\":2}}')"
+             (2, '00000000-0000-0000-0000-000000000002', '{{\"a\":2}}'), \
+             (3, NULL, NULL)"
         ),
     )
     .await
@@ -598,6 +687,23 @@ async fn test_predicate_on_a_column_that_is_text_in_name_only() {
     .await
     .unwrap();
     assert_eq!(ints(&rows, 0), vec![1]);
+
+    // Null-ness is asked of the shard, and a shard that answered it wrongly — or refused —
+    // would show up here rather than anywhere else, since the coordinator's own copy of the
+    // filter can only narrow what the shard returns.
+    for (predicate, want) in [
+        ("uid IS NULL", vec![3]),
+        ("uid IS NOT NULL", vec![1, 2]),
+        ("body IS NULL", vec![3]),
+        ("body IS NOT NULL", vec![1, 2]),
+        ("uid IS NULL OR id = 1", vec![1, 3]),
+    ] {
+        let sql = format!("SELECT id FROM {tbl} WHERE {predicate} ORDER BY id");
+        let rows = simple_query_rows(&client, &sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql} failed: {e}"));
+        assert_eq!(ints(&rows, 0), want, "{sql}");
+    }
 
     drop_table(&client, &tbl).await;
 }
@@ -1180,4 +1286,119 @@ async fn test_order_by_nulls_ordering() {
     assert_eq!(ints(&rows, 0), vec![1, 2, 3, 4, 5, 6]);
 
     drop_table(&client, &tbl).await;
+}
+
+// ============================================================================
+// A read of a schema-qualified relation — row 25
+// ============================================================================
+
+/// Today's behaviour, pinned: a qualified relation answers an *unfiltered* read.
+/// This is the half the DDL suite's `SET SCHEMA` tests rely on, so it is pinned
+/// here rather than left implied.
+#[tokio::test]
+async fn test_an_unfiltered_read_of_a_qualified_relation() {
+    let client = ready_client().await;
+    let schema = unique_table_name("q_qualified_ns");
+    execute(&client, &format!("CREATE SCHEMA {schema}"))
+        .await
+        .unwrap();
+    let tbl = format!("{schema}.t");
+    execute(
+        &client,
+        &format!("CREATE TABLE {tbl} (id INTEGER NOT NULL, v VARCHAR) {CREATE_OPTS}"),
+    )
+    .await
+    .unwrap();
+    execute(
+        &client,
+        &format!("INSERT INTO {tbl} (id, v) VALUES (1,'a'),(2,'b'),(3,'c')"),
+    )
+    .await
+    .unwrap();
+
+    let rows = simple_query_rows(&client, &format!("SELECT v FROM {tbl}"))
+        .await
+        .unwrap();
+    let mut got = strings(&rows, 0);
+    got.sort();
+    assert_eq!(got, vec!["a", "b", "c"]);
+    assert_eq!(row_count(&client, &tbl).await, 3);
+
+    // A write against the same relation takes a `WHERE` — the write path routes on
+    // the catalog key and never builds a logical plan, which is what makes the
+    // failure below a read-path one rather than a catalog one.
+    execute(&client, &format!("UPDATE {tbl} SET v = 'z' WHERE id = 1"))
+        .await
+        .unwrap();
+
+    drop_table(&client, &tbl).await;
+    execute(&client, &format!("DROP SCHEMA {schema}"))
+        .await
+        .unwrap();
+}
+
+/// A filtered or sorted read of a schema-qualified relation, which used to be `42703`
+/// "No field named ns.t.v — Valid fields are \"ns.t\".id, \"ns.t\".v": the relation was
+/// registered under a *bare* `TableReference` whose name contained a dot, and
+/// datafusion-proto writes a `Column`'s relation as one flat string and re-parses it on
+/// decode, so the bare `ns.t` came back as `Partial{ns, t}` and no longer matched the field
+/// it qualified. The relation is now registered under that two-part name in the first place,
+/// which makes the round trip an identity.
+///
+/// Every operator that puts a qualified column into the serialized plan is exercised here —
+/// a `WHERE`, an `ORDER BY`, a pushed-down predicate, an alias, an aggregate — because an
+/// unfiltered projection carries no qualifier and passed even while this was broken.
+#[tokio::test]
+async fn test_a_filtered_read_of_a_qualified_relation() {
+    let client = ready_client().await;
+    let schema = unique_table_name("q_qualified_filter_ns");
+    execute(&client, &format!("CREATE SCHEMA {schema}"))
+        .await
+        .unwrap();
+    let tbl = format!("{schema}.t");
+    execute(
+        &client,
+        &format!("CREATE TABLE {tbl} (id INTEGER NOT NULL, v VARCHAR) {CREATE_OPTS}"),
+    )
+    .await
+    .unwrap();
+    execute(
+        &client,
+        &format!("INSERT INTO {tbl} (id, v) VALUES (1,'a'),(2,'b'),(3,'c')"),
+    )
+    .await
+    .unwrap();
+
+    for (sql, want) in [
+        (format!("SELECT v FROM {tbl} WHERE id = 2"), vec!["b"]),
+        (
+            format!("SELECT v FROM {tbl} ORDER BY v"),
+            vec!["a", "b", "c"],
+        ),
+        (format!("SELECT v FROM {tbl} WHERE v LIKE 'b%'"), vec!["b"]),
+        (
+            format!("SELECT v FROM {tbl} AS x WHERE x.id > 1 ORDER BY x.v"),
+            vec!["b", "c"],
+        ),
+    ] {
+        let rows = simple_query_rows(&client, &sql)
+            .await
+            .unwrap_or_else(|e| panic!("{sql} failed: {e}"));
+        assert_eq!(strings(&rows, 0), want, "{sql}");
+    }
+
+    assert_eq!(
+        ints(
+            &simple_query_rows(&client, &format!("SELECT count(*) FROM {tbl} WHERE id > 1"))
+                .await
+                .unwrap(),
+            0
+        ),
+        vec![2]
+    );
+
+    drop_table(&client, &tbl).await;
+    execute(&client, &format!("DROP SCHEMA {schema}"))
+        .await
+        .unwrap();
 }

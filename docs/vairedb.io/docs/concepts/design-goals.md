@@ -2,7 +2,7 @@
 
 VaireDB targets analytical (OLAP) workloads on a horizontally scalable cluster,
 with operational simplicity as a guiding principle. The table below captures
-what v0.1 optimizes for.
+what the current version optimizes for.
 
 ## Goals
 
@@ -16,7 +16,7 @@ what v0.1 optimizes for.
 | **Compliance** *(planned)* | Defining a DAG of connected tables, the feature creates a vectorized representation of data takeout or deletion to be performed. Also implements a set of anonymization algorithms for hashing specified columns. |
 | **Data quality** *(planned)* | Perform async data quality checks and metrics defined with a specific SQL instruction (designed on top of the DuckDB SQL dialect). |
 
-## Non-goals (for v0.1)
+## Non-goals
 
 These are deliberately out of scope for the current version. Several are tracked
 on the [Roadmap](../roadmap.md).
@@ -34,4 +34,4 @@ on the [Roadmap](../roadmap.md).
 !!! warning "Single coordinator is a SPOF"
     Only a single coordinator node is supported. It is a single point of failure
     for both reads and writes. Coordinator high availability is explicitly a
-    non-goal for v0.1.
+    non-goal for the current version.

@@ -8,7 +8,7 @@ on.
 
 -   [:material-target: __Design Goals__](design-goals.md)
 
-    What VaireDB optimizes for, and what is explicitly out of scope for v0.1.
+    What VaireDB optimizes for, and what is explicitly out of scope.
 
 -   [:material-sitemap: __System Architecture__](system-architecture.md)
 

@@ -198,6 +198,138 @@ async fn test_show_all_lists_every_parameter() {
     );
 }
 
+// The other way a client asks what its session is configured as: `pg_catalog.pg_settings`,
+// which is the table an introspection tool or a driver's settings inspector reads instead of
+// issuing `SHOW`. The table is registered once for the whole coordinator, so the interesting
+// part is that it answers for *this* connection.
+#[tokio::test]
+async fn test_pg_settings_reports_what_this_session_set() {
+    let client = ready_client().await;
+
+    execute(&client, "SET application_name = 'vairedb-pg-settings'")
+        .await
+        .unwrap();
+
+    let rows = simple_query_rows(
+        &client,
+        "SELECT setting, source, reset_val, vartype, context FROM pg_catalog.pg_settings \
+         WHERE name = 'application_name'",
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 1, "one row per parameter");
+    assert_eq!(
+        rows[0][0].as_deref(),
+        Some("vairedb-pg-settings"),
+        "pg_settings must report the value SET on this session, not a default"
+    );
+    assert_eq!(
+        rows[0][1].as_deref(),
+        Some("session"),
+        "a parameter this session SET has source `session`"
+    );
+    // `reset_val` is what `RESET` would restore, which is the value the session opened
+    // with and not the value it is running with.
+    assert_ne!(rows[0][2].as_deref(), Some("vairedb-pg-settings"));
+    assert_eq!(rows[0][3].as_deref(), Some("string"));
+    assert_eq!(rows[0][4].as_deref(), Some("user"));
+
+    // A parameter left alone reports where its value came from, too.
+    let rows = simple_query_rows(
+        &client,
+        "SELECT source FROM pg_catalog.pg_settings WHERE name = 'DateStyle'",
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows[0][0].as_deref(), Some("default"));
+}
+
+// The point of routing the table through the session: two connections read one registered
+// provider and must not see each other's values.
+#[tokio::test]
+async fn test_pg_settings_is_not_shared_between_connections() {
+    let first = ready_client().await;
+    let second = connect().await;
+
+    execute(&first, "SET application_name = 'first-session'")
+        .await
+        .unwrap();
+    execute(&second, "SET application_name = 'second-session'")
+        .await
+        .unwrap();
+
+    let sql = "SELECT setting FROM pg_catalog.pg_settings WHERE name = 'application_name'";
+    assert_eq!(
+        simple_query_rows(&first, sql).await.unwrap()[0][0].as_deref(),
+        Some("first-session")
+    );
+    assert_eq!(
+        simple_query_rows(&second, sql).await.unwrap()[0][0].as_deref(),
+        Some("second-session")
+    );
+}
+
+// The same registry `SHOW ALL` walks, with PostgreSQL's own column list around it.
+#[tokio::test]
+async fn test_pg_settings_lists_every_parameter_with_postgresqls_columns() {
+    let client = ready_client().await;
+
+    let shown = simple_query_rows(&client, "SHOW ALL").await.unwrap().len();
+    let rows = simple_query_rows(
+        &client,
+        "SELECT name, setting, short_desc, boot_val, pending_restart \
+         FROM pg_catalog.pg_settings ORDER BY name",
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        rows.len(),
+        shown,
+        "pg_settings and SHOW ALL read the same registry"
+    );
+    for row in &rows {
+        assert!(row[0].is_some(), "every row is named");
+        assert!(row[2].is_some(), "every parameter has a description");
+        assert_eq!(
+            row[4].as_deref(),
+            Some("f"),
+            "nothing VaireDB accepts needs a restart to take effect"
+        );
+    }
+    assert!(
+        rows.iter().any(|r| r[0].as_deref() == Some("DateStyle")),
+        "pg_settings should include DateStyle"
+    );
+    // `boot_val` is PostgreSQL's spelling of the compiled-in default, and a tool that
+    // reads the column by name has to find it.
+    assert!(rows.iter().all(|r| r[3].is_some()));
+}
+
+// A `SET` and a read of the table in one simple-query string: the snapshot is taken per
+// statement, so the second statement sees what the first did.
+#[tokio::test]
+async fn test_pg_settings_sees_a_set_from_earlier_in_the_same_query_string() {
+    let client = ready_client().await;
+
+    let messages = client
+        .simple_query(
+            "SET application_name = 'same-string'; \
+             SELECT setting FROM pg_catalog.pg_settings WHERE name = 'application_name'",
+        )
+        .await
+        .unwrap();
+    let values: Vec<String> = messages
+        .iter()
+        .filter_map(|m| match m {
+            tokio_postgres::SimpleQueryMessage::Row(row) => {
+                Some(row.get(0).unwrap_or_default().to_string())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(values, vec!["same-string".to_string()]);
+}
+
 // JDBC calls this from `getTransactionIsolation()` before it runs anything, so an
 // error here fails a connection outright. The answer is the weakest level because
 // that is the one a multi-shard commit can stand behind: it is applied one node
@@ -333,14 +465,19 @@ async fn test_unmodelled_set_forms_stay_rejected() {
 // 2. COPY — row 14
 // ============================================================================
 //
-// No longer a gap: all four forms work — CSV to and from a file on the
-// *coordinator's* filesystem, and CSV to and from the client over the copy
+// No longer a gap. CSV works in all four directions — to and from a file on the
+// *coordinator's* filesystem, and to and from the client over the copy
 // sub-protocol, which is what `psql \copy` and every driver's bulk loader use.
-// What is still refused is everything that is not CSV, and it is refused by name,
-// so a client is never left guessing which part of the statement was the problem.
+// Parquet works in the two file directions, which is the whole of it: a Parquet
+// file's footer is written last and read first, so there is no row-at-a-time form
+// of it for the copy sub-protocol to carry.
+//
+// What is still refused is every other encoding, and the CSV-shaped options against
+// a Parquet file — each by name, so a client is never left guessing which part of
+// the statement was the problem.
 
 #[tokio::test]
-async fn test_copy_outside_csv_is_rejected() {
+async fn test_copy_outside_the_supported_formats_is_rejected() {
     let client = ready_client().await;
     let tbl = unique_table_name("un_copy");
     setup_rows(&client, &tbl).await;
@@ -352,8 +489,9 @@ async fn test_copy_outside_csv_is_rejected() {
     )
     .await;
 
-    // Encodings other than CSV, and CSV that is only implied: PostgreSQL's default
-    // is its own TEXT encoding, so a statement that does not say CSV is not one.
+    // Encodings that are neither CSV nor Parquet, and a format that is only implied:
+    // PostgreSQL's default is its own TEXT encoding, so a statement that names no
+    // format has not asked for one VaireDB writes.
     assert_unsupported(
         &client,
         &format!("COPY {tbl} TO '/tmp/{tbl}.bin' (FORMAT BINARY)"),
@@ -409,6 +547,120 @@ async fn test_copy_to_file_then_back_round_trips() {
 
     drop_table(&client, &src).await;
     drop_table(&client, &dst).await;
+}
+
+// The same round trip through Parquet, which is the format an analytical client
+// actually hands over. It has to lose nothing that CSV does not lose, and rather
+// more is being asked of it: the file carries its own column names and types, so the
+// import reads typed values rather than re-parsing text, and the values have to come
+// back out as themselves.
+#[tokio::test]
+async fn test_copy_to_parquet_file_then_back_round_trips() {
+    let client = ready_client().await;
+    let src = unique_table_name("un_copypq_src");
+    let ids = setup_rows(&client, &src).await;
+
+    // Server-side path, inside the coordinator container. No HEADER: a Parquet file
+    // names its columns in its own schema.
+    let path = format!("/tmp/{src}.parquet");
+    execute(&client, &format!("COPY {src} TO '{path}' (FORMAT PARQUET)"))
+        .await
+        .unwrap();
+
+    let dst = create_table(
+        &client,
+        "un_copypq_dst",
+        &format!("(id INTEGER NOT NULL, v VARCHAR) {CREATE_OPTS}"),
+    )
+    .await;
+    execute(
+        &client,
+        &format!("COPY {dst} FROM '{path}' (FORMAT PARQUET)"),
+    )
+    .await
+    .unwrap();
+
+    let rows = simple_query_rows(&client, &format!("SELECT id, v FROM {dst} ORDER BY id"))
+        .await
+        .unwrap();
+    let mut got: Vec<(i64, String)> = rows
+        .iter()
+        .map(|r| {
+            (
+                r[0].as_deref().unwrap().parse().unwrap(),
+                r[1].as_deref().unwrap().to_string(),
+            )
+        })
+        .collect();
+    got.sort_unstable();
+    let mut want: Vec<(i64, String)> = ids.iter().map(|id| (*id, format!("v{id}"))).collect();
+    want.sort_unstable();
+    assert_eq!(
+        got, want,
+        "a Parquet round trip must carry every shard's rows, and their values, exactly once"
+    );
+
+    drop_table(&client, &src).await;
+    drop_table(&client, &dst).await;
+}
+
+// Parquet has no streaming form, and the refusal has to reach the client *before* it
+// is invited to send or expect bytes: a loader that has already uploaded a file has
+// wasted the upload, and one that is waiting for `CopyOutResponse` would hang.
+#[tokio::test]
+async fn test_parquet_over_the_copy_protocol_is_refused() {
+    let client = ready_client().await;
+    let tbl = unique_table_name("un_copypqs");
+    setup_rows(&client, &tbl).await;
+
+    assert!(
+        client
+            .copy_in::<str, bytes::Bytes>(&format!("COPY {tbl} FROM STDIN (FORMAT PARQUET)"))
+            .await
+            .is_err(),
+        "FROM STDIN (FORMAT PARQUET) must be refused before any data is sent"
+    );
+    assert!(
+        client
+            .copy_out(&format!("COPY {tbl} TO STDOUT (FORMAT PARQUET)"))
+            .await
+            .is_err(),
+        "TO STDOUT (FORMAT PARQUET) must be refused rather than leaving the client waiting"
+    );
+
+    // Both refusals are statement-level, so they are reachable as plain execution
+    // errors too, with the SQLSTATE a client switches on.
+    assert_unsupported(&client, &format!("COPY {tbl} TO STDOUT (FORMAT PARQUET)")).await;
+
+    // And the connection is still usable: neither refusal left it in copy mode.
+    let rows = simple_query_rows(&client, &format!("SELECT count(*) FROM {tbl}"))
+        .await
+        .expect("the connection must survive a refused COPY");
+    assert_eq!(rows[0][0].as_deref(), Some("3"));
+
+    drop_table(&client, &tbl).await;
+}
+
+// A Parquet file names and types its own columns, so the CSV options have nothing to
+// act on. Accepting one and ignoring it would promise a file layout the writer never
+// produced, so each is refused by name.
+#[tokio::test]
+async fn test_a_csv_only_option_against_parquet_is_refused() {
+    let client = ready_client().await;
+    let tbl = unique_table_name("un_copypqo");
+    setup_rows(&client, &tbl).await;
+
+    for sql in [
+        format!("COPY {tbl} TO '/tmp/{tbl}.parquet' (FORMAT PARQUET, HEADER)"),
+        format!("COPY {tbl} TO '/tmp/{tbl}.parquet' (FORMAT PARQUET, DELIMITER '|')"),
+        // The format may be named last: which options are meaningful cannot depend on
+        // the order they were written in.
+        format!("COPY {tbl} FROM '/tmp/{tbl}.parquet' (HEADER, FORMAT PARQUET)"),
+    ] {
+        assert_unsupported(&client, &sql).await;
+    }
+
+    drop_table(&client, &tbl).await;
 }
 
 // The streaming forms, which are the ones a client can actually reach: the file
@@ -1385,14 +1637,21 @@ async fn test_index_and_table_names_share_one_namespace() {
     drop_table(&client, &tbl).await;
 }
 
-// A table that carries an index cannot have its columns dropped, renamed, retyped
-// or made (non-)nullable, and cannot be renamed. The shards' engine refuses to
-// alter a table an index depends on — per *table*, not per indexed column —
-// so refusing at the coordinator is what makes the error name the index instead of
-// blaming the cluster, and keeps the catalog from listing an index over a column
-// that moved.
+// What an index still blocks, now that a column change is shipped around one by
+// rebuilding it per shard (see `test_a_column_change_is_shipped_around_an_index` in
+// `sql_command_ddl.rs` for what goes through). Three things do not fit in that
+// rebuild, all because the shards' engine says so, and each is refused at the
+// coordinator so the error names the index rather than blaming the cluster:
+//
+//   * dropping a column an index is built on — PostgreSQL would drop the index with
+//     it, but the engine's drop path consults the column's own index list, which the
+//     DROP INDEX in the same transaction has not updated;
+//   * retyping such a column, refused by the same mechanism;
+//   * renaming the table — the physical index name folds the table name in, so the
+//     rebuild would have to rename the indexes inside a broadcast that is already
+//     not atomic.
 #[tokio::test]
-async fn test_altering_an_indexed_column_names_the_index() {
+async fn test_dropping_or_retyping_an_indexed_column_names_the_index() {
     let client = ready_client().await;
     let tbl = unique_table_name("un_idxalter");
     setup_rows(&client, &tbl).await;
@@ -1402,26 +1661,9 @@ async fn test_altering_an_indexed_column_names_the_index() {
         .await
         .unwrap();
 
-    // Adding a column is metadata-only, so it is allowed with the index in place.
-    execute(
-        &client,
-        &format!("ALTER TABLE {tbl} ADD COLUMN extra INTEGER"),
-    )
-    .await
-    .unwrap();
-
     for sql in [
-        // The indexed column itself.
         format!("ALTER TABLE {tbl} DROP COLUMN v"),
-        format!("ALTER TABLE {tbl} RENAME COLUMN v TO w"),
         format!("ALTER TABLE {tbl} ALTER COLUMN v TYPE TEXT"),
-        // And a column the index does not cover, which the engine blocks just the
-        // same.
-        format!("ALTER TABLE {tbl} DROP COLUMN extra"),
-        format!("ALTER TABLE {tbl} RENAME COLUMN extra TO extra2"),
-        format!("ALTER TABLE {tbl} ALTER COLUMN extra TYPE BIGINT"),
-        format!("ALTER TABLE {tbl} ALTER COLUMN extra SET NOT NULL"),
-        // Renaming the table depends on it too.
         format!("ALTER TABLE {tbl} RENAME TO {tbl}_moved"),
     ] {
         let err = assert_rejected(&client, &sql).await;
@@ -1430,13 +1672,86 @@ async fn test_altering_an_indexed_column_names_the_index() {
             "`{sql}` should name the index blocking it: {}",
             err.message()
         );
+        assert!(
+            err.message().contains("DROP INDEX"),
+            "`{sql}` should say what to remove: {}",
+            err.message()
+        );
     }
 
-    // Dropping the index unblocks all of it.
+    // Dropping the index unblocks all three.
     execute(&client, &format!("DROP INDEX {idx}"))
         .await
         .unwrap();
-    execute(&client, &format!("ALTER TABLE {tbl} DROP COLUMN extra"))
+    execute(
+        &client,
+        &format!("ALTER TABLE {tbl} ALTER COLUMN v TYPE TEXT"),
+    )
+    .await
+    .unwrap();
+    execute(&client, &format!("ALTER TABLE {tbl} DROP COLUMN v"))
+        .await
+        .unwrap();
+
+    drop_table(&client, &tbl).await;
+}
+
+// A *unique* index is the index no column change can be shipped around: its name is
+// not free again until the transaction that dropped it commits, so the rebuild
+// cannot be one transaction, and splitting it in two would leave a shard enforcing
+// no uniqueness while the catalog still promised it. So it blocks every column
+// change, per table — and so does the per-shard index VaireDB enforces a `UNIQUE`
+// constraint with, which is removed by a statement of its own.
+#[tokio::test]
+async fn test_a_unique_index_blocks_every_column_change() {
+    let client = ready_client().await;
+    let tbl = unique_table_name("un_uqalter");
+    setup_rows(&client, &tbl).await;
+    let idx = unique_table_name("un_uqalter_i");
+
+    // Uniqueness over the shard key is the only uniqueness VaireDB accepts.
+    execute(&client, &format!("CREATE UNIQUE INDEX {idx} ON {tbl} (id)"))
+        .await
+        .unwrap();
+
+    // Not one of these covers `id`, and every one of them is still refused.
+    let changes = [
+        format!("ALTER TABLE {tbl} DROP COLUMN v"),
+        format!("ALTER TABLE {tbl} RENAME COLUMN v TO w"),
+        format!("ALTER TABLE {tbl} ALTER COLUMN v SET NOT NULL"),
+    ];
+    for sql in &changes {
+        let err = assert_rejected(&client, sql).await;
+        assert!(
+            err.message().contains(&idx) && err.message().contains("DROP INDEX"),
+            "`{sql}` should name the unique index to drop: {}",
+            err.message()
+        );
+    }
+
+    execute(&client, &format!("DROP INDEX {idx}"))
+        .await
+        .unwrap();
+
+    // The same block under the same uniqueness spelled as a constraint, which names
+    // the statement that removes *it* instead.
+    execute(
+        &client,
+        &format!("ALTER TABLE {tbl} ADD CONSTRAINT uq_id UNIQUE (id)"),
+    )
+    .await
+    .unwrap();
+    for sql in &changes {
+        let err = assert_rejected(&client, sql).await;
+        assert!(
+            err.message().contains("uq_id") && err.message().contains("DROP CONSTRAINT"),
+            "`{sql}` should name the constraint to drop: {}",
+            err.message()
+        );
+    }
+
+    // And with the uniqueness gone, the change goes through.
+    execute(&client, &format!("ALTER TABLE {tbl} DROP CONSTRAINT uq_id"))
         .await
         .unwrap();
     execute(&client, &format!("ALTER TABLE {tbl} DROP COLUMN v"))
@@ -1509,22 +1824,24 @@ async fn test_unique_index_on_shard_key_is_enforced() {
 // coordinator catalog, and a relation's key carries it, so `schema_a.t` and
 // `schema_b.t` are two relations with two shard layouts.
 // `identifier_rewrite.rs::test_schema_qualified_name_collision` covers that from
-// the naming side; this is the statement side. What stays refused is what a pure
+// the naming side; this is the statement side. `ALTER SCHEMA … RENAME TO` renames
+// an *empty* namespace (row 19) — see
+// `test_alter_schema_renames_an_empty_namespace`. What stays refused is what a pure
 // namespace cannot honor: the clauses that give a schema properties or an owner,
-// `CASCADE`, and `ALTER SCHEMA`, which the parser does not accept at all.
+// `CASCADE`, and renaming a schema that still holds relations.
 
 #[tokio::test]
 async fn test_schema_ddl_refusals() {
     let client = ready_client().await;
     let schema = unique_table_name("un_schema");
 
-    // `ALTER SCHEMA` is not in sqlparser's PostgreSqlDialect at all: it fails at
-    // parse (42601, "expected one of VIEW or TYPE or TABLE or INDEX …").
-    assert_rejected(
-        &client,
-        &format!("ALTER SCHEMA {schema} RENAME TO {schema}_2"),
-    )
-    .await;
+    // A schema has no owner and no properties, and neither does an `ALTER` of one.
+    assert_unsupported(&client, &format!("ALTER SCHEMA {schema} OWNER TO bob")).await;
+
+    // The default namespace and the metadata namespaces are not records, so there
+    // is nothing to re-key.
+    assert_unsupported(&client, "ALTER SCHEMA public RENAME TO un_public_moved").await;
+    assert_unsupported(&client, "ALTER SCHEMA pg_catalog RENAME TO un_pg_moved").await;
 
     // A schema has no owner (VaireDB has no roles) and no properties, so each of
     // these is refused by name rather than accepted and dropped.
@@ -1575,6 +1892,27 @@ async fn test_schema_ddl_refusals() {
         .await
         .unwrap();
 
+    // Renaming a namespace that is not there is the same `3F000`, and `IF EXISTS`
+    // makes it the no-op it makes a DROP.
+    assert_sqlstate(
+        &client,
+        &format!("ALTER SCHEMA {schema} RENAME TO {schema}_2"),
+        SQLSTATE_SCHEMA_NOT_FOUND,
+    )
+    .await;
+    execute(
+        &client,
+        &format!("ALTER SCHEMA IF EXISTS {schema} RENAME TO {schema}_2"),
+    )
+    .await
+    .expect("IF EXISTS must make a rename of a missing schema a no-op");
+    assert_sqlstate(
+        &client,
+        &format!("DROP SCHEMA {schema}_2"),
+        SQLSTATE_SCHEMA_NOT_FOUND,
+    )
+    .await;
+
     execute(&client, &format!("CREATE SCHEMA {schema}"))
         .await
         .unwrap();
@@ -1611,8 +1949,104 @@ async fn test_schema_ddl_refusals() {
         err.message()
     );
 
+    // Renaming it is refused for the same reason and names the same relation: the
+    // schema is part of every per-shard table name, so a rename is one fan-out per
+    // relation with no way back from a partial one.
+    let err = assert_sqlstate(
+        &client,
+        &format!("ALTER SCHEMA {schema} RENAME TO {schema}_2"),
+        SQLSTATE_DEPENDENT_OBJECTS_EXIST,
+    )
+    .await;
+    assert!(
+        err.message().contains(&format!("{schema}.t")),
+        "the refusal must name what the schema still holds, got: {}",
+        err.message()
+    );
+
     drop_table(&client, &format!("{schema}.t")).await;
     execute(&client, &format!("DROP SCHEMA {schema}"))
+        .await
+        .unwrap();
+}
+
+// `ALTER SCHEMA … RENAME TO` on an empty namespace is the whole of row 19's schema
+// half: the record is re-keyed, nothing is broadcast, and the new name is a
+// namespace relations can be created in while the old one is gone.
+#[tokio::test]
+async fn test_alter_schema_renames_an_empty_namespace() {
+    let client = ready_client().await;
+    let before = unique_table_name("un_schema_ren_a");
+    let after = unique_table_name("un_schema_ren_b");
+    let occupied = unique_table_name("un_schema_ren_c");
+
+    execute(&client, &format!("CREATE SCHEMA {before}"))
+        .await
+        .unwrap();
+    execute(&client, &format!("CREATE SCHEMA {occupied}"))
+        .await
+        .unwrap();
+
+    // A destination that is taken is a duplicate schema, and nothing moves.
+    assert_sqlstate(
+        &client,
+        &format!("ALTER SCHEMA {before} RENAME TO {occupied}"),
+        SQLSTATE_SCHEMA_ALREADY_EXISTS,
+    )
+    .await;
+    // Renaming to its own name is the same duplicate, as in PostgreSQL, and the
+    // default namespace is taken without being a record.
+    assert_sqlstate(
+        &client,
+        &format!("ALTER SCHEMA {before} RENAME TO {before}"),
+        SQLSTATE_SCHEMA_ALREADY_EXISTS,
+    )
+    .await;
+    assert_sqlstate(
+        &client,
+        &format!("ALTER SCHEMA {before} RENAME TO public"),
+        SQLSTATE_SCHEMA_ALREADY_EXISTS,
+    )
+    .await;
+
+    execute(&client, &format!("ALTER SCHEMA {before} RENAME TO {after}"))
+        .await
+        .unwrap();
+
+    // The new name is a real namespace: a relation can be created in it.
+    execute(
+        &client,
+        &format!("CREATE TABLE {after}.t (id INTEGER NOT NULL, v VARCHAR) {CREATE_OPTS}"),
+    )
+    .await
+    .unwrap();
+    execute(
+        &client,
+        &format!("INSERT INTO {after}.t (id, v) VALUES (1, 'x')"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(row_count(&client, &format!("{after}.t")).await, 1);
+
+    // ...and the old one is not: it resolves to nothing at all.
+    assert_sqlstate(
+        &client,
+        &format!("CREATE TABLE {before}.t (id INTEGER NOT NULL) {CREATE_OPTS}"),
+        SQLSTATE_SCHEMA_NOT_FOUND,
+    )
+    .await;
+    assert_sqlstate(
+        &client,
+        &format!("DROP SCHEMA {before}"),
+        SQLSTATE_SCHEMA_NOT_FOUND,
+    )
+    .await;
+
+    drop_table(&client, &format!("{after}.t")).await;
+    execute(&client, &format!("DROP SCHEMA {after}"))
+        .await
+        .unwrap();
+    execute(&client, &format!("DROP SCHEMA {occupied}"))
         .await
         .unwrap();
 }
@@ -1624,9 +2058,18 @@ async fn test_schema_ddl_is_refused_inside_a_transaction() {
     let client = ready_client().await;
     let schema = unique_table_name("un_schema_tx");
 
-    execute(&client, "BEGIN").await.unwrap();
-    assert_unsupported(&client, &format!("CREATE SCHEMA {schema}")).await;
-    execute(&client, "ROLLBACK").await.unwrap();
+    // One block per statement: the first refusal aborts the block, so a second
+    // probe inside it would be answered `25P02` by the transaction machinery
+    // before the statement was ever classified.
+    for sql in [
+        format!("CREATE SCHEMA {schema}"),
+        format!("ALTER SCHEMA {schema} RENAME TO {schema}_2"),
+        format!("DROP SCHEMA {schema}"),
+    ] {
+        execute(&client, "BEGIN").await.unwrap();
+        assert_unsupported(&client, &sql).await;
+        execute(&client, "ROLLBACK").await.unwrap();
+    }
 
     // Refused, not created.
     assert_sqlstate(
@@ -2123,7 +2566,7 @@ async fn test_rejection_names_the_refused_command() {
     // `COPY` is absent for the same reason: every direction of it is routed now,
     // including the two that drive the copy sub-protocol, so the only refusals left
     // are about a form or an option and they name themselves — see
-    // `test_copy_outside_csv_is_rejected` and
+    // `test_copy_outside_the_supported_formats_is_rejected` and
     // `test_a_streaming_import_that_cannot_work_is_refused_up_front`.
     let cases: Vec<(String, &str)> = vec![
         (

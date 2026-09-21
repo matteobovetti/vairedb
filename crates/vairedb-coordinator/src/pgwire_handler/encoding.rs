@@ -5,7 +5,6 @@
 
 use std::sync::Arc;
 
-use arrow_pg::datatypes::arrow_schema_to_pg_fields;
 use arrow_pg::encoder::encode_value;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
@@ -17,9 +16,11 @@ use pgwire::error::{PgWireError, PgWireResult};
 
 use vairedb_common::proto::vairedb::v1::VdbErrorCode;
 
+use crate::pgwire_handler::column_labels;
 use crate::pgwire_handler::error_enrichment::{
     ErrorContext, enrich_datafusion_error, make_vdb_error,
 };
+use crate::pgwire_handler::wire_types;
 
 /// Map any result-encoding failure to a uniform internal error. Both the text
 /// and binary cell paths plus the row finalizer funnel through here.
@@ -52,7 +53,14 @@ pub(super) async fn encode_dataframe_response(
 
 /// The Arrow schema VaireDB puts on the wire, which is not always the plan's own.
 ///
-/// Two kinds of column are not sent as themselves.
+/// Two kinds of column are not sent as their own **type**, and one is not sent under its
+/// own **name**.
+///
+/// **A numbered anonymous column.** PostgreSQL calls every result column it has no name for
+/// `?column?`, however many of them a select list has; a DataFusion schema cannot hold that
+/// name twice, so [`super::column_labels`] numbers them and this is where the numbering is
+/// undone. Renaming is safe precisely here and nowhere earlier: this schema is the last one
+/// derived from the plan, and it is the one both Describe and Execute read.
 ///
 /// **`UInt64`.** PostgreSQL has no unsigned integers, and arrow-pg already widens most
 /// Arrow ones to the signed type that holds them — `UInt8` to `int2`, `UInt16` to `int4`,
@@ -74,19 +82,22 @@ pub(super) async fn encode_dataframe_response(
 /// nested inside a list keeps arrow-pg's mapping, since its element OID is derived
 /// separately.
 pub(crate) fn wire_schema(schema: &Schema) -> Schema {
-    if !schema
-        .fields()
-        .iter()
-        .any(|f| wire_type(f.data_type()).is_some())
-    {
+    if !schema.fields().iter().any(|f| {
+        wire_type(f.data_type()).is_some() || column_labels::wire_label(f.name()).is_some()
+    }) {
         return schema.clone();
     }
     let fields: Vec<Field> = schema
         .fields()
         .iter()
-        .map(|f| match wire_type(f.data_type()) {
-            Some(wire) => Field::new(f.name(), wire, f.is_nullable()),
-            None => f.as_ref().clone(),
+        .map(|f| {
+            let name = column_labels::wire_label(f.name()).unwrap_or(f.name());
+            match wire_type(f.data_type()) {
+                Some(wire) => Field::new(name, wire, f.is_nullable()),
+                // `with_name` rather than `Field::new`, so a field sent as itself keeps
+                // whatever metadata it carries.
+                None => f.as_ref().clone().with_name(name),
+            }
         })
         .collect();
     Schema::new_with_metadata(fields, schema.metadata().clone())
@@ -160,7 +171,11 @@ pub(super) fn encode_batches_response(
 ) -> PgWireResult<Response> {
     let wire = wire_schema(schema);
     let arrow_schema = &wire;
-    let field_info = Arc::new(arrow_schema_to_pg_fields(arrow_schema, format, None)?);
+    let field_info = Arc::new(wire_types::pg_fields(arrow_schema, format)?);
+    // Asked once for the whole result rather than once per cell: almost no result has a
+    // column whose bytes are VaireDB's to write, and the ones that do are found by a
+    // metadata lookup that would otherwise repeat for every row.
+    let writes_own = wire_types::writes_any_own_value(arrow_schema);
 
     let mut rows = Vec::new();
     for batch in batches {
@@ -186,6 +201,13 @@ pub(super) fn encode_batches_response(
                         encoder.encode_field(&val)
                     };
                     result.map_err(encode_error)?;
+                } else if let Some(value) =
+                    own_binary_value(writes_own, col, row_idx, arrow_schema.field(col_idx), field)?
+                {
+                    // A binary `numeric` or `uuid`, whose bytes arrow-pg either cannot
+                    // produce or would produce under the wrong type. See
+                    // [`super::wire_types`].
+                    encoder.encode_field(&value).map_err(encode_error)?;
                 } else {
                     // Binary cells, and array cells in either format, go through
                     // arrow-pg: it owns the correct binary codec and renders text
@@ -209,6 +231,23 @@ pub(super) fn encode_batches_response(
 
     let row_stream = stream::iter(rows);
     Ok(Response::Query(QueryResponse::new(field_info, row_stream)))
+}
+
+/// The cell VaireDB writes itself, where the result has any such column at all.
+///
+/// A thin gate over [`wire_types::own_binary_value`] so the per-result answer and the
+/// per-cell one are asked in one place.
+fn own_binary_value(
+    writes_own: bool,
+    col: &datafusion::arrow::array::ArrayRef,
+    row: usize,
+    field: &Field,
+    pg_field: &pgwire::api::results::FieldInfo,
+) -> PgWireResult<Option<wire_types::PgValue>> {
+    if !writes_own {
+        return Ok(None);
+    }
+    wire_types::own_binary_value(col, row, field, pg_field)
 }
 
 /// Whether the cell at `row` of `col` is NULL as far as a client is concerned.
@@ -242,7 +281,7 @@ pub(crate) fn is_null_on_the_wire(col: &dyn datafusion::arrow::array::Array, row
 ///
 /// Everything else keeps the one renderer, [`arrow_array_value_to_string`], which the write
 /// path shares.
-fn wire_text_value(col: &dyn datafusion::arrow::array::Array, row: usize) -> String {
+pub(super) fn wire_text_value(col: &dyn datafusion::arrow::array::Array, row: usize) -> String {
     use datafusion::arrow::array::BooleanArray;
 
     match col.data_type() {

@@ -25,8 +25,9 @@ use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 use std::sync::{Arc, OnceLock};
 
-use arrow_pg::datatypes::{arrow_schema_to_pg_fields, into_pg_type};
+use arrow_pg::datatypes::into_pg_type;
 use async_trait::async_trait;
+use datafusion::common::TableReference;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::sql::parser::Statement as DFStatement;
@@ -52,20 +53,29 @@ use crate::pgwire_handler::error_enrichment::{
 };
 use crate::pgwire_handler::introspection;
 use crate::pgwire_handler::pg_aggregate_widening;
+use crate::pgwire_handler::pg_clock_functions;
+use crate::pgwire_handler::pg_count_arity;
 use crate::pgwire_handler::pg_float_division;
+use crate::pgwire_handler::pg_grouping_sets;
 use crate::pgwire_handler::pg_integer_literals;
 use crate::pgwire_handler::pg_not_in_nulls;
 use crate::pgwire_handler::pg_operators;
 use crate::pgwire_handler::pg_param_types;
+use crate::pgwire_handler::pg_projection_subqueries;
+use crate::pgwire_handler::pg_quantified_subqueries;
+use crate::pgwire_handler::pg_set_op_multiplicity;
 use crate::pgwire_handler::pg_set_op_types;
 use crate::pgwire_handler::pg_using_join_merge;
 use crate::pgwire_handler::pg_using_join_qualifiers;
+use crate::pgwire_handler::pg_using_join_where_keys;
 use crate::pgwire_handler::query_router::{self, QueryType};
+use crate::pgwire_handler::schemas;
 use crate::pgwire_handler::session_params;
 use crate::pgwire_handler::views;
+use crate::pgwire_handler::wire_types;
 use crate::sqlparser::ast::{
-    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, ObjectNamePart, Statement, Value,
-    visit_expressions_mut, visit_relations_mut,
+    Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Ident, ObjectName, ObjectNamePart,
+    Statement, Value, visit_expressions_mut, visit_relations_mut,
 };
 use crate::write_sql_cl;
 
@@ -102,6 +112,9 @@ fn pg_parser() -> &'static PostgresCompatibilityParser {
 /// `RESET` has one exception: neither parser has the statement at all, so it is
 /// recognized here and rewritten to the `SET … TO DEFAULT` PostgreSQL defines it
 /// to be — see [`session_params::parse_reset`].
+/// `ALTER TABLE … SET SCHEMA` is the other: neither parser has it either, so it is
+/// recognized here and respelled as the schema-qualified `ALTER TABLE … RENAME TO`
+/// that does the identical work — see [`schemas::parse_alter_table_set_schema`].
 ///
 /// One correction happens on the *text*, before either parse: sqlparser has no binary,
 /// octal or hexadecimal integer literal and silently turns `0b101` into `0` and `0x1F`
@@ -110,6 +123,9 @@ fn pg_parser() -> &'static PostgresCompatibilityParser {
 /// numbers.
 pub fn parse_sql(sql: &str) -> Result<Vec<Statement>> {
     if let Some(statements) = session_params::parse_reset(sql) {
+        return Ok(statements);
+    }
+    if let Some(statements) = schemas::parse_alter_table_set_schema(sql) {
         return Ok(statements);
     }
 
@@ -245,8 +261,10 @@ fn mentions_collate(sql: &str) -> bool {
 
 /// Parse `sql` with sqlparser's plain `PostgreSqlDialect` — no pg-compat probe
 /// substitution and no rewrite rules — so the AST reflects exactly what the
-/// client sent. Used for write-path statements by [`parse_sql`].
-fn parse_verbatim(sql: &str) -> Result<Vec<Statement>> {
+/// client sent. Used for write-path statements by [`parse_sql`], and by
+/// [`schemas::parse_alter_table_set_schema`] to read the half of an
+/// `ALTER TABLE ... SET SCHEMA` sqlparser does parse.
+pub(super) fn parse_verbatim(sql: &str) -> Result<Vec<Statement>> {
     use crate::sqlparser::dialect::PostgreSqlDialect;
     use crate::sqlparser::parser::Parser;
 
@@ -274,30 +292,60 @@ pub fn transform_to_char_format_for_read(stmt: &mut Statement) {
     });
 }
 
-/// Collapse every schema-qualified relation in `stmt` to the single quoted
-/// identifier holding its canonical catalog key, so a `SELECT ... FROM sales.orders`
-/// resolves against the name the table provider is registered under.
+/// Respell every relation in `stmt` as the name its table provider is registered
+/// under, so a `SELECT ... FROM sales.orders` resolves.
 ///
-/// A schema is a namespace in the *coordinator's* catalog, not a DataFusion one:
-/// providers are registered under a bare `TableReference` whose name is the catalog
-/// key (`orders`, `sales.orders`), so a `Partial{schema, table}` reference would not
-/// resolve. Quoting the collapsed name keeps DataFusion from folding it again, which
-/// matters for a table created with a quoted mixed-case name.
+/// The registered name is
+/// [`query_router::table_reference`](crate::pgwire_handler::query_router::table_reference)
+/// of the canonical catalog key, so this writes back what that reference spells: **two**
+/// quoted parts for a relation in a non-default schema, **one** for the rest. Each part is
+/// quoted so DataFusion does not fold it again, which matters for a table created with a
+/// quoted mixed-case name.
 ///
-/// Only multi-part relations are touched; a single-part name is already its own key
-/// and is left byte-identical, so an unquoted one still folds the way PostgreSQL
-/// folds it. Apply on the read path only for non-catalog queries, so
-/// `vairedb_catalog.*` / `pg_catalog.*` references keep their qualifier — those
-/// *are* real schemas in the local context.
-pub fn collapse_schema_qualified_relations(stmt: &mut Statement) {
+/// Three things it is doing at once, all of them the same rewrite:
+///
+/// * A qualified name loses a `public.` qualifier, because a relation in the default schema
+///   is registered bare — `public.orders` and `orders` are one relation.
+/// * A qualified name in another schema drops a leading catalog part, since the canonical
+///   key reads only the last two, and normalizes the case of both.
+/// * A *single* quoted part that canonicalizes to a qualified key is split into the two,
+///   because `"sales.orders"` is documented as naming the same relation as `sales.orders`
+///   and now has to reach the same two-part reference.
+///
+/// A name that already spells its reference is left **byte-identical** — an unquoted
+/// `orders` is not pinned as `"orders"` here, it goes on folding the way PostgreSQL folds
+/// it. Apply on the read path only for non-catalog queries, so `vairedb_catalog.*` /
+/// `pg_catalog.*` references keep their own qualifier — those *are* real schemas in the
+/// local context.
+pub fn canonicalize_relation_names(stmt: &mut Statement) {
     let _ = visit_relations_mut(stmt, |relation| {
-        if relation.0.len() > 1
-            && let Some(key) = query_router::canonical_table_name(relation)
-        {
-            relation.0 = vec![ObjectNamePart::Identifier(Ident::with_quote('"', key))];
+        let Some(key) = query_router::canonical_table_name(relation) else {
+            return ControlFlow::<()>::Continue(());
+        };
+        let parts: Vec<String> = match query_router::table_reference(&key) {
+            TableReference::Partial { schema, table } => {
+                vec![schema.to_string(), table.to_string()]
+            }
+            other => vec![other.table().to_string()],
+        };
+        if !spells(relation, &parts) {
+            relation.0 = parts
+                .into_iter()
+                .map(|part| ObjectNamePart::Identifier(Ident::with_quote('"', part)))
+                .collect();
         }
-        ControlFlow::<()>::Continue(())
+        ControlFlow::Continue(())
     });
+}
+
+/// Whether `relation` is already written as exactly `parts`, part for part, so
+/// [`canonicalize_relation_names`] has nothing to write back.
+fn spells(relation: &ObjectName, parts: &[String]) -> bool {
+    relation.0.len() == parts.len()
+        && relation.0.iter().zip(parts).all(|(part, canonical)| {
+            part.as_ident()
+                .is_some_and(|ident| &ident.value == canonical)
+        })
 }
 
 /// If `arg` is a single-quoted string literal, translate it in place from a
@@ -422,23 +470,41 @@ pub(super) fn prepare_select_for_planning(
     // two fields named `id`. See `pg_using_join_qualifiers`, which leaves every statement
     // that does not qualify a key to `pg_using_join_merge` on the plan.
     pg_using_join_qualifiers::split_qualified_using_keys(&mut prepared)?;
+    // **After** that splitter, which is the whole of the ordering argument. A block that
+    // qualifies a key has had its join respelled to `ON`, so there is no `USING` here left to
+    // find; a block that does not keeps `USING`, and `pg_using_join_merge` writes the merged
+    // value into both underlying fields, so qualifying a bare key in the `WHERE` filters on
+    // the merged value either way. Running before the splitter would instead turn a
+    // `SELECT *` into its wildcard refusal. See `pg_using_join_where_keys`.
+    pg_using_join_where_keys::qualify_using_keys_in_where(&mut prepared, catalog);
     // Translate PG TO_CHAR format strings to strftime specifiers so DataFusion's
     // native to_char formats correctly on the read path.
     transform_to_char_format_for_read(&mut prepared);
-    // Label a function's result column the way PostgreSQL does, before the rewrites
-    // below rename the function — the label the client gets is then the name the client
-    // wrote. Not for a catalog query: those come from upstream's own rewrites, aimed at
-    // the column names particular drivers look for.
+    // Label every result column the way PostgreSQL does, before the rewrites below rename
+    // a function or expand an expression — the label the client gets is then derived from
+    // what the client wrote rather than from what VaireDB planned. Not for a catalog
+    // query: those come from upstream's own rewrites, aimed at the column names particular
+    // drivers look for.
     if !is_catalog {
-        column_labels::label_function_columns(&mut prepared);
+        column_labels::label_result_columns(&mut prepared);
     }
     // Rewrite the PostgreSQL operators DataFusion has no node for, and refuse the
     // expressions it would accept while ignoring half of what they ask for.
     pg_operators::rewrite_pg_expressions(&mut prepared)?;
-    // A schema is a coordinator-catalog namespace, not a DataFusion one: collapse
-    // `schema.tbl` to the single registered name that is its catalog key.
+    // After the labelling above, so `SELECT statement_timestamp()` is still labelled
+    // `statement_timestamp` rather than the `now` it becomes here. The three forms this
+    // resolves all depend on a clock, and a clock is the one thing three shards cannot agree
+    // on, so the resolution has to happen once and it has to happen here.
+    // See `pg_clock_functions`.
+    pg_clock_functions::resolve_clock_functions(&mut prepared);
+    // On the AST because `GROUP BY ()` does not survive the planner — "Empty tuple not
+    // supported yet" is raised while the statement is being planned, so there is no plan to
+    // rewrite. See `pg_grouping_sets`.
+    pg_grouping_sets::remove_empty_grouping_sets(&mut prepared)?;
+    // Respell each relation as the name its provider is registered under, which for a
+    // qualified one is the two-part reference built from its catalog key.
     if !is_catalog {
-        collapse_schema_qualified_relations(&mut prepared);
+        canonicalize_relation_names(&mut prepared);
     }
     Ok(prepared)
 }
@@ -467,6 +533,11 @@ pub(super) async fn plan_select(
         .statement_to_plan(DFStatement::Statement(Box::new(prepared)))
         .await
         .map_err(|e| enrich_datafusion_error(&e, &select_ctx))?;
+    // Straight after the planner, and before any pass that could rewrite the call: the
+    // refusal names the argument *types* the way PostgreSQL does, so it needs the schema the
+    // planner has just resolved and the `count` still spelled the way the client spelled it.
+    // See `pg_count_arity`.
+    pg_count_arity::reject_multi_argument_count(&plan)?;
     // On the plan and not on the session, because this changes a result column's *type*
     // and the type the client is told is read off this plan — by Describe and by the row
     // encoder both. See `pg_aggregate_widening`.
@@ -495,10 +566,33 @@ pub(super) async fn plan_select(
     // is here on the plan rather than beside the AST rewrite that respells the shapes this
     // one refuses. See `pg_not_in_nulls`.
     pg_not_in_nulls::reject_null_unaware_not_in(&plan)?;
+    // Before the optimizer, and only before it: decorrelation is the pass that turns a
+    // `SetComparison` into the stack of mark joins that neither serializes nor, for `ALL`,
+    // executes, so afterwards there is no quantified comparison left to lower. The refusal
+    // reads the *residue* of the lowering, so the two are a pair and the order is fixed. See
+    // `pg_quantified_subqueries`.
+    let plan = pg_quantified_subqueries::lower_quantified_subqueries(plan)
+        .map_err(|e| enrich_datafusion_error(&e, &select_ctx))?;
+    pg_quantified_subqueries::reject_unlowered_quantified_subqueries(&plan)?;
+    // After that lowering, because it is the other pass that builds an `Expr::Exists` — and
+    // builds it only in a predicate position this one leaves alone. Before the optimizer,
+    // because `DecorrelatePredicateSubquery` never reaches a select list and the physical
+    // planner has no form for what is left there; and before `coerce_types`, so the `count(*)`
+    // comparison and the three-valued `CASE` this builds are type-checked like any other
+    // expression. Paired with its own refusal, in that order. See `pg_projection_subqueries`.
+    let plan = pg_projection_subqueries::lower_projection_subqueries(plan)
+        .map_err(|e| enrich_datafusion_error(&e, &select_ctx))?;
+    pg_projection_subqueries::reject_unlowered_projection_subqueries(&plan)?;
     // Before `coerce_types`, and only before it: coercion is the pass that inserts the casts
     // making a set operation's branches agree, so afterwards there is no disagreement left to
     // refuse. See `pg_set_op_types`.
     pg_set_op_types::reject_incompatible_set_operation_types(&plan)?;
+    // After that refusal, so branches that do not agree on a type are named as such rather
+    // than as a set operation this cannot rewrite; and before the optimizer, which reorders
+    // the semi/anti join out of the shape the rewrite recognizes. Reads the branches' columns,
+    // which is why it is here on the plan rather than beside the AST pass that marks the
+    // operations for it. See `pg_set_op_multiplicity`.
+    let plan = pg_set_op_multiplicity::preserve_set_operation_multiplicity(plan)?;
     let plan = coerce_types(ctx, plan, &select_ctx)?;
     Ok((plan, select_ctx))
 }
@@ -743,11 +837,7 @@ impl QueryParser for VaireQueryParser {
         // Through `wire_schema`, because Describe has to promise the type Execute
         // will actually send: the encoder widens a `UInt64` column to `bigint`, and a
         // client told `numeric` here would decode the following DataRow wrongly.
-        arrow_schema_to_pg_fields(
-            &encoding::wire_schema(plan.schema().as_arrow()),
-            format,
-            None,
-        )
+        wire_types::pg_fields(&encoding::wire_schema(plan.schema().as_arrow()), format)
     }
 }
 

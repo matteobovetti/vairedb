@@ -1,6 +1,8 @@
 //! SQL statement inspection used to decide how to route a query: classifying a
 //! parsed statement and extracting the target table name from it.
 
+use datafusion::common::TableReference;
+
 use crate::sqlparser::ast::{
     FromTable, Ident, ObjectName, ObjectType, SetExpr, Statement, TableFactor, TableObject,
 };
@@ -50,6 +52,10 @@ pub enum QueryType {
     /// it resolves against the schema namespace instead of reporting a missing
     /// table.
     DropSchema,
+    /// `ALTER SCHEMA ... RENAME TO`: renames the namespace record. Nothing is
+    /// broadcast for the same reason `CREATE SCHEMA` broadcasts nothing, and only an
+    /// *empty* schema can be renamed — see [`crate::pgwire_handler::schemas`].
+    AlterSchema,
     /// `COPY ... TO/FROM '<file>'`: bulk export and import over a CSV file on the
     /// coordinator. Both directions run in the coordinator — the export on the read
     /// path, the import through the INSERT lane — see
@@ -135,6 +141,7 @@ pub fn classify_statement(stmt: &Statement) -> QueryType {
         Statement::AlterTable { .. } => QueryType::AlterTable,
         Statement::CreateIndex(_) => QueryType::CreateIndex,
         Statement::CreateSchema { .. } => QueryType::CreateSchema,
+        Statement::AlterSchema(_) => QueryType::AlterSchema,
         Statement::CreateView { .. } => QueryType::CreateView,
         Statement::AlterView { .. } => QueryType::AlterView,
         // Split on the object kind rather than on the statement: `DROP INDEX`,
@@ -242,6 +249,32 @@ pub fn relation_of(key: &str) -> &str {
     }
 }
 
+/// The [`TableReference`] a canonical key is registered under in DataFusion — the one
+/// place the flat key becomes a *structured* name.
+///
+/// A qualified key registers as `Partial { schema, table }`, not as a bare name holding
+/// the dot, because DataFusion's expression tree carries a column's qualifier as a
+/// [`TableReference`] too, and `datafusion-proto` encodes that qualifier by printing it and
+/// decodes it by re-parsing the printed string. A bare `"sales.orders"` survives the print
+/// and comes back from the parse as `Partial { sales, orders }` — a qualifier that matches
+/// no registered relation, which is why a *filtered* or *sorted* read of a qualified
+/// relation used to fail `42703` while an unfiltered one (whose plan carries no column
+/// qualifier) worked. Registering the structured name in the first place makes the
+/// round trip an identity.
+///
+/// The residue is the key whose *relation* part still contains a dot, which
+/// [`canonical_table_name`] produces for a relation quoted with a dot in a non-default
+/// schema (`CREATE TABLE sales."a.b"`). There is no two-part reference for it, so it keeps
+/// the bare key and keeps today's behaviour.
+pub fn table_reference(key: &str) -> TableReference {
+    match key.split_once('.') {
+        Some((schema, relation)) if !relation.contains('.') => {
+            TableReference::partial(schema.to_string(), relation.to_string())
+        }
+        _ => TableReference::bare(key.to_string()),
+    }
+}
+
 /// Canonical logical name for a single identifier: verbatim when quoted,
 /// lowercased when unquoted.
 ///
@@ -255,6 +288,20 @@ pub fn canonicalize_ident(ident: &Ident) -> String {
         ident.value.clone()
     } else {
         ident.value.to_ascii_lowercase()
+    }
+}
+
+/// Render a canonical identifier back into SQL: bare when it folds to itself,
+/// double-quoted when it carries case an engine would fold away.
+///
+/// The inverse of [`canonicalize_ident`], and needed wherever the coordinator emits
+/// SQL built from catalog metadata rather than from the client's own statement — a
+/// column stored as `"Amount"` named unquoted would look for `amount` instead.
+pub fn quoted_if_folded(name: &str) -> String {
+    if name.chars().any(|c| c.is_ascii_uppercase()) {
+        format!("\"{name}\"")
+    } else {
+        name.to_string()
     }
 }
 

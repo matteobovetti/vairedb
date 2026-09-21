@@ -65,11 +65,18 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
-serde_json = "1"
+# `raw_value` for `json_pg`: PostgreSQL's `->` hands back the client's own bytes, so a
+# document is read as borrowed `RawValue` slices rather than re-serialized from a `Value`.
+serde_json = { version = "1", features = ["raw_value"] }
 serde_yaml = "0.9"
 
 # CLI
 clap = { version = "4.6.1", features = ["derive"] }
+
+# Calendar arithmetic. Already in the tree as an arrow dependency, but arrow does not
+# re-export it, and `age()`/`make_timestamp()` need the civil-calendar decomposition
+# (leap years, days per month) that PostgreSQL's own answers are defined in terms of.
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 
 # Utilities
 uuid = { version = "1", features = ["v4"] }

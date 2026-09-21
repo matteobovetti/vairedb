@@ -13,6 +13,9 @@ datafusion = { workspace = true }
 # crate that defines them is needed on both sides of the wire too.
 datafusion-pg-catalog = { workspace = true }
 arrow = { workspace = true }
+# `pg_datetime` computes `age()` and `make_timestamp()` the way PostgreSQL defines them,
+# which is in civil-calendar terms rather than in elapsed microseconds.
+chrono = { workspace = true }
 tonic = { workspace = true }
 tonic-prost = { workspace = true }
 prost = { workspace = true }
@@ -22,6 +25,9 @@ serde_yaml = { workspace = true }
 serde_json = { workspace = true }
 
 [dev-dependencies]
+# The shadowing functions in `stats_udaf` and `ntile` change the type a *plan* advertises,
+# which only a planned query can be asserted against — and planning is async.
+tokio = { workspace = true }
 
 [build-dependencies]
 tonic-prost-build = { workspace = true }

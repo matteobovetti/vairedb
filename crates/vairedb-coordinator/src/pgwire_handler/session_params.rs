@@ -70,6 +70,22 @@ enum Disposition {
     ReadOnly,
 }
 
+impl Disposition {
+    /// `pg_settings.context` — when a value can change.
+    ///
+    /// `user`, which PostgreSQL uses for a parameter any session may set, and `internal`,
+    /// which it uses for one compiled in. A [`Disposition::Refused`] parameter reports
+    /// `internal` even where PostgreSQL calls it `user`: what the column is read for is
+    /// whether a `SET` will work, and on VaireDB it will not. The refusal says why; this
+    /// says that.
+    fn context(&self) -> &'static str {
+        match self {
+            Disposition::Free | Disposition::Matching { .. } => "user",
+            Disposition::Refused(_) | Disposition::ReadOnly => "internal",
+        }
+    }
+}
+
 /// One runtime parameter: how PostgreSQL spells and describes it, and what
 /// VaireDB will accept for it.
 struct ParamSpec {
@@ -82,7 +98,35 @@ struct ParamSpec {
     default: &'static str,
     /// `pg_settings.short_desc`, and the `description` column of `SHOW ALL`.
     short_desc: &'static str,
+    /// `pg_settings.vartype`. Declared rather than inferred: the shape of a value is not
+    /// recoverable from [`Self::default`] — `"on"` is a boolean and `"1"` is an integer,
+    /// but `"notice"` is an enum and `"ISO, YMD"` a string, and nothing in the spec says
+    /// which.
+    vartype: VarType,
     disposition: Disposition,
+}
+
+/// `pg_settings.vartype` — the shape of a parameter's value, as PostgreSQL names it.
+///
+/// `real` is absent because VaireDB models no floating-point parameter.
+#[derive(Clone, Copy)]
+enum VarType {
+    Bool,
+    Enum,
+    Integer,
+    String,
+}
+
+impl VarType {
+    /// The spelling `pg_settings.vartype` uses.
+    fn name(self) -> &'static str {
+        match self {
+            VarType::Bool => "bool",
+            VarType::Enum => "enum",
+            VarType::Integer => "integer",
+            VarType::String => "string",
+        }
+    }
 }
 
 /// True for the PostgreSQL spellings of boolean `on`.
@@ -107,6 +151,7 @@ const PARAMS: &[ParamSpec] = &[
         name: "application_name",
         default: "",
         short_desc: "Sets the application name to be reported in statistics and logs.",
+        vartype: VarType::String,
         // Purely a label: VaireDB reports it back and nothing else reads it.
         disposition: Disposition::Free,
     },
@@ -114,6 +159,7 @@ const PARAMS: &[ParamSpec] = &[
         name: "client_encoding",
         default: "UTF8",
         short_desc: "Sets the client's character set encoding.",
+        vartype: VarType::String,
         disposition: Disposition::Matching {
             accepts: |v| {
                 matches!(
@@ -128,6 +174,7 @@ const PARAMS: &[ParamSpec] = &[
         name: "client_min_messages",
         default: "notice",
         short_desc: "Sets the message levels that are sent to the client.",
+        vartype: VarType::Enum,
         // VaireDB emits no notices, warnings or debug messages at all, so every
         // threshold filters the same empty set.
         disposition: Disposition::Free,
@@ -136,6 +183,7 @@ const PARAMS: &[ParamSpec] = &[
         name: "DateStyle",
         default: "ISO, YMD",
         short_desc: "Sets the display format for date and time values.",
+        vartype: VarType::String,
         disposition: Disposition::Matching {
             // Only the output half is constrained: the encoder renders dates ISO
             // (`2024-01-31`). The input half (MDY/DMY/YMD) orders ambiguous date
@@ -156,6 +204,7 @@ const PARAMS: &[ParamSpec] = &[
         name: "default_transaction_read_only",
         default: "off",
         short_desc: "Sets the default read-only status of new transactions.",
+        vartype: VarType::Bool,
         disposition: Disposition::Matching {
             // A read-only block is opened with `BEGIN READ ONLY`; nothing consults a
             // session default when a block opens, so accepting `on` would leave
@@ -168,6 +217,7 @@ const PARAMS: &[ParamSpec] = &[
         name: "extra_float_digits",
         default: "1",
         short_desc: "Sets the number of digits displayed for floating-point values.",
+        vartype: VarType::Integer,
         disposition: Disposition::Matching {
             // The encoder emits the shortest representation that round-trips, which
             // is what PostgreSQL does for any value above 0. A value at or below 0
@@ -181,18 +231,21 @@ const PARAMS: &[ParamSpec] = &[
         name: "in_hot_standby",
         default: "off",
         short_desc: "Shows whether hot standby is currently active.",
+        vartype: VarType::Bool,
         disposition: Disposition::ReadOnly,
     },
     ParamSpec {
         name: "integer_datetimes",
         default: "on",
         short_desc: "Shows whether datetimes are integer based.",
+        vartype: VarType::Bool,
         disposition: Disposition::ReadOnly,
     },
     ParamSpec {
         name: "IntervalStyle",
         default: "postgres",
         short_desc: "Sets the display format for interval values.",
+        vartype: VarType::Enum,
         disposition: Disposition::Matching {
             accepts: |v| v.eq_ignore_ascii_case("postgres"),
             behaviour: "interval values are always rendered in the postgres style",
@@ -202,6 +255,7 @@ const PARAMS: &[ParamSpec] = &[
         name: "is_superuser",
         default: "on",
         short_desc: "Shows whether the current user is a superuser.",
+        vartype: VarType::Bool,
         disposition: Disposition::ReadOnly,
     },
     ParamSpec {
@@ -209,6 +263,7 @@ const PARAMS: &[ParamSpec] = &[
         // PostgreSQL's own value for "no role has been assumed".
         default: "none",
         short_desc: "Sets the current role.",
+        vartype: VarType::String,
         // Refused for the reason `session_authorization` is, and declared here so
         // `RESET ROLE` — which a pooler issues on checkout — succeeds: it asks for
         // the default, and no role assumed *is* VaireDB's state. `SET ROLE` has its
@@ -221,6 +276,7 @@ const PARAMS: &[ParamSpec] = &[
         name: "search_path",
         default: "public",
         short_desc: "Sets the schema search order for names that are not schema-qualified.",
+        vartype: VarType::String,
         // The one parameter on this list refused rather than constrained. VaireDB
         // resolves an unqualified relation to the default schema and nothing else:
         // the catalog key *is* the qualified name, and a relation elsewhere is
@@ -239,18 +295,21 @@ const PARAMS: &[ParamSpec] = &[
         name: "server_encoding",
         default: "UTF8",
         short_desc: "Shows the server-side character set encoding.",
+        vartype: VarType::String,
         disposition: Disposition::ReadOnly,
     },
     ParamSpec {
         name: "server_version",
         default: "16.6",
         short_desc: "Shows the server version.",
+        vartype: VarType::String,
         disposition: Disposition::ReadOnly,
     },
     ParamSpec {
         name: "session_authorization",
         default: "",
         short_desc: "Sets the session user name.",
+        vartype: VarType::String,
         // Refused rather than read-only: PostgreSQL lets a superuser change it, so a
         // client told `OK` would be one acting under an identity the coordinator
         // never switched to.
@@ -262,6 +321,7 @@ const PARAMS: &[ParamSpec] = &[
         name: "standard_conforming_strings",
         default: "on",
         short_desc: "Causes '...' strings to treat backslashes literally.",
+        vartype: VarType::Bool,
         disposition: Disposition::Matching {
             // Both parsers read `\` in a single-quoted string literally, so `off`
             // would change what every escape in every literal means.
@@ -273,6 +333,7 @@ const PARAMS: &[ParamSpec] = &[
         name: "statement_timeout",
         default: "0",
         short_desc: "Sets the maximum allowed duration of any statement.",
+        vartype: VarType::Integer,
         disposition: Disposition::Matching {
             // Nothing cancels a running statement. A client that set a timeout and
             // got an OK would wait indefinitely on the query it expected to be
@@ -285,6 +346,7 @@ const PARAMS: &[ParamSpec] = &[
         name: "TimeZone",
         default: "Etc/UTC",
         short_desc: "Sets the time zone for displaying and interpreting time stamps.",
+        vartype: VarType::String,
         disposition: Disposition::Matching {
             // Timestamps are stored and rendered in UTC throughout; another zone
             // would shift every `timestamptz` the client reads.
@@ -310,6 +372,7 @@ const PARAMS: &[ParamSpec] = &[
         // `SET TRANSACTION ISOLATION LEVEL` stays refused — see [`other_set_form`].
         default: "read uncommitted",
         short_desc: "Shows the isolation level of the current transaction.",
+        vartype: VarType::Enum,
         disposition: Disposition::ReadOnly,
     },
 ];
@@ -430,6 +493,64 @@ impl SessionParams {
         rows.sort_by_key(|(name, _, _)| name.to_ascii_lowercase());
         rows
     }
+
+    /// Every modelled parameter as a [`Setting`], ordered by name as PostgreSQL's
+    /// `pg_settings` is.
+    ///
+    /// The same values `SHOW` reports, in the shape `pg_catalog.pg_settings` has — because
+    /// they are the same parameters, and a client that reads the table instead of issuing
+    /// `SHOW` is asking the same question. See
+    /// [`crate::pgwire_handler::pg_settings`] for how a shared context answers it per
+    /// session.
+    pub(crate) fn settings(&self) -> Vec<Setting> {
+        let mut rows: Vec<Setting> = PARAMS
+            .iter()
+            .map(|spec| Setting {
+                name: spec.name,
+                setting: self.value_of(spec).to_string(),
+                short_desc: spec.short_desc,
+                vartype: spec.vartype.name(),
+                context: spec.disposition.context(),
+                // PostgreSQL's `source` is where the current value came from. A value this
+                // session `SET` is `session`; anything else is the one the connection
+                // opened with, which is `default` — VaireDB reads no configuration file
+                // and takes no per-user or per-database overrides.
+                source: if self.overrides.contains_key(spec.name) {
+                    "session"
+                } else {
+                    "default"
+                },
+                // `reset_val` is what `RESET` would restore, which is what startup
+                // announced; `boot_val` is the compiled-in default underneath it. They
+                // differ only for a parameter pgwire announces.
+                reset_val: self
+                    .initial
+                    .get(spec.name)
+                    .map_or(spec.default, String::as_str)
+                    .to_string(),
+                boot_val: spec.default,
+            })
+            .collect();
+        rows.sort_by_key(|row| row.name.to_ascii_lowercase());
+        rows
+    }
+}
+
+/// One `pg_catalog.pg_settings` row, for the columns VaireDB has a true value for.
+///
+/// The columns left out are left NULL by the table that builds from this — `unit`,
+/// `category`, `extra_desc`, `min_val`, `max_val`, `enumvals`, `sourcefile` and
+/// `sourceline`. PostgreSQL fills most of them; VaireDB would have to invent them, and a
+/// NULL says "not known here" where a made-up range would say something false.
+pub(crate) struct Setting {
+    pub(crate) name: &'static str,
+    pub(crate) setting: String,
+    pub(crate) short_desc: &'static str,
+    pub(crate) vartype: &'static str,
+    pub(crate) context: &'static str,
+    pub(crate) source: &'static str,
+    pub(crate) reset_val: String,
+    pub(crate) boot_val: &'static str,
 }
 
 /// `42704` — the name is not a configuration parameter VaireDB models. What

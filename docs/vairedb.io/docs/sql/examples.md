@@ -75,9 +75,83 @@ UPDATE users SET age = 30 WHERE id = 1;
 ALTER TABLE users RENAME COLUMN email TO email_address;
 ```
 
-## 7. Clean up
+## 7. Bulk load and export
+
+`COPY` writes a file holding every shard's rows, and reads one back routing each
+row to the shard that owns it. Parquet is the format to reach for here: it carries
+its own column names and types, so the import reads typed values instead of
+re-parsing text.
+
+Export the table — note the column is `email_address` now, after the rename in
+step 6:
 
 ```sql
+COPY users (id, name, email_address) TO '/tmp/users.parquet' (FORMAT PARQUET);
+-- COPY 4
+```
+
+Load it into a second sharded table:
+
+```sql
+CREATE TABLE users_archive (
+    id INTEGER NOT NULL,
+    name VARCHAR(255) NOT NULL,
+    email_address VARCHAR(255)
+) WITH (
+    shards = 3,
+    replication_factor = 3,
+    shard_by = 'HASH(id)'
+);
+
+COPY users_archive FROM '/tmp/users.parquet' (FORMAT PARQUET);
+-- COPY 4
+
+SELECT count(*) FROM users_archive;
+```
+
+The import named no columns, so the file's own schema decided which ones it
+filled. State them to map by position instead — the list then has to be exactly as
+wide as the file:
+
+```sql
+-- An import appends, so clear the table first or the four rows land twice
+TRUNCATE users_archive;
+
+COPY users_archive (id, name, email_address)
+  FROM '/tmp/users.parquet' (FORMAT PARQUET);
+-- COPY 4
+```
+
+`FORMAT PARQUET` takes no options: `HEADER`, `DELIMITER` and `QUOTE` describe a CSV
+layout and are rejected rather than ignored. CSV works here too, and is the only
+format the streaming forms carry — note that both sides have to agree on the
+columns, since a CSV header is just text:
+
+```sql
+TRUNCATE users_archive;
+
+COPY users (id, name, email_address) TO '/tmp/users.csv' (FORMAT CSV, HEADER);
+COPY users_archive FROM '/tmp/users.csv' (FORMAT CSV, HEADER);
+-- COPY 4
+```
+
+!!! warning "The path is the coordinator's"
+    `/tmp/users.parquet` is resolved inside the **coordinator** process, not on the
+    machine running `psql`. On the Quick Start cluster that is the coordinator
+    container, so a file produced elsewhere has to be put there first:
+
+    ```bash
+    docker cp users.parquet vairedb-coordinator:/tmp/users.parquet
+    ```
+
+    To move rows to and from your own client instead, use `psql`'s `\copy`, which
+    is CSV-only — see [Bulk load and export](querying.md#bulk-load-and-export) for
+    why Parquet has no streaming form.
+
+## 8. Clean up
+
+```sql
+DROP TABLE users_archive;
 DROP TABLE users;
 ```
 
@@ -90,6 +164,10 @@ DROP TABLE users;
   and sent to that shard's primary and replicas until a quorum acknowledged.
 - Each `SELECT` was planned by the Ballista scheduler, executed as shard-local
   DuckDB scans, streamed back via Arrow Flight, and merged on the coordinator.
+- `COPY … TO` ran its source on that same read path, so the file gathered every
+  shard's rows; `COPY … FROM` decoded the file into batches and re-entered the
+  write path above, so each row was hashed and replicated exactly as a
+  hand-written `INSERT` is.
 
 Follow these flows in detail in
 [Query Processing](../concepts/query-processing.md).

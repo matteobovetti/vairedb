@@ -373,10 +373,12 @@ impl VaireDbQueryHandler {
             // And again for a schema, which is a catalog record like a view's
             // definition — nothing to broadcast, and nothing a ROLLBACK could take
             // back.
-            QueryType::CreateSchema | QueryType::DropSchema => Err(make_vdb_error(
-                VdbErrorCode::FeatureNotSupported,
-                "schema DDL is not supported inside a transaction block: the namespace is written to the coordinator catalog immediately, so ROLLBACK could not undo it. Run the statement outside a transaction block",
-            )),
+            QueryType::CreateSchema | QueryType::DropSchema | QueryType::AlterSchema => {
+                Err(make_vdb_error(
+                    VdbErrorCode::FeatureNotSupported,
+                    "schema DDL is not supported inside a transaction block: the namespace is written to the coordinator catalog immediately, so ROLLBACK could not undo it. Run the statement outside a transaction block",
+                ))
+            }
             // A runtime parameter is allowed inside a block, as in PostgreSQL: it
             // touches no relation, so there is nothing for the block's buffered
             // writes to be inconsistent with. The one form whose scope *is* the

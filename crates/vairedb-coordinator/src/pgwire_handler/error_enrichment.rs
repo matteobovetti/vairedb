@@ -10,7 +10,10 @@ use std::sync::Arc;
 use datafusion::arrow::error::ArrowError;
 use datafusion::error::DataFusionError;
 use pgwire::error::{ErrorInfo, PgWireError};
-use vairedb_common::error::{VaireDbError, sanitize_message, sqlstate_for_code};
+use vairedb_common::error::{
+    TransportedError, TransportedVariant, VaireDbError, code_of_tagged_message,
+    recover_transported_error, sanitize_message, sqlstate_for_code,
+};
 use vairedb_common::proto::vairedb::v1::VdbErrorCode;
 
 use crate::catalog::MetadataCatalog;
@@ -79,10 +82,10 @@ pub fn enrich_coordinator_error(
 /// Enrich an untyped (string-based) error, typically from the engine, by
 /// inferring a `VdbErrorCode` from its message substrings and sanitizing it.
 pub fn enrich_generic_error(e: &dyn Display, ctx: &ErrorContext) -> PgWireError {
-    let msg = e.to_string();
-    let code = classify_generic_error_code(&msg);
+    let raw = e.to_string();
+    let (code, message) = reclassify_transported_error(&raw, classify_generic_error_code(&raw));
     let sqlstate = sqlstate_for_code(code).to_string();
-    let sanitized = sanitize_message(&msg);
+    let sanitized = sanitize_message(&message);
 
     let vdb_error = VaireDbError::new(code, &sanitized);
     let formatted = vdb_error.formatted_message();
@@ -102,10 +105,15 @@ pub fn enrich_generic_error(e: &dyn Display, ctx: &ErrorContext) -> PgWireError 
 /// flattened string sees whichever phrase happens to appear first. Matching the
 /// variant also means a DataFusion upgrade that rewords an error cannot silently
 /// reclassify it — the compiler reports a new variant instead.
+///
+/// The variant is only in hand while the error stayed in this process, which is what
+/// [`reclassify_transported_error`] is for: when it did not, the variant is recovered
+/// from the text the scheduler rendered it into.
 pub fn enrich_datafusion_error(e: &DataFusionError, ctx: &ErrorContext) -> PgWireError {
-    let code = reclassify_transported_data_error(e, classify_datafusion_error_code(e));
+    let raw = e.to_string();
+    let (code, message) = reclassify_transported_error(&raw, classify_datafusion_error_code(e));
     let sqlstate = sqlstate_for_code(code).to_string();
-    let sanitized = sanitize_message(&e.to_string());
+    let sanitized = sanitize_message(&message);
 
     let vdb_error = VaireDbError::new(code, &sanitized);
     let mut info = ErrorInfo::new("ERROR".to_string(), sqlstate, vdb_error.formatted_message());
@@ -231,76 +239,192 @@ fn classify_execution_message(msg: &str) -> VdbErrorCode {
     }
 }
 
-/// Rescue a data error that lost its type crossing the Ballista scheduler boundary.
+/// DataFusion's physical-planner catch-all for a logical expression it will not build a
+/// physical expression for — `not_impl_err!` in `datafusion-physical-expr`.
+const PHYSICAL_EXPR_REFUSAL: &str = "Physical plan does not support logical expression ";
+
+/// What PostgreSQL says when an aggregate appears somewhere aggregates are not evaluated
+/// — inside another aggregate, in `WHERE`, in `GROUP BY`. Every such position is `42803`.
+const AGGREGATE_NOT_ALLOWED: &str = "aggregate functions are not allowed in this context";
+
+/// The same for a window function: nested in another window function, in `WHERE`, in
+/// `GROUP BY` or in `HAVING`. Every such position is `42P20`.
+const WINDOW_NOT_ALLOWED: &str = "window functions are not allowed in this context";
+
+/// Recover the class, and the message, of an error that crossed the Ballista scheduler
+/// boundary and arrived as text.
 ///
-/// The variant-based classifier is the right default: it cannot rot when DataFusion
-/// rewords a message. But it only works while there is a variant to read, and an error
-/// raised inside an executor does not keep one. The scheduler formats the whole failure
-/// into a string, and Ballista returns it under whichever wrapper the call site
-/// happened to use — `Execution` from `DistributedQueryExec`, but wrapped again by
-/// `collect()` on the way out. Depending on which wrapper is on top is depending on an
-/// implementation detail of a dependency; the *rendered message* is the one part of a
-/// transported error that is stable.
+/// Classifying a `DataFusionError` by variant is the right default — it cannot rot when
+/// DataFusion rewords a message — but it only works while there is a variant to read, and
+/// an error raised inside an executor does not keep one. The scheduler renders the whole
+/// failure into a `String` (Ballista's `FailedTask` has nowhere else to put it) and hands
+/// it back under whichever wrapper the call site happened to use. That is why every
+/// executor-side failure used to land `XX000 internal_error`: the one class that tells a
+/// client the *server* broke and the statement is worth retrying, reported for a nested
+/// aggregate that will never succeed however many times it is retried.
 ///
-/// So this runs only when classification already gave up — `EngineError` or
-/// `InternalError`, the two "we do not know" answers — and only for the three named cases
-/// below, where the cost of the wrong answer is concrete: `XX000` tells a driver the server
-/// broke and the statement is worth retrying, and none of these will ever succeed on a
-/// retry. Widening this into a general message-based fallback would erode the reason the
-/// classifier is variant-based, so each case is added by name:
+/// Three things are tried, most authoritative first:
 ///
-/// * **divide-by-zero**, `22012`;
-/// * **a `bytea` input that does not decode**, `22P02` or `22023`. The read path rewrites
-///   `'…'::bytea` into a UDF that runs inside an executor, so a malformed literal raises
-///   there; the write path refuses the same literal at parse time with the same SQLSTATE, and
-///   a client that moves a cast from a `SELECT` to an `INSERT` should not see the code
-///   change. The wording is owned by [`vairedb_common::bytea_in`] rather than repeated here.
-/// * **`nth_value(x, 0)`**, `22016`. A window is evaluated inside an executor, and the guard
-///   that refuses a zero offset raises there, per partition — which is what makes it match
-///   PostgreSQL over an empty input. `22016` is a code PostgreSQL spends on this one
-///   argument of this one function, so reporting `XX000` instead would lose the only signal
-///   that says which argument was wrong. The wording is owned by
-///   [`vairedb_common::nth_value`].
-fn reclassify_transported_data_error(e: &DataFusionError, code: VdbErrorCode) -> VdbErrorCode {
+/// 1. **A `[VDB-…]` tag.** VaireDB's own guards on an executor write their code into the
+///    message (see [`vairedb_common::error::tagged_message`]), so the code is chosen where
+///    the error is raised by the code that knows what went wrong. Nothing here has to
+///    guess, and this beats even a successful variant classification.
+/// 2. **DataFusion's physical-planner catch-all.** `AggregateFunction` or `WindowFunction`
+///    reaching that arm means an aggregate or a window landed in a position the physical
+///    planner does not build one for, which is `42803` / `42P20` and not "unsupported
+///    feature". Every *legal* PostgreSQL form VaireDB has not implemented is refused
+///    earlier, at the coordinator, so nothing legal reaches this arm. The unreadable
+///    `Expr` debug dump is replaced by what PostgreSQL says.
+/// 3. **The variant, recovered from the rendered text.** [`recover_transported_error`]
+///    reads the variant name back out — it survives, because both of Ballista's
+///    renderings spell it — and [`classify_transported`] then applies the *same*
+///    per-variant classification the local path uses. This runs only when classification
+///    already gave up (`EngineError` or `InternalError`, the two "we do not know"
+///    answers), so a variant that is still in hand always wins.
+///
+/// Two wordings are then still owned by the modules that raise them, because their
+/// SQLSTATEs are finer than any variant carries: a `bytea` literal that does not decode
+/// ([`vairedb_common::bytea_in`], `22P02`/`22023`) and `nth_value(x, 0)`
+/// ([`vairedb_common::nth_value`], `22016`, a code PostgreSQL spends on this one argument
+/// of this one function). The divide-by-zero carve-out that used to sit beside them is
+/// gone: step 3 recovers `ArrowError(DivideByZero)` structurally, so matching its `Debug`
+/// spelling by hand is no longer needed.
+fn reclassify_transported_error(raw: &str, code: VdbErrorCode) -> (VdbErrorCode, String) {
+    let recovered = recover_transported_error(raw);
+    // The innermost message a recovery reached, which is the only part of a transported
+    // failure written for a client: everything around it is the job, stage and task
+    // framing the scheduler added. `sanitize_message` cannot reach it on its own, because
+    // it only unwraps a `Debug` dump that is the *whole* message.
+    let innermost = || {
+        recovered
+            .as_ref()
+            .map_or_else(|| raw.to_string(), |r| r.message.clone())
+    };
+
+    if let Some(tagged) = code_of_tagged_message(raw) {
+        return (tagged, innermost());
+    }
+    if let Some(refusal) = reclassify_physical_expr_refusal(raw) {
+        return refusal;
+    }
     if !matches!(
         code,
         VdbErrorCode::EngineError | VdbErrorCode::InternalError
     ) {
-        return code;
+        return (code, raw.to_string());
     }
-    let message = e.to_string();
-    if is_divide_by_zero(&message.to_lowercase()) {
-        return VdbErrorCode::DivisionByZero;
+    if let Some(recovered) = &recovered {
+        let (recovered_code, message) = classify_transported(recovered);
+        if !matches!(
+            recovered_code,
+            VdbErrorCode::EngineError | VdbErrorCode::InternalError
+        ) {
+            return (recovered_code, message);
+        }
     }
-    if let Some(bytea_code) = vairedb_common::bytea_in::error_code_of_message(&message) {
-        return bytea_code;
+    if let Some(bytea_code) = vairedb_common::bytea_in::error_code_of_message(raw) {
+        return (bytea_code, innermost());
     }
-    if let Some(nth_value_code) = vairedb_common::nth_value::error_code_of_message(&message) {
-        return nth_value_code;
+    if let Some(nth_value_code) = vairedb_common::nth_value::error_code_of_message(raw) {
+        return (nth_value_code, innermost());
     }
-    code
+    (code, raw.to_string())
 }
 
-/// Recognize divide-by-zero in an already-lowercased message, in prose or in Rust's
-/// `Debug` spelling.
+/// Turn DataFusion's physical-planner catch-all into the class PostgreSQL gives the
+/// misplaced expression, and PostgreSQL's own wording.
 ///
-/// The `Debug` spelling is not a nicety. An error raised inside a Ballista executor is
-/// serialized by the scheduler before the coordinator ever sees it, and what comes back
-/// is the `Debug` rendering nested a few layers deep:
+/// Matched anywhere in the text rather than at the front, because this arrives wrapped in
+/// however many layers of job, stage and task framing the scheduler added — and the
+/// wording is DataFusion's own, so there is nothing else it could be.
+fn reclassify_physical_expr_refusal(raw: &str) -> Option<(VdbErrorCode, String)> {
+    let at = raw.find(PHYSICAL_EXPR_REFUSAL)?;
+    let expr = &raw[at + PHYSICAL_EXPR_REFUSAL.len()..];
+    if expr.starts_with("AggregateFunction") {
+        Some((
+            VdbErrorCode::GroupingError,
+            AGGREGATE_NOT_ALLOWED.to_string(),
+        ))
+    } else if expr.starts_with("WindowFunction") {
+        Some((VdbErrorCode::WindowingError, WINDOW_NOT_ALLOWED.to_string()))
+    } else {
+        None
+    }
+}
+
+/// Classify a [`TransportedError`] exactly as [`classify_datafusion_error_code`] would
+/// have classified the value it was rendered from, and return the innermost message with
+/// it.
 ///
-/// ```text
-/// Job abc failed: … DataFusionError(Execution("ArrowError(DivideByZero)"))
-/// ```
+/// One arm per variant, deliberately mirroring the local classifier: the point of the
+/// whole exercise is that a client cannot tell from the SQLSTATE whether the error was
+/// raised on the coordinator or on an executor, and the only way to keep that true is for
+/// the two to make the same decision from the same evidence.
+fn classify_transported(e: &TransportedError) -> (VdbErrorCode, String) {
+    // Arrow is the one variant that also rewords, because it is the one whose rendering can
+    // be a bare variant name — see [`classify_arrow_message`]. Every other variant keeps
+    // the message it arrived with.
+    if e.variant == TransportedVariant::Arrow {
+        return classify_arrow_message(&e.message);
+    }
+    let code = match e.variant {
+        TransportedVariant::NotImplemented | TransportedVariant::Substrait => {
+            VdbErrorCode::FeatureNotSupported
+        }
+        TransportedVariant::Sql => VdbErrorCode::SqlSyntaxError,
+        TransportedVariant::Schema => VdbErrorCode::ColumnNotFound,
+        TransportedVariant::Plan => classify_plan_message(&e.message),
+        TransportedVariant::Execution => classify_execution_message(&e.message),
+        TransportedVariant::ResourcesExhausted => VdbErrorCode::WriteQueueFull,
+        TransportedVariant::Io | TransportedVariant::ExecutionJoin | TransportedVariant::Arrow => {
+            VdbErrorCode::EngineError
+        }
+        TransportedVariant::Internal | TransportedVariant::Configuration => {
+            VdbErrorCode::InternalError
+        }
+    };
+    (code, e.message.clone())
+}
+
+/// Recognize divide-by-zero in an already-lowercased message.
 ///
-/// `ArrowError::DivideByZero`'s typed arm in [`classify_arrow_error`] cannot fire on
-/// that, because there is no longer an `ArrowError` to match — only text. Since scans
-/// and projections run distributed, this is the spelling most arithmetic errors on a
-/// real table actually arrive in, so missing it meant `1 / 0` reported `XX000` and
-/// invited a retry that could not succeed. Matching without the spaces covers both.
+/// Both spellings are live: Arrow's `Display` writes "Divide by zero error" and DuckDB
+/// writes "Division by zero". The `Debug` spelling this used to match as well —
+/// `ArrowError(DivideByZero)`, which is what an executor-side division arrives as — is
+/// handled structurally now, by [`reclassify_transported_error`].
 fn is_divide_by_zero(lower: &str) -> bool {
-    lower.contains("divide by zero")
-        || lower.contains("division by zero")
-        || lower.contains("dividebyzero")
+    lower.contains("divide by zero") || lower.contains("division by zero")
+}
+
+/// Classify an [`ArrowError`] that arrives as the text it was rendered to, mapping each
+/// spelling to the same code its typed arm in [`classify_arrow_error`] maps to, and
+/// returning the message a client should read.
+///
+/// Anchored with `starts_with` rather than `contains`, and that matters: the string being
+/// classified *is* the rendering of one `ArrowError`, so its variant name or its `Display`
+/// prefix is at the front. A message that merely mentions a cast is not a cast error, and
+/// scanning for the phrase anywhere would classify it as one.
+///
+/// `DivideByZero` is the one variant with no payload, so recovering it leaves the bare
+/// Rust variant name where a message should be. `sanitize_message` unwraps the others —
+/// `CastError("…")` is a single-field `Debug` dump and reduces to its text — but there is
+/// nothing inside this one to unwrap, so PostgreSQL's own wording is substituted here.
+fn classify_arrow_message(msg: &str) -> (VdbErrorCode, String) {
+    let lower = msg.to_lowercase();
+    let starts_with_any = |spellings: &[&str]| spellings.iter().any(|s| lower.starts_with(*s));
+    if starts_with_any(&["dividebyzero", "divide by zero"]) {
+        (VdbErrorCode::DivisionByZero, "division by zero".to_string())
+    } else if starts_with_any(&["arithmeticoverflow", "arithmetic overflow"]) {
+        (VdbErrorCode::NumericValueOutOfRange, msg.to_string())
+    } else if starts_with_any(&["casterror", "cast error", "parseerror", "parser error"]) {
+        (VdbErrorCode::InvalidTextRepresentation, msg.to_string())
+    } else if starts_with_any(&["notyetimplemented", "not yet implemented"]) {
+        (VdbErrorCode::FeatureNotSupported, msg.to_string())
+    } else if starts_with_any(&["schemaerror", "schema error"]) {
+        (VdbErrorCode::ColumnNotFound, msg.to_string())
+    } else {
+        (VdbErrorCode::EngineError, msg.to_string())
+    }
 }
 
 /// Classify an [`ArrowError`] reached through `DataFusionError::ArrowError`.
@@ -1091,17 +1215,6 @@ mod tests {
                 DataFusionError::Execution("Divide by zero error".into()),
                 VdbErrorCode::DivisionByZero,
             ),
-            // The shape a divide-by-zero actually has after it crosses the Ballista
-            // scheduler: the typed `ArrowError` is gone and only its `Debug` spelling
-            // survives, with no spaces to match on. Copied from a live 5-node cluster.
-            (
-                DataFusionError::Execution(
-                    "Job MUwZj9P failed: Job failed due to stage 1 failed: Task failed due to \
-                     runtime execution error: DataFusionError(Execution(\"ArrowError(DivideByZero)\"))"
-                        .into(),
-                ),
-                VdbErrorCode::DivisionByZero,
-            ),
             (
                 DataFusionError::Execution("Overflow happened".into()),
                 VdbErrorCode::NumericValueOutOfRange,
@@ -1239,8 +1352,8 @@ mod tests {
     /// under a wrapper variant that carries no type information. Every one of these
     /// shapes was observed or is a plausible re-wrap of one that was, and all of them
     /// have to answer `22012` — which is the reason
-    /// [`reclassify_transported_data_error`] reads the rendered message rather than
-    /// trusting the wrapper.
+    /// [`reclassify_transported_error`] recovers the variant from the rendered message
+    /// rather than trusting the wrapper it arrived under.
     #[test]
     fn a_transported_division_by_zero_reports_the_data_error_sqlstate() {
         const BALLISTA: &str = "Job 3QdcFzH failed: Job failed due to stage 1 failed: Task \
@@ -1259,6 +1372,14 @@ mod tests {
             match enrich_datafusion_error(&err, &ErrorContext::default()) {
                 pgwire::error::PgWireError::UserError(info) => {
                     assert_eq!(info.code, "22012", "for {err:?}");
+                    // `ArrowError::DivideByZero` carries no payload, so recovering it
+                    // leaves the bare Rust variant name where a message should be.
+                    assert!(
+                        info.message.ends_with("division by zero"),
+                        "for {err:?}: {}",
+                        info.message
+                    );
+                    assert!(!info.message.contains("Job "), "{}", info.message);
                 }
                 other => panic!("expected UserError, got: {other:?}"),
             }
@@ -1317,6 +1438,177 @@ mod tests {
                 }
                 other => panic!("expected UserError, got: {other:?}"),
             }
+        }
+    }
+
+    /// Wrap `raised` in the framing the Ballista scheduler adds to a failed task —
+    /// measured on a live five-node cluster, and the shape every test below is built on.
+    fn transported_task(raised: &str) -> String {
+        format!(
+            "Job 3QdcFzH failed: Job failed due to stage 1 failed: Task failed due to \
+             runtime execution error: DataFusionError({raised})"
+        )
+    }
+
+    /// The SQLSTATE and message a client is sent for `err`.
+    fn enriched(err: &DataFusionError) -> (String, String) {
+        match enrich_datafusion_error(err, &ErrorContext::default()) {
+            pgwire::error::PgWireError::UserError(info) => (info.code, info.message),
+            other => panic!("expected UserError, got: {other:?}"),
+        }
+    }
+
+    /// The structured half of the fix: a code chosen where the error was raised beats
+    /// every guess made at this end, and the tag itself never reaches the client.
+    #[test]
+    fn a_tagged_code_survives_the_scheduler_and_is_reported_verbatim() {
+        for (code, sqlstate) in [
+            (VdbErrorCode::FeatureNotSupported, "0A000"),
+            (VdbErrorCode::InvalidParameterValue, "22023"),
+            (VdbErrorCode::GroupingError, "42803"),
+        ] {
+            let raised = vairedb_common::error::tagged_message(code, "what the client reads");
+            let err = DataFusionError::Internal(transported_task(&format!("Plan({raised:?})")));
+            let (reported, message) = enriched(&err);
+            assert_eq!(reported, sqlstate, "for {code:?}");
+            assert_eq!(
+                message,
+                format!("[VDB-{}] what the client reads", code as i32)
+            );
+            // Exactly one code, and it is the coordinator's own formatting of it.
+            assert_eq!(message.matches("[VDB-").count(), 1, "{message}");
+        }
+    }
+
+    /// The nested aggregate and the misplaced window function, which are the rows this
+    /// closes. Both reach the *physical* planner — on an executor — and DataFusion refuses
+    /// them with one catch-all that says nothing about which; PostgreSQL says `42803` and
+    /// `42P20`, and used to say `XX000` here.
+    ///
+    /// The unreadable `Expr` debug dump goes with the wrong class: it named DataFusion's
+    /// internal planner rather than anything about the statement.
+    #[test]
+    fn a_misplaced_aggregate_or_window_reports_postgresqls_class_and_wording() {
+        let cases = [
+            (
+                "AggregateFunction(AggregateFunction { func: AggregateUDF { inner: Max { \
+                 signature: Signature { type_signature: UserDefined, volatility: Immutable } } }, \
+                 args: [AggregateFunction(…)] })",
+                "42803",
+                AGGREGATE_NOT_ALLOWED,
+            ),
+            (
+                "WindowFunction(WindowFunction { fun: WindowUDF(WindowUDF { inner: RowNumber { \
+                 signature: Signature { type_signature: Nullary, volatility: Immutable } } }), \
+                 params: WindowFunctionParams { … } })",
+                "42P20",
+                WINDOW_NOT_ALLOWED,
+            ),
+        ];
+
+        for (expr, sqlstate, wording) in cases {
+            let raised = format!("This feature is not implemented: {PHYSICAL_EXPR_REFUSAL}{expr}");
+            // Both of Ballista's renderings, since either can carry this one.
+            for err in [
+                DataFusionError::Execution(format!(
+                    "Job WV0k16o failed: DataFusion error: {raised}"
+                )),
+                DataFusionError::Internal(transported_task(&format!(
+                    "NotImplemented({:?})",
+                    format!("{PHYSICAL_EXPR_REFUSAL}{expr}")
+                ))),
+                // And the local shape, so a plan the coordinator executes itself agrees.
+                DataFusionError::NotImplemented(format!("{PHYSICAL_EXPR_REFUSAL}{expr}")),
+            ] {
+                let (reported, message) = enriched(&err);
+                assert_eq!(reported, sqlstate, "for {err:?}");
+                assert!(message.ends_with(wording), "{message}");
+                for leaked in ["Physical plan", "Signature", "AggregateUDF", "WindowUDF"] {
+                    assert!(!message.contains(leaked), "{leaked} survived: {message}");
+                }
+            }
+        }
+    }
+
+    /// Every other transported failure keeps the class its *variant* means, which is the
+    /// whole point of § 1.3: a client cannot tell from the SQLSTATE which side of the
+    /// scheduler noticed. Each row is the same error the local path already classifies
+    /// this way — `count(DISTINCT a, b)` and a subquery in the select list among them.
+    #[test]
+    fn a_transported_error_keeps_the_class_of_the_variant_it_was_raised_as() {
+        for (raised, want) in [
+            (
+                "NotImplemented(\"count DISTINCT with multiple arguments\")",
+                "0A000",
+            ),
+            (
+                "NotImplemented(\"Physical plan does not support logical expression \
+                 Exists(Exists { .. })\")",
+                "0A000",
+            ),
+            ("Plan(\"No field named nope\")", "42703"),
+            ("Plan(\"table 'nope' not found\")", "42P01"),
+            ("Plan(\"something the planner refused\")", "42601"),
+            ("SQL(ParserError(\"unexpected token\"), None)", "42601"),
+            ("Execution(\"ArrowError(DivideByZero)\")", "22012"),
+            (
+                "Execution(\"ArrowError(CastError(\\\"not a number\\\"))\")",
+                "22P02",
+            ),
+            ("ResourcesExhausted(\"memory budget\")", "53000"),
+        ] {
+            let err = DataFusionError::Internal(transported_task(raised));
+            let (reported, _) = enriched(&err);
+            assert_eq!(reported, want, "for {raised}");
+        }
+    }
+
+    /// The over-reach probe. Recovery runs only where classification gave up, so an error
+    /// whose variant is still in hand is untouched, and text that names no variant keeps
+    /// the answer it already had — a transport failure is still the server's fault.
+    #[test]
+    fn recovery_does_not_reclassify_what_it_was_not_asked_to() {
+        // A variant still in hand: `Plan` wins even though the *message* mentions another.
+        let (reported, _) = enriched(&DataFusionError::Plan(
+            "No function matches 'Execution(x)'".into(),
+        ));
+        assert_eq!(reported, "0A000");
+
+        // Nothing recoverable: an internal failure stays internal rather than being
+        // forced into a class it does not have.
+        for raised in [
+            "Job 3QdcFzH failed: stage 1 failed",
+            "connection refused",
+            "invariant violated: partition count is zero",
+        ] {
+            let (reported, _) = enriched(&DataFusionError::Internal(raised.into()));
+            assert_eq!(reported, "XX000", "for {raised}");
+        }
+    }
+
+    /// An untyped error takes the same route, because a transported failure does not
+    /// always arrive with a `DataFusionError` around it — the write path and the node RPC
+    /// surface both hand back strings.
+    #[test]
+    fn an_untyped_transported_error_is_recovered_too() {
+        let raised = vairedb_common::error::tagged_message(
+            VdbErrorCode::FeatureNotSupported,
+            "percentile_disc with an array of fractions is not supported",
+        );
+        match enrich_generic_error(
+            &transported_task(&format!("Plan({raised:?})")),
+            &ErrorContext::default(),
+        ) {
+            pgwire::error::PgWireError::UserError(info) => {
+                assert_eq!(info.code, "0A000");
+                assert!(
+                    info.message
+                        .ends_with("percentile_disc with an array of fractions is not supported"),
+                    "{}",
+                    info.message
+                );
+            }
+            other => panic!("expected UserError, got: {other:?}"),
         }
     }
 

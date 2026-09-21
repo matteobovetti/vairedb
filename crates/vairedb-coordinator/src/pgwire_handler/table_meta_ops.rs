@@ -21,10 +21,11 @@ use crate::column_types::unserviceable_type_reason;
 use crate::pgwire_handler::constraints;
 use crate::pgwire_handler::constraints::constraints_from_create;
 use crate::pgwire_handler::error_enrichment::make_vdb_error;
+use crate::pgwire_handler::pg_operators::is_byte_order_collation;
 use crate::pgwire_handler::query_router::{
     canonical_table_name, canonicalize_ident, canonicalize_ident_str,
 };
-use pgwire::error::PgWireResult;
+use pgwire::error::{PgWireError, PgWireResult};
 
 /// HMAC-SHA256 hex digests are 64 characters, so an anonymized column must be a
 /// string type able to hold at least this many characters.
@@ -106,10 +107,48 @@ pub(super) fn reject_unserviceable_column_type(
     }
 }
 
-/// [`reject_unserviceable_column_type`] for every column of a `CREATE TABLE`.
+/// Reject a column declared with a collation that is not the byte order VaireDB in fact
+/// compares by.
+///
+/// A `COLLATE` inside an *expression* is refused on both paths already
+/// ([`crate::pgwire_handler::pg_operators::reject_unsupported_collation`],
+/// [`crate::write_sql_cl::reject_duckdb_divergent`]). A column-level one is the same
+/// divergence arriving through the table instead of through the statement: a DDL
+/// broadcast is the client's own AST rendered back to SQL, so `s VARCHAR COLLATE nocase`
+/// would reach the shards and make every comparison on that column case-insensitive
+/// **there** while the coordinator's own — DataFusion, which compares by byte value —
+/// stayed case-sensitive. That is not a slower query, it is two answers to one predicate,
+/// and it would also undo the invariant the shard-side ordering push-down relies on (see
+/// [`crate::scheduler::filter_pushdown`]).
+///
+/// The byte-order names are accepted, because they describe the comparison already in
+/// effect — the same three [`is_byte_order_collation`] accepts everywhere else.
+pub(super) fn reject_unsupported_column_collation(column: &AstColumnDef) -> PgWireResult<()> {
+    for option in &column.options {
+        if let ColumnOption::Collation(collation) = &option.option
+            && !is_byte_order_collation(collation)
+        {
+            return Err(make_vdb_error(
+                VdbErrorCode::FeatureNotSupported,
+                format!(
+                    "column \"{}\" declared COLLATE {collation} is not supported by VaireDB: text \
+                     is compared and ordered by byte value everywhere, and a shard applying its \
+                     own collation instead would not agree with the coordinator; omit the \
+                     COLLATE, or use \"C\"",
+                    column.name.value
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// [`reject_unserviceable_column_type`] and [`reject_unsupported_column_collation`] for
+/// every column of a `CREATE TABLE`.
 pub(super) fn reject_unserviceable_column_types(create: &CreateTable) -> PgWireResult<()> {
     for col in &create.columns {
         reject_unserviceable_column_type(&col.name.value, &col.data_type)?;
+        reject_unsupported_column_collation(col)?;
     }
     Ok(())
 }
@@ -519,6 +558,7 @@ pub(super) fn apply_alter_operation(
                 ));
             }
             reject_unserviceable_column_type(&column_def.name.value, &column_def.data_type)?;
+            reject_unsupported_column_collation(column_def)?;
             table_meta.columns.push(column_def_from_ast(column_def));
         }
         AlterTableOperation::DropColumn {
@@ -529,7 +569,7 @@ pub(super) fn apply_alter_operation(
             for column_name in column_names {
                 let name = &canonicalize_ident(column_name);
                 reject_if_anonymized(table_meta, name, "drop")?;
-                reject_if_indexed(table_meta, name, "drop")?;
+                reject_unrebuildable_index(table_meta, name, "drop", true)?;
                 constraints::reject_drop_of_constrained_column(table_meta, name)?;
                 if *name == table_meta.shard_key {
                     return Err(make_vdb_error(
@@ -545,7 +585,8 @@ pub(super) fn apply_alter_operation(
                     Some(i) => {
                         table_meta.columns.remove(i);
                         // Whatever CHECK covered it goes with it, silently, exactly
-                        // as it does on the shards.
+                        // as it does on the shards. No index can: the guard above
+                        // refused the drop while one was built on the column.
                         constraints::forget_constraints_on_dropped_column(table_meta, name);
                     }
                     None => {
@@ -566,31 +607,35 @@ pub(super) fn apply_alter_operation(
             let old_name = &canonicalize_ident(old_column_name);
             let new_name = &canonicalize_ident(new_column_name);
             reject_if_anonymized(table_meta, old_name, "rename")?;
-            reject_if_indexed(table_meta, old_name, "rename")?;
+            reject_unrebuildable_index(table_meta, old_name, "rename", false)?;
             let col = find_column_mut(table_meta, old_name)?;
             col.name = new_name.clone();
             if table_meta.shard_key == *old_name {
                 table_meta.shard_key = new_name.clone();
             }
             // The shards rewrite a constraint around the new name rather than
-            // dropping it, so the recorded constraints follow the column.
+            // dropping it, so the recorded constraints follow the column — and the
+            // index is rebuilt around the new name, so its column list follows too.
             constraints::rename_column_in_constraints(table_meta, old_name, new_name);
+            rename_column_in_indexes(table_meta, old_name, new_name);
         }
         AlterTableOperation::AlterColumn { column_name, op } => {
             let name = &canonicalize_ident(column_name);
             reject_if_anonymized(table_meta, name, "alter")?;
             // A default lives in the table's metadata and leaves every index valid,
-            // so the shards accept it while one exists. A type or nullability change
-            // rewrites the column, which they refuse.
+            // so the shards accept it while one exists, and nothing has to be
+            // rebuilt. A type or nullability change rewrites the column, which they
+            // refuse while an index stands — a retype even when the index was dropped
+            // in the same transaction, which is what the last argument reports.
             let indexed_verb = match op {
-                AlterColumnOperation::SetDataType { .. } => Some("change the type of"),
+                AlterColumnOperation::SetDataType { .. } => Some(("change the type of", true)),
                 AlterColumnOperation::SetNotNull | AlterColumnOperation::DropNotNull => {
-                    Some("change the nullability of")
+                    Some(("change the nullability of", false))
                 }
                 _ => None,
             };
-            if let Some(verb) = indexed_verb {
-                reject_if_indexed(table_meta, name, verb)?;
+            if let Some((verb, retyping)) = indexed_verb {
+                reject_unrebuildable_index(table_meta, name, verb, retyping)?;
             }
             // A declared constraint blocks a narrower set of changes than an index
             // does, and each for its own reason — see
@@ -662,11 +707,12 @@ fn reject_if_anonymized(table_meta: &TableMeta, name: &str, op: &str) -> PgWireR
     Ok(())
 }
 
-/// A physical index on the shards that stands in the way of a column change, and the
-/// statement that removes it. Two things produce one: a secondary index, and a
-/// constraint VaireDB enforces with an index of its own (see
-/// [`crate::pgwire_handler::constraints`]). The shards cannot tell them apart, so
-/// they block the same operations; only the removal statement differs.
+/// A physical index on the shards, and the statement that removes it. Two things
+/// produce one: a secondary index, and a constraint VaireDB enforces with an index
+/// of its own (see [`crate::pgwire_handler::constraints`]). The shards cannot tell
+/// them apart — both are a dependency on the whole table — so both have to come off
+/// for a column change and both go back on after it; only the removal statement a
+/// client would write differs.
 struct BlockingIndex<'a> {
     name: &'a str,
     /// What to call it in the error: "index" or "constraint".
@@ -675,30 +721,23 @@ struct BlockingIndex<'a> {
     removal: String,
     /// Whether it is built on the column being changed.
     on_this_column: bool,
+    /// Whether it enforces uniqueness, which is what decides whether the rebuild can
+    /// be one transaction.
+    unique: bool,
 }
 
-/// Reject a column-changing `ALTER TABLE` operation (`op` names the verb, e.g.
-/// "drop") on a table that carries an index, naming what to drop first.
-///
-/// **The block is per table, not per column.** The shards' engine treats an index
-/// as a dependency on the whole table: `Dependency Error: Cannot alter entry
-/// "<table>"` comes back for a column the index does not even cover. Only adding a
-/// column and changing a column's default are metadata-only enough to be allowed
-/// while an index exists — see the caller.
-///
-/// Without this check the client gets "ALTER TABLE partially failed: could not
-/// reach N node(s)" — the wrong error, pointing at the cluster instead of at the
-/// index — and the metadata would go on listing an index over a column that no
-/// longer exists under that name or type.
-fn reject_if_indexed(table_meta: &TableMeta, name: &str, op: &str) -> PgWireResult<()> {
-    let blocking: Vec<BlockingIndex<'_>> = table_meta
+/// Every index the shards would have to drop to change a column of this table, in the
+/// order a rebuild takes them off.
+fn blocking_indexes<'a>(table_meta: &'a TableMeta, column: &str) -> Vec<BlockingIndex<'a>> {
+    table_meta
         .indexes
         .iter()
         .map(|idx| BlockingIndex {
             name: &idx.name,
             noun: "index",
             removal: format!("DROP INDEX \"{}\"", idx.name),
-            on_this_column: idx.columns.iter().any(|c| c == name),
+            on_this_column: idx.columns.iter().any(|c| c == column),
+            unique: idx.unique,
         })
         .chain(
             table_meta
@@ -712,31 +751,96 @@ fn reject_if_indexed(table_meta: &TableMeta, name: &str, op: &str) -> PgWireResu
                         "ALTER TABLE {} DROP CONSTRAINT \"{}\"",
                         table_meta.table_name, c.name
                     ),
-                    on_this_column: c.columns.iter().any(|covered| covered == name),
+                    on_this_column: c.columns.iter().any(|covered| covered == column),
+                    // An index-backed constraint is always a unique one: it is the
+                    // only uniqueness the shards can put on a table that has rows.
+                    unique: true,
                 }),
         )
-        .collect();
-    if blocking.is_empty() {
-        return Ok(());
+        .collect()
+}
+
+/// Reject the two column changes an index makes unshippable, naming what to remove
+/// first. Everything else is shipped *around* the indexes — taken off, changed, put
+/// back, inside one transaction per shard — by
+/// [`shard_local_alter_with_index_rebuild`](crate::pgwire_handler::indexes::shard_local_alter_with_index_rebuild).
+///
+/// Both refusals are measured properties of the shards' engine, pinned by
+/// `a_column_change_rebuilds_a_plain_index_in_one_transaction_but_not_a_unique_one`
+/// in `vairedb-core`:
+///
+/// - **A unique index — the table's own or one enforcing a constraint — blocks every
+///   column change.** Its name is not free again until the transaction that dropped
+///   it commits (`An index with the name … already exists!`), so the rebuild cannot
+///   be one transaction. Splitting it in two is what is refused here rather than
+///   shipped: between them the shard would enforce no uniqueness at all, and a
+///   rebuild that then failed — on a lossy retype, or a node that went away — would
+///   leave the catalog promising a constraint nothing holds. The block is per table,
+///   because one unique index anywhere on it is enough.
+/// - **Dropping or retyping the covered column itself.** Those two paths in the
+///   engine consult the column's own index list, which the drop in the same
+///   transaction has not yet updated (`Cannot drop this column` / `Cannot change the
+///   type of this column: an index depends on it!`), so neither can be wrapped even
+///   for a plain index. This is where VaireDB is narrower than PostgreSQL, which
+///   would drop the index along with the column; the index has to be dropped by a
+///   statement of its own first. A rename or a nullability change on the same column
+///   is carried.
+///
+/// Without this the client would get "ALTER TABLE partially failed: could not reach
+/// N node(s)" — the wrong error, pointing at the cluster instead of at the index.
+///
+/// `rewrites_column` marks the two operations of that second kind, which the caller
+/// knows and this function cannot see.
+fn reject_unrebuildable_index(
+    table_meta: &TableMeta,
+    name: &str,
+    op: &str,
+    rewrites_column: bool,
+) -> PgWireResult<()> {
+    let blocking = blocking_indexes(table_meta, name);
+
+    let unique: Vec<&BlockingIndex<'_>> = blocking.iter().filter(|b| b.unique).collect();
+    if !unique.is_empty() {
+        return Err(indexed_column_refusal(
+            name,
+            op,
+            &unique,
+            "the table carries a unique index — its own, or one enforcing a \
+             constraint — and the shards' engine cannot give a unique index its name \
+             back inside the transaction that dropped it, so the index cannot be \
+             rebuilt around the change",
+        ));
     }
-    // One built on this very column is the clearest thing to point at; when none is,
-    // every index on the table has to go, since any one of them blocks the operation.
-    let (reason, blocking) = match blocking.iter().find(|b| b.on_this_column) {
-        Some(index) => (
-            format!("{} \"{}\" is built on it", index.noun, index.name),
-            vec![index],
-        ),
-        None => (
-            "the table carries an index — its own, or one enforcing a constraint — and \
-             the shards' engine refuses to alter a table an index depends on, even a \
-             column no index covers"
-                .to_string(),
-            blocking.iter().collect(),
-        ),
-    };
-    // One gives a statement the client can copy; several cannot, since each removal
-    // statement takes one name.
-    let hint = match blocking.as_slice() {
+
+    if rewrites_column {
+        let covering: Vec<&BlockingIndex<'_>> =
+            blocking.iter().filter(|b| b.on_this_column).collect();
+        if !covering.is_empty() {
+            return Err(indexed_column_refusal(
+                name,
+                op,
+                &covering,
+                "the shards' engine refuses to drop or retype a column an index is \
+                 built on, even inside the transaction that dropped that index",
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+/// The refusal a blocking index produces: what cannot be done, why, and the
+/// statements that clear the way.
+///
+/// One index gives a statement the client can copy; several cannot, since each
+/// removal statement takes one name.
+fn indexed_column_refusal(
+    name: &str,
+    op: &str,
+    blocking: &[&BlockingIndex<'_>],
+    reason: &str,
+) -> PgWireError {
+    let hint = match blocking {
         [only] => format!("{} first", only.removal),
         many => format!(
             "remove all of them first: {}",
@@ -746,10 +850,36 @@ fn reject_if_indexed(table_meta: &TableMeta, name: &str, op: &str) -> PgWireResu
                 .join("; ")
         ),
     };
-    Err(make_vdb_error(
+    // Named when there is one to name: "index \"uq\" is built on it" is what the
+    // client can act on without reading the rest.
+    let reason = match blocking {
+        [only] if only.on_this_column => {
+            format!(
+                "{} \"{}\" is built on it and {reason}",
+                only.noun, only.name
+            )
+        }
+        _ => reason.to_string(),
+    };
+    make_vdb_error(
         VdbErrorCode::FeatureNotSupported,
         format!("cannot {op} column \"{name}\" because {reason}; {hint}"),
-    ))
+    )
+}
+
+/// Follow a `RENAME COLUMN` through the indexes built on the column.
+///
+/// The index is rebuilt around the new name, so the recorded column list has to be
+/// re-keyed or the rebuild would name a column that no longer exists — and a later
+/// change would compare against the wrong one.
+fn rename_column_in_indexes(table_meta: &mut TableMeta, old: &str, new: &str) {
+    for index in &mut table_meta.indexes {
+        for covered in &mut index.columns {
+            if covered == old {
+                *covered = new.to_string();
+            }
+        }
+    }
 }
 
 /// Mutably borrow the column named `name`, or a `ColumnNotFound` error.
@@ -944,6 +1074,60 @@ mod tests {
                 .map(|c| c.data_type.as_str()),
             Some("DECIMAL(10,2)")
         );
+    }
+
+    // --- reject_unsupported_column_collation tests ---
+
+    // A column-level `COLLATE` is the one place a collation reaches a shard without being
+    // looked at: broadcast DDL is the client's own AST re-rendered, and the expression-level
+    // refusal walks expressions only. Byte order is what every layer agrees on, so a column
+    // asking for anything else is refused before the table exists.
+    #[test]
+    fn a_column_collation_that_is_not_byte_order_is_refused() {
+        let create = parse_create("CREATE TABLE t (id INT, s VARCHAR COLLATE nocase)");
+        let err = reject_unserviceable_column_types(&create)
+            .expect_err("a shard applying its own collation would not agree with the coordinator")
+            .to_string();
+        assert!(err.contains("\"s\""), "got: {err}");
+        assert!(err.contains("nocase"), "got: {err}");
+        // And the way out, which is the only collation VaireDB has.
+        assert!(err.contains("\"C\""), "got: {err}");
+    }
+
+    #[test]
+    fn a_column_collated_by_byte_order_is_accepted() {
+        for sql in [
+            "CREATE TABLE t (s VARCHAR COLLATE \"C\")",
+            "CREATE TABLE t (s VARCHAR COLLATE \"POSIX\")",
+            "CREATE TABLE t (s VARCHAR COLLATE ucs_basic)",
+            "CREATE TABLE t (s VARCHAR COLLATE \"default\")",
+            "CREATE TABLE t (s VARCHAR)",
+        ] {
+            assert!(
+                reject_unserviceable_column_types(&parse_create(sql)).is_ok(),
+                "naming the collation VaireDB already uses must not be a refusal: {sql}"
+            );
+        }
+    }
+
+    #[test]
+    fn adding_a_collated_column_is_held_to_the_same_rule() {
+        let mut table = sample_table();
+        let err = apply_alter_operation(
+            &mut table,
+            &parse_alter_ops("ALTER TABLE t ADD COLUMN s VARCHAR COLLATE nocase")[0],
+        )
+        .expect_err("ADD COLUMN reaches the same shards CREATE TABLE does")
+        .to_string();
+        assert!(err.contains("nocase"), "got: {err}");
+        assert!(table.columns.iter().all(|c| c.name != "s"));
+
+        apply_alter_operation(
+            &mut table,
+            &parse_alter_ops("ALTER TABLE t ADD COLUMN ok VARCHAR COLLATE \"C\"")[0],
+        )
+        .expect("byte order is the collation the column would have had anyway");
+        assert!(table.columns.iter().any(|c| c.name == "ok"));
     }
 
     #[test]
@@ -1273,38 +1457,40 @@ mod tests {
         table
     }
 
-    // The shards' engine refuses all three, so catching them here is what turns a
-    // misleading "the broadcast partially failed" into an error naming the index —
-    // and keeps the metadata from listing an index over a column that moved.
-    #[test]
-    fn test_altering_an_indexed_column_is_rejected_naming_the_index() {
-        for sql in [
-            "ALTER TABLE orders DROP COLUMN amount",
-            "ALTER TABLE orders RENAME COLUMN amount TO total",
-            "ALTER TABLE orders ALTER COLUMN amount SET DATA TYPE BIGINT",
-        ] {
-            let mut table = table_with_index_on_amount();
-            let ops = parse_alter_ops(sql);
-            let err = apply_alter_operation(&mut table, &ops[0])
-                .expect_err(&format!("`{sql}` must be rejected"));
-            let msg = err.to_string();
-            assert!(
-                msg.contains("idx_amount"),
-                "`{sql}` must name the index: {msg}"
-            );
-            assert!(
-                msg.contains("DROP INDEX"),
-                "`{sql}` must say what to do: {msg}"
-            );
-        }
+    /// [`table_with_index_on_amount`] with the index made unique — the one shape that
+    /// cannot be rebuilt around a column change.
+    fn table_with_unique_index_on_amount() -> TableMeta {
+        let mut table = table_with_index_on_amount();
+        table.indexes[0].name = "uq_amount".to_string();
+        table.indexes[0].unique = true;
+        table
     }
 
-    // The shards' engine blocks per *table*, not per column: it refuses to alter a
-    // table any index depends on, even for a column the index does not cover. The
-    // error still has to name an index to drop.
+    /// [`sample_table`] with a `UNIQUE` constraint VaireDB enforces with a per-shard
+    /// index — a blocker like the unique index above, but removed by a statement of
+    /// its own.
+    fn table_with_index_backed_constraint() -> TableMeta {
+        let mut table = sample_table();
+        table.constraints.push(crate::catalog::ConstraintMeta {
+            name: "uq_customer".to_string(),
+            kind: crate::catalog::ConstraintKind::Unique as i32,
+            columns: vec!["customer_id".to_string()],
+            definition: "UNIQUE (customer_id)".to_string(),
+            index_backed: true,
+        });
+        table
+    }
+
+    // A plain index no longer freezes the table: the broadcast drops it, applies the
+    // change and builds it again inside one transaction per shard, so the guard has
+    // to stay out of the way — of every column the index does not cover, and of the
+    // changes to the covered one the engine does carry.
     #[test]
-    fn test_altering_an_unindexed_column_of_an_indexed_table_is_rejected() {
+    fn test_a_plain_index_no_longer_blocks_the_changes_the_rebuild_carries() {
         for sql in [
+            "ALTER TABLE orders RENAME COLUMN amount TO total",
+            "ALTER TABLE orders ALTER COLUMN amount SET NOT NULL",
+            "ALTER TABLE orders ALTER COLUMN amount DROP NOT NULL",
             "ALTER TABLE orders DROP COLUMN id",
             "ALTER TABLE orders RENAME COLUMN id TO ident",
             "ALTER TABLE orders ALTER COLUMN id SET DATA TYPE BIGINT",
@@ -1313,14 +1499,72 @@ mod tests {
         ] {
             let mut table = table_with_index_on_amount();
             let ops = parse_alter_ops(sql);
-            let err = apply_alter_operation(&mut table, &ops[0])
-                .expect_err(&format!("`{sql}` must be rejected"));
-            let msg = err.to_string();
-            assert!(
-                msg.contains("idx_amount"),
-                "`{sql}` must name an index to drop: {msg}"
-            );
+            apply_alter_operation(&mut table, &ops[0])
+                .unwrap_or_else(|e| panic!("`{sql}` must be shipped around the index: {e}"));
         }
+    }
+
+    // The two changes the rebuild cannot carry even for a plain index: the shards'
+    // engine drops and retypes a column by consulting the column's own index list,
+    // which the drop in the same transaction has not updated. Catching them here is
+    // what turns a misleading "the broadcast partially failed" into an error naming
+    // the index.
+    #[test]
+    fn test_dropping_or_retyping_an_indexed_column_is_rejected_naming_the_index() {
+        for sql in [
+            "ALTER TABLE orders DROP COLUMN amount",
+            "ALTER TABLE orders ALTER COLUMN amount SET DATA TYPE BIGINT",
+        ] {
+            let mut table = table_with_index_on_amount();
+            let ops = parse_alter_ops(sql);
+            let msg = apply_alter_operation(&mut table, &ops[0])
+                .unwrap_err()
+                .to_string();
+            assert!(msg.contains("idx_amount"), "`{sql}` must name it: {msg}");
+            assert!(msg.contains("DROP INDEX"), "`{sql}`: {msg}");
+        }
+    }
+
+    // A unique index cannot take its name back inside the transaction that dropped
+    // it, so it blocks every column change — per *table*, since one anywhere on it is
+    // enough. An index-backed constraint is the same blocker under another name, and
+    // is removed by a statement of its own.
+    #[test]
+    fn test_a_unique_index_blocks_every_column_change_naming_what_to_remove() {
+        for sql in [
+            "ALTER TABLE orders DROP COLUMN amount",
+            "ALTER TABLE orders RENAME COLUMN amount TO total",
+            "ALTER TABLE orders ALTER COLUMN amount SET DATA TYPE BIGINT",
+            "ALTER TABLE orders ALTER COLUMN id SET NOT NULL",
+            "ALTER TABLE orders ALTER COLUMN id DROP NOT NULL",
+            "ALTER TABLE orders DROP COLUMN id",
+        ] {
+            let ops = parse_alter_ops(sql);
+
+            let mut indexed = table_with_unique_index_on_amount();
+            let msg = apply_alter_operation(&mut indexed, &ops[0])
+                .unwrap_err()
+                .to_string();
+            assert!(msg.contains("uq_amount"), "`{sql}`: {msg}");
+            assert!(msg.contains("DROP INDEX"), "`{sql}`: {msg}");
+
+            let mut constrained = table_with_index_backed_constraint();
+            let msg = apply_alter_operation(&mut constrained, &ops[0])
+                .unwrap_err()
+                .to_string();
+            assert!(msg.contains("uq_customer"), "`{sql}`: {msg}");
+            assert!(msg.contains("DROP CONSTRAINT"), "`{sql}`: {msg}");
+        }
+    }
+
+    // The rebuild names the column as the catalog records it, so a rename that did
+    // not re-key the index would build it against a column that no longer exists.
+    #[test]
+    fn test_renaming_a_column_follows_it_into_the_index() {
+        let mut table = table_with_index_on_amount();
+        let ops = parse_alter_ops("ALTER TABLE orders RENAME COLUMN amount TO total");
+        apply_alter_operation(&mut table, &ops[0]).unwrap();
+        assert_eq!(table.indexes[0].columns, vec!["total".to_string()]);
     }
 
     // Adding a column and changing a default are metadata-only, so the shards apply
@@ -1339,22 +1583,29 @@ mod tests {
         }
     }
 
-    // Several indexes cannot be dropped by one statement, so the error lists them
+    // Several blockers cannot be removed by one statement, so the error lists them
     // all rather than handing over a statement that would leave the rest in place.
+    // The plain index alongside them is not listed: it is not what blocks anything.
     #[test]
-    fn test_every_blocking_index_is_named_when_the_column_is_not_indexed() {
-        let mut table = table_with_index_on_amount();
+    fn test_every_blocking_index_is_named_when_there_is_more_than_one() {
+        let mut table = table_with_index_backed_constraint();
         table.indexes.push(crate::catalog::IndexMeta {
-            name: "idx_customer".to_string(),
-            columns: vec!["customer_id".to_string()],
+            name: "uq_amount".to_string(),
+            columns: vec!["amount".to_string()],
+            unique: true,
+        });
+        table.indexes.push(crate::catalog::IndexMeta {
+            name: "idx_note".to_string(),
+            columns: vec!["note".to_string()],
             unique: false,
         });
         let ops = parse_alter_ops("ALTER TABLE orders DROP COLUMN id");
         let msg = apply_alter_operation(&mut table, &ops[0])
             .expect_err("must be rejected")
             .to_string();
-        assert!(msg.contains("idx_amount"), "{msg}");
-        assert!(msg.contains("idx_customer"), "{msg}");
+        assert!(msg.contains("uq_amount"), "{msg}");
+        assert!(msg.contains("uq_customer"), "{msg}");
+        assert!(!msg.contains("idx_note"), "{msg}");
     }
 
     // --- constraints under column changes ---

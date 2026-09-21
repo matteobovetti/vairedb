@@ -46,10 +46,12 @@ use pgwire::error::{PgWireError, PgWireResult};
 use vairedb_common::proto::vairedb::v1::VdbErrorCode;
 
 use crate::catalog::MetadataCatalog;
+use crate::pgwire_handler::column_labels;
 use crate::pgwire_handler::encoding;
 use crate::pgwire_handler::error_enrichment::{
     ErrorContext, enrich_datafusion_error, make_vdb_error,
 };
+use crate::pgwire_handler::wire_types;
 use crate::pgwire_handler::{parser, query_router};
 use crate::sqlparser::ast::{DescribeAlias, Expr, Statement, UtilityOption, Value, ValueWithSpan};
 
@@ -421,6 +423,11 @@ async fn collect_locally(
 /// PostgreSQL, and the difference is not cosmetic — a client renders the column
 /// row by row, so leaving the newlines inside a cell prints the whole plan on one
 /// line.
+///
+/// Each line also has the plan's own column-label disambiguators taken out of it: a
+/// projection that gives two columns one PostgreSQL label carries the second under a name
+/// holding a `NUL`, which cannot be sent inside a value — libpq reads a text cell up to its
+/// first one. See [`column_labels::without_disambiguators`].
 fn query_plan_batch(batches: &[RecordBatch]) -> PgWireResult<(Schema, Vec<RecordBatch>)> {
     let mut lines: Vec<String> = Vec::new();
 
@@ -432,7 +439,7 @@ fn query_plan_batch(batches: &[RecordBatch]) -> PgWireResult<(Schema, Vec<Record
                 lines.push(stage.to_string());
             }
             for line in plan.and_then(|c| cell(c, row)).unwrap_or("").lines() {
-                lines.push(line.to_string());
+                lines.push(column_labels::without_disambiguators(line).into_owned());
             }
         }
     }
@@ -479,7 +486,7 @@ pub(super) fn result_fields(plan: &LogicalPlan, format: &Format) -> PgWireResult
     // and a Describe that skipped the widening would promise a type Execute then does
     // not send. Neither shape above can hold a `UInt64` today, so this is what keeps
     // that from becoming a silent divergence if one ever does.
-    arrow_pg::datatypes::arrow_schema_to_pg_fields(&encoding::wire_schema(&schema), format, None)
+    wire_types::pg_fields(&encoding::wire_schema(&schema), format)
 }
 
 #[cfg(test)]
@@ -643,16 +650,18 @@ mod tests {
     #[test]
     fn preparation_reaches_the_query_inside_an_explain() {
         let catalog = empty_catalog();
-        let stmt = parse("EXPLAIN SELECT * FROM sales.orders");
+        // Written in a case the catalog key does not keep, so the rewrite is *visible* in the
+        // prepared statement: a name already spelling its reference is left byte-identical
+        // and would prove nothing about whether preparation ran.
+        let stmt = parse("EXPLAIN SELECT * FROM Sales.Orders");
         let inspection = inspection(&stmt).expect("accepted");
         let prepared = prepare(&stmt, &inspection, false, &catalog).expect("prepared");
 
         let inner = explained_query(&prepared).expect("still an EXPLAIN of a query");
-        // `sales.orders` collapsed to the single quoted name that is its catalog
-        // key, which is what the table provider is registered under.
+        // Respelled as the two-part reference the table provider is registered under.
         assert!(
-            inner.to_string().contains("\"sales.orders\""),
-            "the inner query should carry the collapsed name, got: {inner}"
+            inner.to_string().contains("\"sales\".\"orders\""),
+            "the inner query should carry the canonicalized name, got: {inner}"
         );
     }
 }

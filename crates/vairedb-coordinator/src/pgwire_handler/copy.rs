@@ -1,26 +1,38 @@
-//! `COPY ... TO/FROM`: the bulk import/export path, to a server-side CSV file or
-//! to the client over the copy sub-protocol.
+//! `COPY ... TO/FROM`: the bulk import/export path, to a server-side CSV or
+//! Parquet file, or to the client over the copy sub-protocol.
 //!
 //! Every direction is built from parts that already exist, which is what keeps
 //! them consistent with ordinary statements:
 //!
 //! * `COPY <table|query> TO '<file>' | STDOUT` runs the source on the read path —
 //!   so it gathers every shard's rows through the same planner a `SELECT` uses —
-//!   and emits the collected batches as CSV.
-//! * `COPY <table> FROM '<file>' | STDIN` decodes the CSV into record batches and
+//!   and emits the collected batches in the format the statement asked for.
+//! * `COPY <table> FROM '<file>' | STDIN` decodes the file into record batches and
 //!   hands them to the INSERT lane, so every row is routed by its shard key, split
 //!   per shard, and counted exactly like a client `INSERT ... VALUES` would be.
 //!
-//! The two `FROM` forms differ only in who supplies the bytes: both feed one
+//! The two CSV `FROM` forms differ only in who supplies the bytes: both feed one
 //! [`crate::pgwire_handler::copy_stream::CopySink`], which is what makes a file
 //! import and a `\copy` import land identically. A named file is on the
 //! **coordinator's** filesystem, not the client's — that is PostgreSQL's
 //! server-side `COPY` — while `STDIN`/`STDOUT` are the client's own, driven by the
 //! copy sub-protocol in [`crate::pgwire_handler::copy_stream`].
 //!
-//! Only CSV is accepted, and it must be asked for explicitly: PostgreSQL's default
-//! `TEXT` format is a different encoding, and silently writing CSV where a client
-//! expects `TEXT` would corrupt whatever reads the file next.
+//! Two formats are accepted and the statement has to name one of them:
+//!
+//! * `FORMAT CSV`, in either direction and over either transport. It cannot be
+//!   defaulted to, because PostgreSQL's default is its own `TEXT` encoding and
+//!   silently writing CSV where a client expects `TEXT` would corrupt whatever
+//!   reads the file next.
+//! * `FORMAT PARQUET`, for the server-side file forms only — see
+//!   [`crate::pgwire_handler::copy_parquet`] for why a Parquet file is not
+//!   something the copy sub-protocol can carry, and why the format takes no
+//!   options.
+//!
+//! What the two formats *share* is everything about the table: which columns a
+//! file's fields land on ([`target_columns`]), that those columns exist and carry
+//! the shard key ([`validate_target_columns`]), and how a failure part-way through
+//! is reported ([`partial_copy_error`]). Only the decoding differs.
 
 use std::fs::File;
 use std::io::BufWriter;
@@ -29,9 +41,9 @@ use std::sync::Arc;
 use bytes::Bytes;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::csv::WriterBuilder;
-use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
 use pgwire::api::results::{CopyResponse, Response, Tag};
-use pgwire::error::PgWireResult;
+use pgwire::error::{PgWireError, PgWireResult};
 use pgwire::messages::copy::CopyData;
 use tokio::io::AsyncReadExt;
 
@@ -39,6 +51,8 @@ use vairedb_common::proto::vairedb::v1::VdbErrorCode;
 
 use crate::catalog::MetadataCatalog;
 use crate::error::CoordinatorError;
+use crate::pgwire_handler::column_labels;
+use crate::pgwire_handler::copy_parquet;
 use crate::pgwire_handler::copy_stream::CopySink;
 use crate::pgwire_handler::error_enrichment::{
     ErrorContext, enrich_coordinator_error, make_vdb_error,
@@ -78,6 +92,19 @@ impl Default for CsvDialect {
     }
 }
 
+/// The encoding a COPY reads or writes.
+///
+/// The dialect lives *inside* the CSV arm rather than beside the format, because
+/// that is where it has meaning: a Parquet file names and types its own columns, so
+/// there is no `HEADER`, `DELIMITER` or `QUOTE` for a client to choose and a
+/// statement that names one against `FORMAT PARQUET` is refused rather than left
+/// with an option nothing reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum CopyFormat {
+    Csv(CsvDialect),
+    Parquet,
+}
+
 /// What a `COPY ... TO` exports.
 #[derive(Debug, Clone, PartialEq)]
 enum CopyOutSource {
@@ -89,9 +116,11 @@ enum CopyOutSource {
 
 /// Who supplies (or receives) a COPY's bytes.
 ///
-/// The distinction is *only* about the transport: the CSV either side reads and
-/// writes is the same CSV, decoded by the same sink and rendered by the same
-/// writer, so a file and a `\copy` cannot disagree about what a row means.
+/// For CSV the distinction is *only* about the transport: the CSV either side reads
+/// and writes is the same CSV, decoded by the same sink and rendered by the same
+/// writer, so a file and a `\copy` cannot disagree about what a row means. Parquet
+/// has no client form at all — see [`CopyFormat`] and
+/// [`crate::pgwire_handler::copy_parquet`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum CopyEndpoint {
     /// A path on the coordinator's own filesystem — PostgreSQL's server-side form.
@@ -107,23 +136,32 @@ enum CopyPlan {
     Out {
         source: CopyOutSource,
         endpoint: CopyEndpoint,
-        dialect: CsvDialect,
+        format: CopyFormat,
     },
     In {
         table: String,
         /// The columns the file's fields map onto, canonical. Empty means "decide
-        /// from the file's header, or the table's leading columns".
+        /// from the file's own column names, or the table's leading columns".
         columns: Vec<String>,
         endpoint: CopyEndpoint,
-        dialect: CsvDialect,
+        format: CopyFormat,
     },
 }
 
-/// Bytes read from a file per `COPY ... FROM '<file>'` step.
+/// Bytes read from a file per `COPY ... FROM '<file>' (FORMAT CSV)` step.
 ///
 /// The sink buffers rows, not bytes, so this only bounds how much of the file is
 /// in flight at once; it is a read size, chosen to be a few filesystem blocks.
 const FILE_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Rows decoded before a batch of an import is handed to the INSERT lane.
+///
+/// A multiple of the INSERT lane's own chunk size, so a batch turns into whole
+/// statements rather than one full chunk and a remainder. Ten of them is the
+/// trade-off between round trips to the shards and how much of the client's data is
+/// held in the coordinator at once. Shared by both formats so that the same data
+/// imports in the same number of statements whichever file it arrived in.
+pub(super) const ROWS_PER_BATCH: usize = 10 * write_sql_cl::ROWS_PER_STATEMENT;
 
 impl VaireDbQueryHandler {
     /// Run a `COPY`, in whichever of the four directions the statement named.
@@ -141,24 +179,16 @@ impl VaireDbQueryHandler {
             CopyPlan::Out {
                 source,
                 endpoint,
-                dialect,
-            } => self.copy_out(&source, &endpoint, &dialect).await,
+                format,
+            } => self.copy_out(&source, &endpoint, &format).await,
             CopyPlan::In {
                 table,
                 columns,
                 endpoint,
-                dialect,
+                format,
             } => {
-                let sink = self.open_copy_sink(&table, &columns, &dialect).await?;
-                match endpoint {
-                    CopyEndpoint::File(path) => {
-                        let rows = self.copy_from_file(sink, &path, session).await?;
-                        Ok(Response::Execution(
-                            Tag::new("COPY").with_rows(rows as usize),
-                        ))
-                    }
-                    CopyEndpoint::Client => Ok(begin_copy_from_client(sink, session).await),
-                }
+                self.copy_in(&table, &columns, &endpoint, &format, session)
+                    .await
             }
         }
     }
@@ -171,7 +201,7 @@ impl VaireDbQueryHandler {
         &self,
         source: &CopyOutSource,
         endpoint: &CopyEndpoint,
-        dialect: &CsvDialect,
+        format: &CopyFormat,
     ) -> PgWireResult<Response> {
         let query = match source {
             CopyOutSource::Table { name, columns } => {
@@ -193,14 +223,22 @@ impl VaireDbQueryHandler {
         };
 
         let (schema, batches) = self.collect_query_rows(&query, &[]).await?;
+        // A header names the columns, so it is a place a label reaches a client, and it has
+        // to name them the way a `SELECT`'s RowDescription does. See
+        // [`collapse_anonymous_labels`].
+        let (schema, batches) = collapse_anonymous_labels(schema, batches)?;
 
-        match endpoint {
-            CopyEndpoint::File(path) => {
-                let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        let rows: usize = batches.iter().map(RecordBatch::num_rows).sum();
+        match (endpoint, format) {
+            (CopyEndpoint::File(path), CopyFormat::Csv(dialect)) => {
                 write_csv_file(path.clone(), batches, dialect.clone()).await?;
                 Ok(Response::Execution(Tag::new("COPY").with_rows(rows)))
             }
-            CopyEndpoint::Client => {
+            (CopyEndpoint::File(path), CopyFormat::Parquet) => {
+                copy_parquet::write_file(path.clone(), schema, batches).await?;
+                Ok(Response::Execution(Tag::new("COPY").with_rows(rows)))
+            }
+            (CopyEndpoint::Client, CopyFormat::Csv(dialect)) => {
                 let columns = schema.fields().len();
                 let chunks = csv_row_messages(&schema, &batches, dialect)?;
                 // Format 0 is the textual one, which is what CSV is. pgwire drives
@@ -212,16 +250,55 @@ impl VaireDbQueryHandler {
                     futures::stream::iter(chunks.into_iter().map(Ok)),
                 )))
             }
+            // Refused by [`plan_copy`], which is the only way a plan is built.
+            (CopyEndpoint::Client, CopyFormat::Parquet) => Err(make_vdb_error(
+                VdbErrorCode::InternalError,
+                "COPY ... TO STDOUT (FORMAT PARQUET) reached the export path",
+            )),
         }
     }
 
-    async fn open_copy_sink(
+    /// Import into a table, from a file on the coordinator or from the client.
+    ///
+    /// Three of the four combinations exist: CSV from a file, CSV from the client,
+    /// and Parquet from a file. All three end in the INSERT lane, so an imported row
+    /// is routed, split per shard and counted like any other written row — what
+    /// differs is only how the bytes became a batch.
+    async fn copy_in(
         &self,
         table: &str,
         columns: &[String],
-        dialect: &CsvDialect,
-    ) -> PgWireResult<CopySink> {
-        open_copy_sink(&self.catalog, table, columns, dialect)
+        endpoint: &CopyEndpoint,
+        format: &CopyFormat,
+        session: &SessionState,
+    ) -> PgWireResult<Response> {
+        match (endpoint, format) {
+            (CopyEndpoint::File(path), CopyFormat::Parquet) => {
+                let rows = self
+                    .copy_from_parquet_file(table, columns, path, session)
+                    .await?;
+                Ok(Response::Execution(
+                    Tag::new("COPY").with_rows(rows as usize),
+                ))
+            }
+            (endpoint, CopyFormat::Csv(dialect)) => {
+                let sink = open_copy_sink(&self.catalog, table, columns, dialect)?;
+                match endpoint {
+                    CopyEndpoint::File(path) => {
+                        let rows = self.copy_from_file(sink, path, session).await?;
+                        Ok(Response::Execution(
+                            Tag::new("COPY").with_rows(rows as usize),
+                        ))
+                    }
+                    CopyEndpoint::Client => Ok(begin_copy_from_client(sink, session).await),
+                }
+            }
+            // Refused by [`plan_copy`], which is the only way a plan is built.
+            (CopyEndpoint::Client, CopyFormat::Parquet) => Err(make_vdb_error(
+                VdbErrorCode::InternalError,
+                "COPY ... FROM STDIN (FORMAT PARQUET) reached the import path",
+            )),
+        }
     }
 
     /// Feed a file on the coordinator's disk to `sink`, returning the rows written.
@@ -235,15 +312,7 @@ impl VaireDbQueryHandler {
         path: &str,
         session: &SessionState,
     ) -> PgWireResult<u64> {
-        // Checked before opening so that a directory — which opens fine and reads
-        // as an error only later — is reported as what it is.
-        let metadata = std::fs::metadata(path).map_err(|e| file_error("read", path, &e))?;
-        if !metadata.is_file() {
-            return Err(make_vdb_error(
-                VdbErrorCode::InternalError,
-                format!("COPY could not read \"{path}\" on the coordinator: not a file"),
-            ));
-        }
+        readable_file(path)?;
 
         let mut file = tokio::fs::File::open(path)
             .await
@@ -261,10 +330,103 @@ impl VaireDbQueryHandler {
         }
         sink.finish(self, session).await
     }
+
+    /// Import a Parquet file on the coordinator's disk, returning the rows written.
+    ///
+    /// The file decides the column mapping — it names its own columns — so that is
+    /// settled and validated before a batch is read, and a file the table cannot
+    /// take is refused with nothing written. From there each batch goes straight to
+    /// the INSERT lane, one at a time, so a file larger than memory imports without
+    /// ever being held whole.
+    async fn copy_from_parquet_file(
+        &self,
+        table: &str,
+        columns: &[String],
+        path: &str,
+        session: &SessionState,
+    ) -> PgWireResult<u64> {
+        let ctx = ErrorContext::for_table(table);
+        let table_meta = self
+            .catalog
+            .get_table(table)
+            .map_err(|e| enrich_coordinator_error(&e, &ctx, &self.catalog))?
+            .ok_or_else(|| {
+                let err = CoordinatorError::TableNotFound(table.to_string());
+                enrich_coordinator_error(&err, &ctx, &self.catalog)
+            })?;
+
+        readable_file(path)?;
+        let mut file = copy_parquet::ParquetFile::open(path).await?;
+        let template = copy_parquet::insert_template(table, columns, file.fields(), &table_meta)?;
+
+        // Counted outside the loop so a failure part-way can say how much of the
+        // file is already stored — there is no cross-shard rollback to undo it with.
+        let mut rows = 0u64;
+        match self
+            .import_parquet_batches(&mut file, &template, table, session, &mut rows)
+            .await
+        {
+            Ok(()) => Ok(rows),
+            Err(e) => Err(partial_copy_error(table, rows, e)),
+        }
+    }
+
+    /// Ship every remaining batch of `file` through the INSERT lane, adding what each
+    /// wrote to `rows`.
+    async fn import_parquet_batches(
+        &self,
+        file: &mut copy_parquet::ParquetFile,
+        template: &Statement,
+        table: &str,
+        session: &SessionState,
+        rows: &mut u64,
+    ) -> PgWireResult<()> {
+        while let Some(batch) = file.next_batch().await? {
+            let statements = copy_parquet::insert_statements(template, &batch)?;
+            *rows += self
+                .write_row_statements(&statements, &[], session, table, "COPY")
+                .await?;
+        }
+        Ok(())
+    }
 }
 
-/// The sink a `COPY ... FROM` feeds, with everything decidable before a byte
-/// arrives already decided: the table exists, and a column list the statement
+/// Check that `path` names something the coordinator can read rows out of.
+///
+/// Checked before opening so that a directory — which opens fine and reads as an
+/// error only later, differently per format — is reported as what it is.
+fn readable_file(path: &str) -> PgWireResult<()> {
+    let metadata = std::fs::metadata(path).map_err(|e| file_error("read", path, &e))?;
+    if !metadata.is_file() {
+        return Err(make_vdb_error(
+            VdbErrorCode::InternalError,
+            format!("COPY could not read \"{path}\" on the coordinator: not a file"),
+        ));
+    }
+    Ok(())
+}
+
+/// Report a failed `COPY ... FROM` honestly: as a partial commit once rows are
+/// stored, and as itself while nothing is.
+///
+/// Shared by both import lanes because the guarantee is the same in both. VaireDB
+/// has no cross-shard commit protocol, so a batch that fails after earlier batches
+/// shipped leaves those rows written — saying so is the whole point, since a client
+/// that retries needs to know the table is not as it was.
+pub(super) fn partial_copy_error(table: &str, rows: u64, e: PgWireError) -> PgWireError {
+    if rows == 0 {
+        return e;
+    }
+    make_vdb_error(
+        VdbErrorCode::PartialCommit,
+        format!(
+            "COPY partially applied: {rows} row(s) were written to \"{table}\" and cannot be undone, then the copy failed. Inspect the table before retrying. Cause: {e}"
+        ),
+    )
+}
+
+/// The sink a `COPY ... FROM (FORMAT CSV)` feeds, with everything decidable before
+/// a byte arrives already decided: the table exists, and a column list the statement
 /// spelled out names real columns and carries the shard key.
 fn open_copy_sink(
     catalog: &Arc<MetadataCatalog>,
@@ -302,6 +464,10 @@ fn open_copy_sink(
 /// Only `FROM STDIN` is checked. The other three directions do not invite the
 /// client to send anything, so nothing about them is riding on when they refuse,
 /// and Execute is where they stay.
+///
+/// `plan_copy` runs either way, which is what makes `FROM STDIN (FORMAT PARQUET)`
+/// land here too: a format with no streaming form is refused while the statement is
+/// still being prepared, for exactly the reason above.
 pub(super) fn precheck_copy_from_stdin(
     stmt: &Statement,
     catalog: &Arc<MetadataCatalog>,
@@ -310,7 +476,7 @@ pub(super) fn precheck_copy_from_stdin(
         table,
         columns,
         endpoint: CopyEndpoint::Client,
-        dialect,
+        format: CopyFormat::Csv(dialect),
     } = plan_copy(stmt)?
     {
         open_copy_sink(catalog, &table, &columns, &dialect)?;
@@ -369,6 +535,55 @@ fn csv_row_messages(
     }
 
     Ok(messages)
+}
+
+/// Give every anonymous result column back the one name PostgreSQL has for it.
+///
+/// A `COPY (SELECT a + 1, b + 1) TO … WITH (HEADER)` writes a header out of the **batches'**
+/// own schema rather than out of the wire schema a `SELECT` describes from, so the
+/// numbering [`super::column_labels`] uses to keep those two columns distinct inside the
+/// plan would otherwise be visible here — `?column?,?column?2` where PostgreSQL writes
+/// `?column?,?column?`. The batches are rebuilt rather than the schema alone, because the
+/// CSV writer reads the names off the batch it is handed.
+///
+/// A statement with nothing to rename comes back untouched, which is every `COPY` of a
+/// table and every query whose columns are named. Names are all that changes — not the
+/// types [`super::encoding::wire_schema`] also converts, since CSV renders a value rather
+/// than declaring it and the batches would then no longer match their own schema.
+fn collapse_anonymous_labels(
+    schema: SchemaRef,
+    batches: Vec<RecordBatch>,
+) -> PgWireResult<(SchemaRef, Vec<RecordBatch>)> {
+    if !schema
+        .fields()
+        .iter()
+        .any(|f| column_labels::wire_label(f.name()).is_some())
+    {
+        return Ok((schema, batches));
+    }
+    let fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|f| match column_labels::wire_label(f.name()) {
+            Some(name) => f.as_ref().clone().with_name(name),
+            None => f.as_ref().clone(),
+        })
+        .collect();
+    let collapsed = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
+    let batches = batches
+        .into_iter()
+        .map(|batch| {
+            RecordBatch::try_new(SchemaRef::clone(&collapsed), batch.columns().to_vec()).map_err(
+                |e| {
+                    make_vdb_error(
+                        VdbErrorCode::InternalError,
+                        format!("COPY could not label a result column: {e}"),
+                    )
+                },
+            )
+        })
+        .collect::<PgWireResult<Vec<_>>>()?;
+    Ok((collapsed, batches))
 }
 
 /// One batch rendered as CSV, optionally preceded by the column-name header.
@@ -437,7 +652,17 @@ fn plan_copy(stmt: &Statement) -> PgWireResult<CopyPlan> {
     };
 
     let endpoint = copy_endpoint(target)?;
-    let dialect = csv_dialect(options, legacy_options)?;
+    let format = copy_format(options, legacy_options)?;
+
+    // A Parquet file is not a sequence of rows, so there is no streaming form of it
+    // to route. Refused here rather than at the transfer, which is what lets the
+    // Parse-time pre-check catch it — see [`precheck_copy_from_stdin`].
+    if format == CopyFormat::Parquet && endpoint == CopyEndpoint::Client {
+        return Err(make_vdb_error(
+            VdbErrorCode::FeatureNotSupported,
+            "COPY ... FROM STDIN / TO STDOUT (FORMAT PARQUET) is not supported by VaireDB: a Parquet file's footer is written last and has to be read first, so the bytes are not the row-at-a-time stream the copy protocol carries. Name a file on the coordinator with COPY ... TO/FROM '<file>' (FORMAT PARQUET), or stream with (FORMAT CSV)",
+        ));
+    }
 
     // `COPY t FROM STDIN ...;` puts the rows after the statement's semicolon, and
     // the parser reads whatever follows it in the same buffer as inline data. On a
@@ -476,7 +701,7 @@ fn plan_copy(stmt: &Statement) -> PgWireResult<CopyPlan> {
         return Ok(CopyPlan::Out {
             source,
             endpoint,
-            dialect,
+            format,
         });
     }
 
@@ -501,7 +726,7 @@ fn plan_copy(stmt: &Statement) -> PgWireResult<CopyPlan> {
         })?,
         columns: columns.iter().map(canonicalize_ident).collect(),
         endpoint,
-        dialect,
+        format,
     })
 }
 
@@ -521,30 +746,43 @@ fn copy_endpoint(target: &CopyTarget) -> PgWireResult<CopyEndpoint> {
     }
 }
 
-/// The CSV dialect asked for by a COPY's options, in either the modern
+/// The format asked for by a COPY's options, in either the modern
 /// `(FORMAT CSV, HEADER)` spelling or the legacy `CSV HEADER` one.
 ///
-/// `FORMAT CSV` is required rather than defaulted: PostgreSQL's default is `TEXT`,
-/// a different encoding, and a client that omitted the format is expecting that
-/// one. An option VaireDB does not honor is refused by name — accepting and
-/// ignoring `NULL 'x'` or `FORCE_QUOTE` would write a file that does not say what
-/// the client asked it to say.
-fn csv_dialect(
+/// `FORMAT` is required rather than defaulted: PostgreSQL's default is `TEXT`, a
+/// different encoding from either of the two VaireDB writes, and a client that
+/// omitted the format is expecting that one. An option VaireDB does not honor is
+/// refused by name — accepting and ignoring `NULL 'x'` or `FORCE_QUOTE` would write
+/// a file that does not say what the client asked it to say.
+///
+/// The format is settled last, after every option has been read, so that the
+/// refusals do not depend on the order the client wrote them in: `(HEADER, FORMAT
+/// PARQUET)` is the same statement as `(FORMAT PARQUET, HEADER)` and both name an
+/// option Parquet has nothing to apply it to.
+fn copy_format(
     options: &[CopyOption],
     legacy_options: &[CopyLegacyOption],
-) -> PgWireResult<CsvDialect> {
+) -> PgWireResult<CopyFormat> {
+    let mut named: Option<&str> = None;
     let mut dialect = CsvDialect::default();
-    let mut csv_requested = false;
+    // Options that only mean something for CSV, in the spelling the client used.
+    let mut csv_only: Vec<&str> = Vec::new();
 
     for option in options {
         match option {
-            CopyOption::Format(name) if name.value.eq_ignore_ascii_case("csv") => {
-                csv_requested = true;
+            CopyOption::Format(name) => named = Some(&name.value),
+            CopyOption::Header(header) => {
+                dialect.header = *header;
+                csv_only.push("HEADER");
             }
-            CopyOption::Format(name) => return Err(unsupported_format(&name.value)),
-            CopyOption::Header(header) => dialect.header = *header,
-            CopyOption::Delimiter(c) => dialect.delimiter = single_byte("DELIMITER", *c)?,
-            CopyOption::Quote(c) => dialect.quote = single_byte("QUOTE", *c)?,
+            CopyOption::Delimiter(c) => {
+                dialect.delimiter = single_byte("DELIMITER", *c)?;
+                csv_only.push("DELIMITER");
+            }
+            CopyOption::Quote(c) => {
+                dialect.quote = single_byte("QUOTE", *c)?;
+                csv_only.push("QUOTE");
+            }
             other => return Err(unsupported_option(&other.to_string())),
         }
     }
@@ -552,7 +790,7 @@ fn csv_dialect(
     for option in legacy_options {
         match option {
             CopyLegacyOption::Csv(csv_options) => {
-                csv_requested = true;
+                named = Some("CSV");
                 for csv_option in csv_options {
                     match csv_option {
                         CopyLegacyCsvOption::Header => dialect.header = true,
@@ -563,38 +801,66 @@ fn csv_dialect(
                     }
                 }
             }
+            // The legacy spelling of `FORMAT BINARY`, which is neither of the two.
             CopyLegacyOption::Binary => return Err(unsupported_format("BINARY")),
             CopyLegacyOption::Delimiter(c) => {
                 dialect.delimiter = single_byte("DELIMITER", *c)?;
+                csv_only.push("DELIMITER");
             }
             other => return Err(unsupported_option(&other.to_string())),
         }
     }
 
-    if !csv_requested {
+    let Some(named) = named else {
         return Err(make_vdb_error(
             VdbErrorCode::FeatureNotSupported,
-            "COPY without FORMAT CSV is not supported by VaireDB: PostgreSQL's default TEXT format is a different encoding, so it is refused rather than written as CSV. Add (FORMAT CSV)",
+            "COPY without a FORMAT is not supported by VaireDB: PostgreSQL's default TEXT format is a different encoding, so it is refused rather than written as something else. Add (FORMAT CSV) or (FORMAT PARQUET)",
         ));
-    }
+    };
 
-    Ok(dialect)
+    if named.eq_ignore_ascii_case("csv") {
+        return Ok(CopyFormat::Csv(dialect));
+    }
+    if !named.eq_ignore_ascii_case("parquet") {
+        return Err(unsupported_format(named));
+    }
+    if let Some(option) = csv_only.first() {
+        return Err(csv_only_option(option));
+    }
+    Ok(CopyFormat::Parquet)
 }
 
 /// `0A000` for a format VaireDB cannot read or write.
-fn unsupported_format(name: &str) -> pgwire::error::PgWireError {
+fn unsupported_format(name: &str) -> PgWireError {
     make_vdb_error(
         VdbErrorCode::FeatureNotSupported,
-        format!("COPY format {name} is not supported by VaireDB: only CSV is. Use (FORMAT CSV)"),
+        format!(
+            "COPY format {name} is not supported by VaireDB: only CSV and PARQUET are. Use (FORMAT CSV) or (FORMAT PARQUET)"
+        ),
     )
 }
 
 /// `0A000` for an option VaireDB would have to ignore.
-fn unsupported_option(rendered: &str) -> pgwire::error::PgWireError {
+fn unsupported_option(rendered: &str) -> PgWireError {
     make_vdb_error(
         VdbErrorCode::FeatureNotSupported,
         format!(
-            "COPY option `{rendered}` is not supported by VaireDB, and is refused rather than ignored: a file written or read against options that were dropped would not hold what the statement said. Supported options are FORMAT CSV, HEADER, DELIMITER and QUOTE"
+            "COPY option `{rendered}` is not supported by VaireDB, and is refused rather than ignored: a file written or read against options that were dropped would not hold what the statement said. Supported options are FORMAT CSV, FORMAT PARQUET, and HEADER, DELIMITER and QUOTE for CSV"
+        ),
+    )
+}
+
+/// `0A000` for a CSV option named against `FORMAT PARQUET`.
+///
+/// Refused rather than ignored for the same reason as any other dropped option, and
+/// the message says what makes it meaningless rather than only that it is: a client
+/// that reached for `HEADER` was asking for column names, which a Parquet file
+/// already carries.
+fn csv_only_option(option: &str) -> PgWireError {
+    make_vdb_error(
+        VdbErrorCode::FeatureNotSupported,
+        format!(
+            "COPY option `{option}` is not supported by VaireDB with FORMAT PARQUET, and is refused rather than ignored: a Parquet file names and types its own columns, so HEADER, DELIMITER and QUOTE have nothing to apply to. Drop the option, or use (FORMAT CSV)"
         ),
     )
 }
@@ -772,11 +1038,7 @@ async fn write_csv_file(
 /// A file the coordinator could not read or write, named with the cause. The
 /// coordinator's filesystem is the one that matters here, so the message says so:
 /// a client looking for the file on its own machine will not find it.
-fn file_error(
-    verb: &str,
-    path: &str,
-    cause: &impl std::fmt::Display,
-) -> pgwire::error::PgWireError {
+pub(super) fn file_error(verb: &str, path: &str, cause: &impl std::fmt::Display) -> PgWireError {
     make_vdb_error(
         VdbErrorCode::InternalError,
         format!("COPY could not {verb} \"{path}\" on the coordinator: {cause}"),
@@ -816,10 +1078,10 @@ mod tests {
                     columns: vec![],
                 },
                 endpoint: CopyEndpoint::File("/tmp/orders.csv".to_string()),
-                dialect: CsvDialect {
+                format: CopyFormat::Csv(CsvDialect {
                     header: true,
                     ..Default::default()
-                },
+                }),
             }
         );
     }
@@ -836,7 +1098,7 @@ mod tests {
                     columns: vec!["id".to_string(), "V".to_string()],
                 },
                 endpoint: CopyEndpoint::File("/tmp/o.csv".to_string()),
-                dialect: CsvDialect::default(),
+                format: CopyFormat::Csv(CsvDialect::default()),
             }
         );
     }
@@ -849,10 +1111,10 @@ mod tests {
                 table: "orders".to_string(),
                 columns: vec!["id".to_string(), "v".to_string()],
                 endpoint: CopyEndpoint::File("/tmp/orders.csv".to_string()),
-                dialect: CsvDialect {
+                format: CopyFormat::Csv(CsvDialect {
                     header: true,
                     ..Default::default()
-                },
+                }),
             }
         );
     }
@@ -885,10 +1147,10 @@ mod tests {
                     columns: vec![],
                 },
                 endpoint: CopyEndpoint::Client,
-                dialect: CsvDialect {
+                format: CopyFormat::Csv(CsvDialect {
                     header: true,
                     ..Default::default()
-                },
+                }),
             }
         );
     }
@@ -904,10 +1166,10 @@ mod tests {
                 table: "orders".to_string(),
                 columns: vec!["id".to_string(), "v".to_string()],
                 endpoint: CopyEndpoint::Client,
-                dialect: CsvDialect {
+                format: CopyFormat::Csv(CsvDialect {
                     header: true,
                     ..Default::default()
-                },
+                }),
             }
         );
     }
@@ -983,23 +1245,102 @@ mod tests {
                     columns: vec![],
                 },
                 endpoint: CopyEndpoint::File("/tmp/o.csv".to_string()),
-                dialect: CsvDialect {
+                format: CopyFormat::Csv(CsvDialect {
                     header: true,
                     ..Default::default()
-                },
+                }),
             }
         );
     }
 
     #[test]
     fn a_delimiter_and_quote_are_carried_into_the_dialect() {
-        let CopyPlan::Out { dialect, .. } =
-            plan("COPY orders TO '/tmp/o.csv' (FORMAT CSV, DELIMITER ';', QUOTE '''')")
+        let CopyPlan::Out {
+            format: CopyFormat::Csv(dialect),
+            ..
+        } = plan("COPY orders TO '/tmp/o.csv' (FORMAT CSV, DELIMITER ';', QUOTE '''')")
         else {
-            panic!("expected an export");
+            panic!("expected a CSV export");
         };
         assert_eq!(dialect.delimiter, b';');
         assert_eq!(dialect.quote, b'\'');
+    }
+
+    // --- FORMAT PARQUET ---
+
+    // A Parquet export plans exactly like a CSV one: the format is a property of the
+    // file being written, not of what is being read out of the table.
+    #[test]
+    fn copy_to_a_parquet_file_plans_an_export() {
+        assert_eq!(
+            plan("COPY orders TO '/tmp/orders.parquet' (FORMAT PARQUET)"),
+            CopyPlan::Out {
+                source: CopyOutSource::Table {
+                    name: "orders".to_string(),
+                    columns: vec![],
+                },
+                endpoint: CopyEndpoint::File("/tmp/orders.parquet".to_string()),
+                format: CopyFormat::Parquet,
+            }
+        );
+    }
+
+    #[test]
+    fn copy_from_a_parquet_file_plans_an_import() {
+        assert_eq!(
+            plan("COPY orders (id, v) FROM '/tmp/orders.parquet' (FORMAT PARQUET)"),
+            CopyPlan::In {
+                table: "orders".to_string(),
+                columns: vec!["id".to_string(), "v".to_string()],
+                endpoint: CopyEndpoint::File("/tmp/orders.parquet".to_string()),
+                format: CopyFormat::Parquet,
+            }
+        );
+    }
+
+    // A Parquet file's footer is written last and has to be read first, so the bytes
+    // are not the row-at-a-time stream the copy protocol carries. Refused at planning
+    // time, before the client is told to start sending or expecting data.
+    #[test]
+    fn parquet_over_the_copy_protocol_is_refused() {
+        for sql in [
+            "COPY orders TO STDOUT (FORMAT PARQUET)",
+            "COPY orders FROM STDIN (FORMAT PARQUET);",
+        ] {
+            let (code, msg) = rejection(sql);
+            assert_eq!(code, "0A000", "`{sql}`");
+            assert!(msg.contains("footer"), "`{sql}` got: {msg}");
+            assert!(msg.contains("FORMAT CSV"), "`{sql}` got: {msg}");
+        }
+    }
+
+    // A Parquet file names and types its own columns, so these options have nothing to
+    // act on. The order of the options must not matter: the format decides which ones
+    // are meaningful, and it can be stated after them.
+    #[test]
+    fn a_csv_only_option_is_refused_for_parquet_in_either_order() {
+        for (sql, named) in [
+            (
+                "COPY orders TO '/tmp/o.parquet' (FORMAT PARQUET, HEADER)",
+                "HEADER",
+            ),
+            (
+                "COPY orders TO '/tmp/o.parquet' (HEADER, FORMAT PARQUET)",
+                "HEADER",
+            ),
+            (
+                "COPY orders FROM '/tmp/o.parquet' (FORMAT PARQUET, DELIMITER '|')",
+                "DELIMITER",
+            ),
+            (
+                "COPY orders FROM '/tmp/o.parquet' (QUOTE '\"', FORMAT PARQUET)",
+                "QUOTE",
+            ),
+        ] {
+            let (code, msg) = rejection(sql);
+            assert_eq!(code, "0A000", "`{sql}`");
+            assert!(msg.contains(named), "`{sql}` got: {msg}");
+        }
     }
 
     // --- target_columns ---
@@ -1313,6 +1654,9 @@ mod tests {
             ("COPY orders (v) FROM STDIN (FORMAT CSV);", "42601"),
             // Not CSV, so there is no import VaireDB could perform at all.
             ("COPY orders FROM STDIN;", "0A000"),
+            // Parquet cannot arrive as a stream, and hearing so at Parse is what keeps
+            // the client from uploading a file it will only be told to abandon.
+            ("COPY orders FROM STDIN (FORMAT PARQUET);", "0A000"),
         ] {
             let err = precheck_copy_from_stdin(&parse_one(sql), &handler.catalog)
                 .err()
@@ -1455,6 +1799,134 @@ mod tests {
         let (_code, msg) = copy_rejection(
             &handler,
             &format!("COPY orders FROM '{path}' (FORMAT CSV, HEADER)"),
+        )
+        .await;
+        assert!(
+            !msg.contains("column") && !msg.contains("shard key"),
+            "the file must have been read and mapped, got: {msg}"
+        );
+    }
+
+    // --- the handler, importing Parquet ---
+
+    /// Write a Parquet file naming `columns` and holding one row, returning its path.
+    /// Written through the export path, so what the import reads is what an export
+    /// produces.
+    async fn write_parquet(name: &str, columns: &[&str]) -> String {
+        use std::sync::Arc;
+
+        use datafusion::arrow::array::StringArray;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(
+            columns
+                .iter()
+                .map(|c| Field::new(*c, DataType::Utf8, true))
+                .collect::<Vec<_>>(),
+        ));
+        let batch = RecordBatch::try_new(
+            SchemaRef::clone(&schema),
+            columns
+                .iter()
+                .map(|c| Arc::new(StringArray::from(vec![*c])) as _)
+                .collect(),
+        )
+        .unwrap();
+
+        let path = std::env::temp_dir()
+            .join(format!(
+                "vairedb_copy_test_{}_{name}.parquet",
+                std::process::id()
+            ))
+            .to_str()
+            .unwrap()
+            .to_string();
+        copy_parquet::write_file(path.clone(), schema, vec![batch])
+            .await
+            .unwrap();
+        path
+    }
+
+    // The table is resolved before the file is opened, so an import into a table that
+    // does not exist says so rather than reporting whatever the file turned out to be.
+    #[tokio::test]
+    async fn a_parquet_import_of_an_unknown_table_is_a_table_error() {
+        let handler = VaireDbQueryHandler::for_tests(false);
+        let path = write_parquet("unknown_table", &["id", "v"]).await;
+
+        let (code, msg) = copy_rejection(
+            &handler,
+            &format!("COPY nowhere FROM '{path}' (FORMAT PARQUET)"),
+        )
+        .await;
+        assert_eq!(code, "42P01");
+        assert!(msg.contains("nowhere"), "got: {msg}");
+    }
+
+    // The same message as the CSV lane: the path is the coordinator's, not the
+    // client's, and a client hunting for it locally would not find it.
+    #[tokio::test]
+    async fn a_missing_parquet_file_is_reported_against_the_coordinator() {
+        let handler = VaireDbQueryHandler::for_tests(false);
+        register(&handler, "orders", &["id", "v"]);
+
+        let missing = std::env::temp_dir().join("vairedb_copy_does_not_exist.parquet");
+        let (_code, msg) = copy_rejection(
+            &handler,
+            &format!("COPY orders FROM '{}' (FORMAT PARQUET)", missing.display()),
+        )
+        .await;
+        assert!(msg.contains("coordinator"), "got: {msg}");
+        assert!(msg.contains("vairedb_copy_does_not_exist"), "got: {msg}");
+    }
+
+    // A Parquet file names its own columns, so a column the table does not have is
+    // refused by name — dropping it would lose data without saying so.
+    #[tokio::test]
+    async fn a_parquet_column_the_table_does_not_have_is_refused() {
+        let handler = VaireDbQueryHandler::for_tests(false);
+        register(&handler, "orders", &["id", "v"]);
+        let path = write_parquet("unknown_column", &["id", "nope"]).await;
+
+        let (code, msg) = copy_rejection(
+            &handler,
+            &format!("COPY orders FROM '{path}' (FORMAT PARQUET)"),
+        )
+        .await;
+        assert_eq!(code, "42703");
+        assert!(msg.contains("nope"), "got: {msg}");
+    }
+
+    // Every row is placed by hashing its shard key, so a file without that column has
+    // nowhere to go. Refused before a single row is read.
+    #[tokio::test]
+    async fn a_parquet_import_without_the_shard_key_is_refused() {
+        let handler = VaireDbQueryHandler::for_tests(false);
+        register(&handler, "orders", &["id", "v"]);
+        let path = write_parquet("no_shard_key", &["v"]).await;
+
+        let (code, msg) = copy_rejection(
+            &handler,
+            &format!("COPY orders FROM '{path}' (FORMAT PARQUET)"),
+        )
+        .await;
+        assert_eq!(code, "42601");
+        assert!(msg.contains("shard key"), "got: {msg}");
+        assert!(msg.contains("\"id\""), "got: {msg}");
+    }
+
+    // As with CSV: the file is opened, its columns mapped and validated, and what
+    // stops the import is that the cluster has no shards to ship the rows to.
+    #[tokio::test]
+    async fn a_valid_parquet_import_gets_as_far_as_routing_the_rows() {
+        let handler = VaireDbQueryHandler::for_tests(false);
+        register(&handler, "orders", &["id", "v"]);
+        let path = write_parquet("routable", &["id", "v"]).await;
+
+        // No shards are assigned in a test handler, so routing is where it stops.
+        let (_code, msg) = copy_rejection(
+            &handler,
+            &format!("COPY orders FROM '{path}' (FORMAT PARQUET)"),
         )
         .await;
         assert!(

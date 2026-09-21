@@ -145,8 +145,8 @@ CREATE TABLE archive WITH (...) AS SELECT id, customer_email FROM foo_table;
 
 Either declare the destination **without** `anonymized_columns` — it then stores
 the digests exactly as they are, which is the only faithful thing to do with them
-— or load it from the original plaintext. `COPY ... FROM '<file>'` cannot be
-checked this way: the coordinator has no way to tell that a column in a CSV
+— or load it from the original plaintext. `COPY ... FROM` cannot be checked this
+way: the coordinator has no way to tell that a column in a CSV or Parquet file
 already holds digests, so a file exported from a pseudonymized table will be
 hashed again on import.
 

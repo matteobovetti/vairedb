@@ -1,3 +1,5 @@
+use super::transported::strip_code_tags;
+
 /// Engine-specific error message prefixes stripped before surfacing to clients.
 ///
 /// The DataFusion block is transcribed from `DataFusionError::error_prefix` in
@@ -215,7 +217,7 @@ fn matching_brace_outside_strings(s: &str) -> Option<usize> {
 /// Byte offset, within `s`, of the `"` that closes a string literal starting at `s[0]` —
 /// `None` if it never closes. Counts backslash escapes, since the literal being scanned
 /// is a `Debug` rendering and its own quotes arrive as `\"`.
-fn string_literal_end(s: &str) -> Option<usize> {
+pub(super) fn string_literal_end(s: &str) -> Option<usize> {
     let mut escaped = false;
     for (i, c) in s.char_indices() {
         if escaped {
@@ -235,7 +237,7 @@ fn string_literal_end(s: &str) -> Option<usize> {
 ///
 /// A transported error can be nested several `Debug` renderings deep, so its innermost
 /// text arrives with `\\\"`-style escaping. One level per pass is right: the caller loops.
-fn unescape(s: &str) -> String {
+pub(super) fn unescape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut chars = s.chars();
     while let Some(c) = chars.next() {
@@ -309,9 +311,9 @@ const MAX_UNWRAP_PASSES: usize = 8;
 ///
 /// Repeatedly unwraps the layers a transported error arrives in — a gRPC
 /// `Status { … }` dump, known engine prefixes (DataFusion, Ballista, DuckDB, `CoreError`),
-/// and whole-message `Debug` variant dumps — collapses `Signature { … }` debug dumps,
-/// unwraps Ballista "failed on executor" wrappers, and replaces any `http://` URLs with
-/// `[node]` so node addresses never leak to clients.
+/// `[VDB-…]` transport tags, and whole-message `Debug` variant dumps — collapses
+/// `Signature { … }` debug dumps, unwraps Ballista "failed on executor" wrappers, and
+/// replaces any `http://` URLs with `[node]` so node addresses never leak to clients.
 ///
 /// The layers alternate rather than nest neatly, which is why this is a loop and not a
 /// sequence: unwrapping a `Status` exposes a prefix, stripping the prefix exposes a
@@ -324,6 +326,11 @@ pub fn sanitize_message(raw: &str) -> String {
         msg = unwrap_grpc_status(&msg);
         msg = elide_signature_dumps(&msg);
         msg = strip_known_prefixes(&msg);
+        // A `[VDB-…]` tag is how an error raised on an executor carries its code across
+        // the scheduler (see `super::transported`). The code is read off the raw text
+        // before sanitizing; the tag itself is transport, and the coordinator attaches
+        // exactly one of its own when it formats the reply.
+        msg = strip_code_tags(&msg);
         if let Some(inner) = unwrap_debug_wrapper(&msg) {
             msg = inner;
         }
@@ -579,6 +586,30 @@ mod tests {
         ] {
             assert_eq!(sanitize_message(msg), msg, "{msg}");
         }
+    }
+
+    /// A `[VDB-…]` tag is how an error raised on an executor carries its code home. It is
+    /// transport, so it must not reach the client — the coordinator attaches exactly one
+    /// tag of its own when it formats the reply, and a surviving one would read as a
+    /// second code in the middle of the sentence.
+    #[test]
+    fn a_transport_code_tag_never_reaches_the_client() {
+        assert_eq!(
+            sanitize_message(
+                "DataFusion error: Error during planning: DataFusion error: \
+                 Plan(\"[VDB-1004] percentile_disc with an array of fractions is not supported\")"
+            ),
+            "percentile_disc with an array of fractions is not supported"
+        );
+    }
+
+    /// `[VDB-…]` that is not a tag belongs to whoever wrote it.
+    #[test]
+    fn something_shaped_like_a_tag_but_not_one_is_kept() {
+        assert_eq!(
+            sanitize_message("column \"[VDB-x]\" does not exist"),
+            "column \"[VDB-x]\" does not exist"
+        );
     }
 
     #[test]

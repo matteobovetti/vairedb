@@ -633,9 +633,7 @@ async fn test_a_qualified_using_key_reports_each_side_own_value() {
     assert_eq!(
         pairs(
             &client,
-            &format!(
-                "SELECT id, l.id AS l_id FROM {l} l FULL JOIN {r} r USING (id) ORDER BY id"
-            )
+            &format!("SELECT id, l.id AS l_id FROM {l} l FULL JOIN {r} r USING (id) ORDER BY id")
         )
         .await,
         vec![
@@ -693,33 +691,100 @@ async fn test_a_qualified_using_key_beside_a_wildcard_or_its_own_name_is_refused
     drop_table(&client, &r).await;
 }
 
-// REFUSAL. The one clause that cannot reach the merged column: DataFusion plans a `WHERE`
-// predicate without the join's `USING` set in hand, so two fields named `id` are ambiguous
-// to it where PostgreSQL sees one merged column. It refuses rather than answering a
-// different question, and it refuses on **every** `USING` and `NATURAL` join — inner
-// included — so this is not a cost of the merge above. The qualified spelling works, and
-// filters on that side's own key: `l.id > 2` keeps the rows `l` has, so the row only `r` has
-// is not one of them.
+// The last clause that could not reach the merged column, and the § 2.6 row that closed it.
+// DataFusion plans a `WHERE` predicate without the join's `USING` set in hand, so two fields
+// named `id` were ambiguous to it where PostgreSQL sees one merged column — and every one of
+// these was refused as `42703`, on **every** `USING` and `NATURAL` join, inner included.
+//
+// `pg_using_join_where_keys` writes the qualifier the planner needs: the left side's column
+// for an inner or left join, the right side's for a right join, and `COALESCE(l.id, r.id)` for
+// a full join, which is PostgreSQL's own definition of the merged column. Filtering on the
+// merged key is the ordinary way a client writes a join, so the refusal was not a niche one.
 #[tokio::test]
-async fn test_a_where_clause_on_a_using_key_is_refused() {
+async fn test_a_where_clause_on_a_using_key_filters_on_the_merged_column() {
     let client = ready_client().await;
     let (l, r) = setup_pair(&client, "jg_usingwhere").await;
 
-    for sql in [
-        format!("SELECT id FROM {l} FULL JOIN {r} USING (id) WHERE id > 2"),
-        format!("SELECT id FROM {l} JOIN {r} USING (id) WHERE id > 2"),
-        format!("SELECT id FROM {l} NATURAL FULL JOIN {r} WHERE id > 2"),
+    // The four join types, each with the merged key the join type gives it. The full join is
+    // the one that proves the merge rather than a shortcut: `5` exists only in `r`, so a
+    // predicate reading the left column alone would drop it.
+    for (sql, expected) in [
+        (
+            format!("SELECT id FROM {l} FULL JOIN {r} USING (id) WHERE id > 2"),
+            vec!["3", "4", "5"],
+        ),
+        (
+            format!("SELECT id FROM {l} JOIN {r} USING (id) WHERE id > 2"),
+            vec!["3"],
+        ),
+        (
+            format!("SELECT id FROM {l} LEFT JOIN {r} USING (id) WHERE id > 2"),
+            vec!["3", "4"],
+        ),
+        (
+            format!("SELECT id FROM {l} RIGHT JOIN {r} USING (id) WHERE id > 2"),
+            vec!["3", "5"],
+        ),
     ] {
-        // `42703` undefined_column, not PostgreSQL's `42702` ambiguous_column — recorded
-        // as observed, since PostgreSQL does not refuse this form at all.
-        let err = assert_sqlstate(&client, &sql, "42703").await;
-        assert!(
-            err.message().contains("mbiguous"),
-            "`{sql}` should be refused as ambiguous, got: {}",
-            err.message()
-        );
+        assert_eq!(sorted_column(&client, &sql).await, expected, "for `{sql}`");
     }
 
+    // `NATURAL` merges every shared column, so `id` **and** `k` are reachable unqualified —
+    // and the keys come from the catalog rather than from the statement, since a natural join
+    // does not name them.
+    assert_eq!(
+        sorted_column(
+            &client,
+            &format!("SELECT id FROM {l} NATURAL FULL JOIN {r} WHERE id > 2")
+        )
+        .await,
+        vec!["3", "3", "4", "5"]
+    );
+    assert_eq!(
+        sorted_column(
+            &client,
+            &format!("SELECT id FROM {l} NATURAL FULL JOIN {r} WHERE k = 20")
+        )
+        .await,
+        vec!["2"]
+    );
+
+    // Every position in the predicate, not only a top-level comparison: the key inside a
+    // conjunction, inside an `IS NULL`, and as an operand of arithmetic.
+    assert_eq!(
+        sorted_column(
+            &client,
+            &format!(
+                "SELECT id FROM {l} FULL JOIN {r} USING (id) \
+                 WHERE (id > 2 AND id < 5) OR id + 10 = 11"
+            )
+        )
+        .await,
+        vec!["1", "3", "4"]
+    );
+
+    // And a wildcard, which is the shape the qualified-key respelling refuses: there is no
+    // qualifier in this statement for it to object to, so the ordinary answer is given.
+    assert_eq!(
+        sorted_column(
+            &client,
+            &format!("SELECT v FROM {l} JOIN {r} USING (id) WHERE id > 2")
+        )
+        .await,
+        vec!["c"]
+    );
+    assert_eq!(
+        describe_result_labels(
+            &client,
+            &format!("SELECT * FROM {l} FULL JOIN {r} USING (id) WHERE id > 2")
+        )
+        .await,
+        vec!["id", "k", "v", "k", "w"]
+    );
+
+    // OVER-REACH. The qualified spelling still reads that side's own key, and is *not*
+    // rewritten into the merged one: `l.id > 2` keeps the rows `l` has, so the row only `r`
+    // has is not one of them. This is the assertion the rewrite could most easily break.
     assert_eq!(
         sorted_column(
             &client,
@@ -727,6 +792,33 @@ async fn test_a_where_clause_on_a_using_key_is_refused() {
         )
         .await,
         vec!["3", "4"]
+    );
+    assert_eq!(
+        sorted_column(
+            &client,
+            &format!("SELECT r.id FROM {l} l FULL JOIN {r} r USING (id) WHERE r.id > 2")
+        )
+        .await,
+        vec!["3", "5"]
+    );
+
+    // OVER-REACH. A column that is not a join key is untouched, and an `ON` join has no
+    // merged column at all — so a bare `id` there is still the ambiguous reference it was,
+    // which is what says the rewrite is keyed on `USING` and not on the name.
+    assert_eq!(
+        sorted_column(
+            &client,
+            &format!("SELECT id FROM {l} JOIN {r} USING (id) WHERE v = 'c'")
+        )
+        .await,
+        vec!["3"]
+    );
+    let sql = format!("SELECT l.id FROM {l} l JOIN {r} r ON l.id = r.id WHERE id > 2");
+    let err = assert_sqlstate(&client, &sql, "42703").await;
+    assert!(
+        err.message().contains("mbiguous"),
+        "`{sql}` has no merged column, so `id` is still ambiguous: {}",
+        err.message()
     );
 
     drop_table(&client, &l).await;
@@ -1627,37 +1719,104 @@ async fn test_not_in_over_a_correlated_subquery() {
     drop_table(&client, &r).await;
 }
 
-// REFUSAL. Every quantified comparison over a subquery except `= ANY` and `<> ALL` plans to
-// a *mark* join, whose output column is called `mark` on both sides of the join above it.
-// Serializing that plan for an executor fails — `Schema contains duplicate unqualified
-// field name mark` — so before this refusal the query reached the client as `XX000`
-// carrying a raw gRPC `Status { … }`. The refusal names the aggregate rewrite that works,
-// and does not apply it: `x > (SELECT max(c) …)` differs from `x > ALL (SELECT c …)` on an
-// empty subquery and on one containing a NULL.
+// DISTRIBUTED. Every quantified comparison over a subquery, not just the two spellings that
+// are `IN` and `NOT IN`. Each one is lowered to `EXISTS` / `NOT EXISTS` before planning,
+// because the planner's own decorrelation builds stacked *mark* joins whose output column is
+// called `mark` on both sides — a plan that answers in one process and then fails to
+// deserialize on its way to the scheduler (`Schema contains duplicate unqualified field name
+// mark`), which is why the measurement has to happen here and not in a unit test.
+//
+// `l.k` = 10, 20, 30, NULL and `r.k` = 20, 99, 50.
 #[tokio::test]
-async fn test_quantified_subquery_forms_are_refused() {
+async fn test_quantified_subquery_forms_answer() {
     let client = ready_client().await;
     let (l, r) = setup_pair(&client, "jg_quant").await;
 
-    for op in ["> ALL", ">= ALL", "= ALL", "> ANY", "< SOME"] {
-        let sql = format!("SELECT id FROM {l} WHERE k {op} (SELECT k FROM {r})");
-        let err = assert_sqlstate(&client, &sql, SQLSTATE_FEATURE_NOT_SUPPORTED).await;
-        assert!(
-            err.message().contains("aggregate") && err.message().contains("EXISTS"),
-            "`{sql}` should name a rewrite that works: {}",
-            err.message()
+    // The ordering operators. `ANY` is "true for some candidate", `ALL` is "true for every
+    // candidate" — so `> ANY` is really `> min` and `> ALL` is `> max`, and no row of `l`
+    // exceeds 99.
+    for (op, expected) in [
+        ("> ALL", Vec::<&str>::new()),
+        (">= ALL", vec![]),
+        ("> ANY", vec!["3"]),
+        ("< ALL", vec!["1"]),
+        ("< ANY", vec!["1", "2", "3"]),
+        ("< SOME", vec!["1", "2", "3"]),
+    ] {
+        assert_eq!(
+            column(
+                &client,
+                &format!("SELECT id FROM {l} WHERE k {op} (SELECT k FROM {r}) ORDER BY id")
+            )
+            .await,
+            expected,
+            "`k {op} (subquery)`"
         );
     }
 
-    // The rewrite the message names is available, and answers.
+    // The two equality spellings that are *not* `IN` and `NOT IN`: `= ALL` needs every
+    // candidate equal, `<> ANY` needs one to differ.
     assert_eq!(
         column(
             &client,
-            &format!("SELECT id FROM {l} WHERE k > (SELECT MAX(k) FROM {r}) ORDER BY id")
+            &format!("SELECT id FROM {l} WHERE k = ALL (SELECT k FROM {r}) ORDER BY id")
         )
         .await,
         Vec::<String>::new()
     );
+    assert_eq!(
+        column(
+            &client,
+            &format!("SELECT id FROM {l} WHERE k <> ANY (SELECT k FROM {r}) ORDER BY id")
+        )
+        .await,
+        vec!["1", "2", "3"]
+    );
+
+    // Over `id`, which is `NOT NULL`: the shape whose optimized plan used to lose the
+    // subquery's qualifier — a provably empty branch becomes a bare `EmptyRelation` — and so
+    // reached the client as `XX000` carrying a raw gRPC `Status { … }`.
+    assert_eq!(
+        column(
+            &client,
+            &format!("SELECT id FROM {l} WHERE id > ANY (SELECT id FROM {r}) ORDER BY id")
+        )
+        .await,
+        vec!["3", "4"]
+    );
+    assert_eq!(
+        column(
+            &client,
+            &format!("SELECT id FROM {l} WHERE id >= ALL (SELECT id FROM {r}) ORDER BY id")
+        )
+        .await,
+        Vec::<String>::new()
+    );
+
+    // The case an aggregate rewrite cannot express, which is why the old refusal named one
+    // and did not apply it: over an empty subquery `ANY` is false and `ALL` is true, for
+    // every operand — including the NULL one, which `id` 4 carries.
+    assert_eq!(
+        column(
+            &client,
+            &format!(
+                "SELECT id FROM {l} WHERE k > ANY (SELECT k FROM {r} WHERE k = 0) ORDER BY id"
+            )
+        )
+        .await,
+        Vec::<String>::new()
+    );
+    assert_eq!(
+        column(
+            &client,
+            &format!(
+                "SELECT id FROM {l} WHERE k > ALL (SELECT k FROM {r} WHERE k = 0) ORDER BY id"
+            )
+        )
+        .await,
+        vec!["1", "2", "3", "4"]
+    );
+    // And the aggregate spelling still answers, so the two readings can be compared.
     assert_eq!(
         column(
             &client,
@@ -1666,42 +1825,317 @@ async fn test_quantified_subquery_forms_are_refused() {
         .await,
         vec!["3"]
     );
-    // The two spellings that are not mark joins keep working — see the semi/anti test.
+
+    drop_table(&client, &l).await;
+    drop_table(&client, &r).await;
+}
+
+// THREE-VALUED. A NULL among the *candidates* is what a two-valued rewrite gets wrong: `ALL`
+// is then NULL rather than true even when every non-NULL candidate compares true, so the row
+// is dropped. Here the subquery is `l.k` = 10, 20, 30, NULL, and `r.k` = 99 beats every
+// number in it.
+#[tokio::test]
+async fn test_quantified_subquery_null_candidates() {
+    let client = ready_client().await;
+    let (l, r) = setup_pair(&client, "jg_quant_null").await;
+
+    // 99 > 10, 20, 30 — but `99 > NULL` is NULL, so `ALL` is NULL and no row passes.
+    assert_eq!(
+        column(
+            &client,
+            &format!("SELECT id FROM {r} WHERE k > ALL (SELECT k FROM {l}) ORDER BY id")
+        )
+        .await,
+        Vec::<String>::new()
+    );
+    // Remove the NULL candidate and the same query answers — 99 and 50 both beat every one
+    // of 10, 20, 30 — which is what pins the NULL as the cause rather than the comparison.
+    assert_eq!(
+        column(
+            &client,
+            &format!(
+                "SELECT id FROM {r} WHERE k > ALL (SELECT k FROM {l} WHERE k IS NOT NULL) \
+                 ORDER BY id"
+            )
+        )
+        .await,
+        vec!["3", "5"]
+    );
+    // `ANY` never has to reach the NULL: one true candidate is enough.
+    assert_eq!(
+        column(
+            &client,
+            &format!("SELECT id FROM {r} WHERE k > ANY (SELECT k FROM {l}) ORDER BY id")
+        )
+        .await,
+        vec!["2", "3", "5"]
+    );
+    // A NULL *operand* is the other half: `id` 4 of `l` compares NULL against every
+    // candidate, so it passes neither quantifier.
     assert_eq!(
         count(
             &client,
-            &format!("SELECT COUNT(*) FROM {l} WHERE id = ANY (SELECT id FROM {r})")
+            &format!("SELECT COUNT(*) FROM {l} WHERE id = 4 AND (k > ANY (SELECT k FROM {r}))")
         )
         .await,
-        2
+        0
     );
 
     drop_table(&client, &l).await;
     drop_table(&client, &r).await;
 }
 
+// DISTRIBUTED. The predicate positions the lowering covers: a `WHERE`, a `HAVING`, a join
+// `ON`, beside another conjunct, correlated with the enclosing query, and inside a derived
+// table or a CTE — each of which puts the semi/anti join under a different stage boundary.
 #[tokio::test]
-#[ignore = "gap (row 24): <op> ANY/ALL (subquery) must answer instead of being refused"]
-async fn test_quantified_subquery_forms_answer() {
+async fn test_quantified_subquery_positions_answer() {
     let client = ready_client().await;
-    let (l, r) = setup_pair(&client, "jg_quant_gap").await;
+    let (l, r) = setup_pair(&client, "jg_quant_pos").await;
 
-    // `k > ALL (20, 99, 50)` is true for no row; `k > ANY (…)` is true for 30 alone.
+    // Correlated: for `id` 1 and 2 the subquery is empty, which `ANY` reads as false and
+    // `ALL` as true.
     assert_eq!(
         column(
             &client,
-            &format!("SELECT id FROM {l} WHERE k > ALL (SELECT k FROM {r}) ORDER BY id")
+            &format!(
+                "SELECT a.id FROM {l} a WHERE a.k > ANY (SELECT b.k FROM {r} b WHERE b.id < a.id) \
+                 ORDER BY a.id"
+            )
         )
         .await,
-        Vec::<String>::new()
+        vec!["3"]
+    );
+    // `ALL` therefore keeps those two on the empty subquery *and* `id` 3, whose one candidate
+    // (20) it beats. `id` 4's `k` is NULL, so it passes neither quantifier.
+    assert_eq!(
+        column(
+            &client,
+            &format!(
+                "SELECT a.id FROM {l} a WHERE a.k > ALL (SELECT b.k FROM {r} b WHERE b.id < a.id) \
+                 ORDER BY a.id"
+            )
+        )
+        .await,
+        vec!["1", "2", "3"]
+    );
+
+    // A `HAVING`, where the operand is an aggregate rather than a column.
+    assert_eq!(
+        column(
+            &client,
+            &format!(
+                "SELECT id FROM {l} GROUP BY id HAVING MAX(k) > ANY (SELECT k FROM {r}) \
+                 ORDER BY id"
+            )
+        )
+        .await,
+        vec!["3"]
+    );
+
+    // A join `ON`, whose predicate may name a column of either side. Written without a table
+    // alias on the correlated side: with one, the shape is refused — see
+    // `test_a_quantified_subquery_in_a_join_on_cannot_name_an_alias`.
+    assert_eq!(
+        column(
+            &client,
+            &format!(
+                "SELECT {l}.id FROM {l} JOIN {r} ON {l}.id = {r}.id \
+                 AND {l}.k < ANY (SELECT k FROM {r}) ORDER BY {l}.id"
+            )
+        )
+        .await,
+        vec!["2", "3"]
+    );
+
+    // Beside another conjunct, which the lowering has to keep.
+    assert_eq!(
+        column(
+            &client,
+            &format!("SELECT id FROM {l} WHERE id > 1 AND k < ANY (SELECT k FROM {r}) ORDER BY id")
+        )
+        .await,
+        vec!["2", "3"]
+    );
+
+    // Inside a derived table and inside a CTE.
+    assert_eq!(
+        count(
+            &client,
+            &format!(
+                "SELECT COUNT(*) FROM \
+                 (SELECT id FROM {l} WHERE k > ANY (SELECT k FROM {r})) t"
+            )
+        )
+        .await,
+        1
+    );
+    assert_eq!(
+        count(
+            &client,
+            &format!(
+                "WITH q AS (SELECT id FROM {l} WHERE k < ANY (SELECT k FROM {r})) \
+                 SELECT COUNT(*) FROM q"
+            )
+        )
+        .await,
+        3
+    );
+
+    drop_table(&client, &l).await;
+    drop_table(&client, &r).await;
+}
+
+// REFUSAL. One position inside the covered set is withheld: a join `ON` predicate whose
+// left-hand side reaches its column through a table alias. The lowering is exact there too, but
+// the plan DataFusion builds from the correlated `EXISTS` is not — the semi join lands *under*
+// the alias while the filter still carries the outer qualifier — so the shape is named rather
+// than answered wrongly. A hand-written `EXISTS` in the same position fails the same way, which
+// is what makes this DataFusion's defect and not the lowering's.
+#[tokio::test]
+async fn test_a_quantified_subquery_in_a_join_on_cannot_name_an_alias() {
+    let client = ready_client().await;
+    let (l, r) = setup_pair(&client, "jg_quant_on_alias").await;
+
+    // Either side of the join may carry the alias; what matters is that the *comparison's*
+    // left-hand side is qualified by one.
+    for sql in [
+        format!(
+            "SELECT a.id FROM {l} a JOIN {r} ON a.id = {r}.id \
+             AND a.k < ANY (SELECT k FROM {r})"
+        ),
+        format!(
+            "SELECT {l}.id FROM {l} JOIN {r} b ON {l}.id = b.id \
+             AND b.k < ANY (SELECT k FROM {l})"
+        ),
+    ] {
+        let err = assert_sqlstate(&client, &sql, SQLSTATE_FEATURE_NOT_SUPPORTED).await;
+        assert!(
+            err.message().contains("table alias")
+                && err.message().contains("WHERE clause")
+                && err.message().contains("dropping the alias"),
+            "`{sql}` should name both spellings that answer: {}",
+            err.message()
+        );
+    }
+
+    // Both named spellings answer, which is what makes the refusal a redirection rather than a
+    // dead end. Dropping the alias:
+    assert_eq!(
+        column(
+            &client,
+            &format!(
+                "SELECT {l}.id FROM {l} JOIN {r} ON {l}.id = {r}.id \
+                 AND {l}.k < ANY (SELECT k FROM {r}) ORDER BY {l}.id"
+            )
+        )
+        .await,
+        vec!["2", "3"]
+    );
+    // and moving the comparison into the `WHERE`, alias and all:
+    assert_eq!(
+        column(
+            &client,
+            &format!(
+                "SELECT a.id FROM {l} a JOIN {r} ON a.id = {r}.id \
+                 WHERE a.k < ANY (SELECT k FROM {r}) ORDER BY a.id"
+            )
+        )
+        .await,
+        vec!["2", "3"]
+    );
+
+    // The refusal reaches no further than that one shape. An alias in a plain `WHERE`, with no
+    // join at all:
+    assert_eq!(
+        column(
+            &client,
+            &format!("SELECT a.id FROM {l} a WHERE a.k < ANY (SELECT k FROM {r}) ORDER BY a.id")
+        )
+        .await,
+        vec!["1", "2", "3"]
+    );
+    // and an alias on the side the comparison does *not* name, which the `ON` still answers.
+    assert_eq!(
+        column(
+            &client,
+            &format!(
+                "SELECT {l}.id FROM {l} JOIN {r} b ON {l}.id = b.id \
+                 AND {l}.id > ANY (SELECT id FROM {r}) ORDER BY {l}.id"
+            )
+        )
+        .await,
+        vec!["3"]
+    );
+
+    drop_table(&client, &l).await;
+    drop_table(&client, &r).await;
+}
+
+// REFUSAL. The lowering is exact because of *where* it applies: a position that already reads
+// NULL as not-true. Outside one — under a `NOT`, inside a `CASE`, in a select list, in an
+// `ORDER BY` — the collapse is invalid, and under an `OR` it is valid but leaves DataFusion's
+// own mark-join decorrelation in charge, which is the plan that does not ship. All five are
+// refused with the `EXISTS` spelling that works from anywhere, guard included.
+#[tokio::test]
+async fn test_quantified_subquery_positions_are_refused() {
+    let client = ready_client().await;
+    let (l, r) = setup_pair(&client, "jg_quant_pos_no").await;
+
+    for sql in [
+        format!("SELECT k > ANY (SELECT k FROM {r}) FROM {l}"),
+        format!("SELECT id FROM {l} ORDER BY (k > ANY (SELECT k FROM {r}))"),
+        format!("SELECT id FROM {l} WHERE NOT (k > ANY (SELECT k FROM {r}))"),
+        format!(
+            "SELECT id FROM {l} WHERE CASE WHEN k > ANY (SELECT k FROM {r}) \
+             THEN true ELSE false END"
+        ),
+        format!("SELECT id FROM {l} WHERE k > ANY (SELECT k FROM {r}) OR id = 1"),
+    ] {
+        let err = assert_sqlstate(&client, &sql, SQLSTATE_FEATURE_NOT_SUPPORTED).await;
+        assert!(
+            err.message().contains("EXISTS") && err.message().contains("IS TRUE"),
+            "`{sql}` should name the spelling that works, guard included: {}",
+            err.message()
+        );
+    }
+
+    // The refusal must not spread to the neighbouring subquery forms, which are answered in
+    // every position — including under the `OR` the quantified form is refused for.
+    assert_eq!(
+        column(
+            &client,
+            &format!("SELECT id FROM {l} WHERE k IN (SELECT k FROM {r}) OR id = 1 ORDER BY id")
+        )
+        .await,
+        vec!["1", "2"]
     );
     assert_eq!(
         column(
             &client,
-            &format!("SELECT id FROM {l} WHERE k > ANY (SELECT k FROM {r}) ORDER BY id")
+            &format!(
+                "SELECT a.id FROM {l} a WHERE EXISTS (SELECT 1 FROM {r} b WHERE b.k = a.k) \
+                 OR a.id = 1 ORDER BY a.id"
+            )
         )
         .await,
-        vec!["3"]
+        vec!["1", "2"]
+    );
+    assert_eq!(
+        column(
+            &client,
+            &format!("SELECT id FROM {l} WHERE id = ANY (SELECT id FROM {r}) ORDER BY id")
+        )
+        .await,
+        vec!["2", "3"]
+    );
+    assert_eq!(
+        column(
+            &client,
+            &format!("SELECT id FROM {l} WHERE id <> ALL (SELECT id FROM {r}) ORDER BY id")
+        )
+        .await,
+        vec!["1", "4"]
     );
 
     drop_table(&client, &l).await;
@@ -2200,63 +2634,20 @@ async fn test_intersect_and_except_branch_mismatch() {
     drop_table(&client, &r).await;
 }
 
-// REFUSAL. `INTERSECT ALL` and `EXCEPT ALL` count multiplicity: `INTERSECT ALL` keeps a row
-// as many times as it appears on *both* sides, and `EXCEPT ALL` removes one left row per
-// matching right row. Both were answered as the plain semi/anti join the `DISTINCT` forms
-// are built from — measured `1, 1, 1` where PostgreSQL answers `1, 1`, and `2` where
-// PostgreSQL answers `1, 2` — so both are refused rather than answered, because a row count
-// is exactly what an analytical client goes on to aggregate.
+// DISTRIBUTED + THREE-VALUED. `INTERSECT ALL` and `EXCEPT ALL` count multiplicity:
+// `INTERSECT ALL` keeps a row `min(m, n)` times and `EXCEPT ALL` keeps it `max(m - n, 0)`
+// times, where `m` and `n` are how often it appears on each side. Both used to be answered as
+// the plain semi/anti join the `DISTINCT` forms are built from — measured `1, 1, 1` where
+// PostgreSQL answers `1, 1`, and `2` where PostgreSQL answers `1, 2`.
+//
+// Both branches are now numbered within each distinct value tuple and joined on the value
+// *and* that number, so the operation is a window function under a semi join — a plan shape
+// nothing else in the read path produces, and one that has to survive being cut into stages
+// and shipped to the executors.
 #[tokio::test]
-async fn test_multiplicity_set_operations_are_refused() {
-    let client = ready_client().await;
-    let (dl, dr) = setup_dupes(&client, "jg_mult").await;
-
-    for op in ["INTERSECT ALL", "EXCEPT ALL"] {
-        let sql = format!("SELECT k FROM {dl} {op} SELECT k FROM {dr}");
-        let err = assert_sqlstate(&client, &sql, SQLSTATE_FEATURE_NOT_SUPPORTED).await;
-        assert!(
-            err.message().contains("as sets"),
-            "`{sql}` should name the form that is correct: {}",
-            err.message()
-        );
-    }
-
-    // The `DISTINCT` forms the message points at are correct and stay available.
-    assert_eq!(
-        sorted_column(
-            &client,
-            &format!("SELECT k FROM {dl} INTERSECT SELECT k FROM {dr}")
-        )
-        .await,
-        vec!["1"]
-    );
-    assert_eq!(
-        sorted_column(
-            &client,
-            &format!("SELECT k FROM {dl} EXCEPT SELECT k FROM {dr}")
-        )
-        .await,
-        vec!["2"]
-    );
-    // `UNION ALL` is untouched: concatenating is all its `ALL` asks for.
-    assert_eq!(
-        count(
-            &client,
-            &format!("SELECT COUNT(*) FROM (SELECT k FROM {dl} UNION ALL SELECT k FROM {dr}) t")
-        )
-        .await,
-        7
-    );
-
-    drop_table(&client, &dl).await;
-    drop_table(&client, &dr).await;
-}
-
-#[tokio::test]
-#[ignore = "gap (row 27): INTERSECT ALL / EXCEPT ALL must count how often a row appears"]
 async fn test_multiplicity_set_operations_count_duplicates() {
     let client = ready_client().await;
-    let (dl, dr) = setup_dupes(&client, "jg_mult_gap").await;
+    let (dl, dr) = setup_dupes(&client, "jg_mult").await;
 
     // `dl.k` = 1, 1, 1, 2 and `dr.k` = 1, 1, 3.
     assert_eq!(
@@ -2275,6 +2666,197 @@ async fn test_multiplicity_set_operations_count_duplicates() {
         .await,
         vec!["1", "2"]
     );
+
+    // The other direction: `max(m - n, 0)`, so the `1`s cancel out entirely rather than
+    // leaving a negative count behind.
+    assert_eq!(
+        sorted_column(
+            &client,
+            &format!("SELECT k FROM {dr} EXCEPT ALL SELECT k FROM {dl}")
+        )
+        .await,
+        vec!["3"]
+    );
+
+    // An empty branch leaves both operations at their extremes.
+    assert!(
+        sorted_column(
+            &client,
+            &format!("SELECT k FROM {dl} INTERSECT ALL SELECT k FROM {dr} WHERE k = 99")
+        )
+        .await
+        .is_empty()
+    );
+    assert_eq!(
+        sorted_column(
+            &client,
+            &format!("SELECT k FROM {dl} EXCEPT ALL SELECT k FROM {dr} WHERE k = 99")
+        )
+        .await,
+        vec!["1", "1", "1", "2"]
+    );
+
+    // A branch against itself: every row is its own partner, as often as it appears. Both
+    // sides carry the same qualifier here, which is the case a rewrite naming its bookkeeping
+    // columns once would get wrong.
+    assert_eq!(
+        sorted_column(
+            &client,
+            &format!("SELECT k FROM {dl} INTERSECT ALL SELECT k FROM {dl}")
+        )
+        .await,
+        vec!["1", "1", "1", "2"]
+    );
+    assert!(
+        sorted_column(
+            &client,
+            &format!("SELECT k FROM {dl} EXCEPT ALL SELECT k FROM {dl}")
+        )
+        .await
+        .is_empty()
+    );
+
+    // More than one column, which is what the rewrite has to partition by all of. The two
+    // columns have to carry different names: `SELECT k, k` is refused by DataFusion whether a
+    // set operation is involved or not ("Projections require unique expression names"), which
+    // is the residue § 4 Tier 2 row 9 records, not this one's.
+    assert_eq!(
+        pairs(
+            &client,
+            &format!(
+                "SELECT k, (k % 2) AS parity FROM {dl} \
+                 INTERSECT ALL SELECT k, (k % 2) AS parity FROM {dr}"
+            )
+        )
+        .await
+        .len(),
+        2
+    );
+
+    // Nested in a derived table and in a CTE, each of which puts a stage above the operation.
+    assert_eq!(
+        count(
+            &client,
+            &format!(
+                "SELECT COUNT(*) FROM \
+                 (SELECT k FROM {dl} INTERSECT ALL SELECT k FROM {dr}) t"
+            )
+        )
+        .await,
+        2
+    );
+    assert_eq!(
+        count(
+            &client,
+            &format!(
+                "WITH both AS (SELECT k FROM {dl} EXCEPT ALL SELECT k FROM {dr}) \
+                 SELECT COUNT(*) FROM both"
+            )
+        )
+        .await,
+        2
+    );
+
+    // The `DISTINCT` forms compare the rows as sets, and are untouched by the rewrite.
+    assert_eq!(
+        sorted_column(
+            &client,
+            &format!("SELECT k FROM {dl} INTERSECT SELECT k FROM {dr}")
+        )
+        .await,
+        vec!["1"]
+    );
+    assert_eq!(
+        sorted_column(
+            &client,
+            &format!("SELECT k FROM {dl} EXCEPT SELECT k FROM {dr}")
+        )
+        .await,
+        vec!["2"]
+    );
+    // `UNION ALL` is untouched too: concatenating is all its `ALL` asks for.
+    assert_eq!(
+        count(
+            &client,
+            &format!("SELECT COUNT(*) FROM (SELECT k FROM {dl} UNION ALL SELECT k FROM {dr}) t")
+        )
+        .await,
+        7
+    );
+
+    drop_table(&client, &dl).await;
+    drop_table(&client, &dr).await;
+}
+
+// THREE-VALUED. A set operation groups `NULL` with `NULL`, which is the one place its
+// comparison is not `=`. So the duplicate counting has to hold for NULLs as well: two NULLs on
+// the left and one on the right intersect to one NULL and differ by one NULL.
+#[tokio::test]
+async fn test_multiplicity_set_operations_match_nulls() {
+    let client = ready_client().await;
+    let nl = create_table(
+        &client,
+        "jg_multnull_l",
+        &format!("(id INTEGER NOT NULL, k INTEGER) {CREATE_OPTS}"),
+    )
+    .await;
+    let nr = create_table(
+        &client,
+        "jg_multnull_r",
+        &format!("(id INTEGER NOT NULL, k INTEGER) {CREATE_OPTS}"),
+    )
+    .await;
+    execute(
+        &client,
+        &format!("INSERT INTO {nl} (id, k) VALUES (1, NULL), (2, NULL), (3, 5)"),
+    )
+    .await
+    .unwrap();
+    execute(
+        &client,
+        &format!("INSERT INTO {nr} (id, k) VALUES (1, NULL), (2, 6)"),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(
+        sorted_column(
+            &client,
+            &format!("SELECT k FROM {nl} INTERSECT ALL SELECT k FROM {nr}")
+        )
+        .await,
+        vec!["NULL"]
+    );
+    assert_eq!(
+        sorted_column(
+            &client,
+            &format!("SELECT k FROM {nl} EXCEPT ALL SELECT k FROM {nr}")
+        )
+        .await,
+        vec!["5", "NULL"]
+    );
+
+    drop_table(&client, &nl).await;
+    drop_table(&client, &nr).await;
+}
+
+// REFUSAL. `BY NAME` matches the branches by column name instead of by position. It is a
+// DuckDB extension with no PostgreSQL spelling, so it is refused rather than approximated —
+// PostgreSQL is the contract, and a client that wrote it wrote it for another database.
+#[tokio::test]
+async fn test_set_operation_by_name_is_refused() {
+    let client = ready_client().await;
+    let (dl, dr) = setup_dupes(&client, "jg_byname").await;
+
+    for op in ["INTERSECT ALL BY NAME", "EXCEPT ALL BY NAME"] {
+        let sql = format!("SELECT id, k FROM {dl} {op} SELECT k, id FROM {dr}");
+        let err = assert_sqlstate(&client, &sql, SQLSTATE_FEATURE_NOT_SUPPORTED).await;
+        assert!(
+            err.message().contains("matched by position"),
+            "`{sql}` should say what PostgreSQL does instead: {}",
+            err.message()
+        );
+    }
 
     drop_table(&client, &dl).await;
     drop_table(&client, &dr).await;

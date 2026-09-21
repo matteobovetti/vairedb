@@ -152,8 +152,9 @@ and the shapes that qualify.
 
 ## Bulk load and export
 
-`COPY` moves rows between a table and a **CSV file on the coordinator**. An export
-gathers from every shard; an import routes each row by its shard key.
+`COPY` moves rows between a table and a **CSV or Parquet file on the coordinator**,
+or between a table and your client over the copy protocol. An export gathers from
+every shard; an import routes each row by its shard key.
 
 ```sql
 -- Export: one file holding every shard's rows
@@ -166,20 +167,58 @@ COPY (SELECT id, name FROM foo_table WHERE id > 10)
 -- Import: each row is routed to the shard that owns it
 COPY foo_table (id, name, email, created_at)
   FROM '/var/lib/vairedb/foo_table.csv' (FORMAT CSV, HEADER);
+
+-- Parquet, for the same two file directions
+COPY foo_table TO '/var/lib/vairedb/foo_table.parquet' (FORMAT PARQUET);
+COPY foo_table FROM '/var/lib/vairedb/foo_table.parquet' (FORMAT PARQUET);
+
+-- Streaming, which is what psql's \copy and driver bulk loaders use
+COPY foo_table FROM STDIN (FORMAT CSV, HEADER);
+COPY foo_table TO STDOUT (FORMAT CSV, HEADER);
 ```
 
-`FORMAT CSV` is required — PostgreSQL's default is its own `TEXT` encoding, which
-VaireDB does not write. `HEADER`, `DELIMITER` and `QUOTE` are honored; any other
-option is rejected rather than ignored, so the file always matches what you asked
-for. An import must include the table's shard key, and with `HEADER` the file's
-header names decide which columns are filled.
+A format must be named: PostgreSQL's default is its own `TEXT` encoding, which
+VaireDB does not write.
 
-!!! warning "The file is on the coordinator, not on your client"
+- **`FORMAT CSV`** works in all four directions. `HEADER`, `DELIMITER` and `QUOTE`
+  are honored; any other option is rejected rather than ignored, so the file always
+  matches what you asked for. With `HEADER`, the file's header names decide which
+  columns an import fills.
+- **`FORMAT PARQUET`** works for the two file directions. A Parquet file carries its
+  own column names and types, so it takes no options — `HEADER`, `DELIMITER` and
+  `QUOTE` are rejected against it — and the file's schema decides which columns an
+  import fills. Exports are Snappy-compressed.
+
+An import must always include the table's shard key. Naming the columns yourself
+overrides the file's own names and maps them **by position**, so the list has to be
+exactly as wide as the file:
+
+```sql
+COPY foo_table (id, name, email) FROM '/var/lib/vairedb/foo_table.parquet' (FORMAT PARQUET);
+```
+
+Whichever way the names come from the file, they fold to lower case like every other
+identifier — a Parquet column `ID` fills `id`, and will not match a column created as
+`"ID"`.
+
+!!! note "A Parquet import reads the file's types"
+    Because the values arrive typed rather than as text, a column whose type has no
+    SQL literal form — `BYTEA`, a list, a struct — is rejected **by name** before a
+    row is read. Use `FORMAT CSV` for those: it carries them as text. Every other
+    type, including `DECIMAL`, dates and timestamps, imports as itself.
+
+!!! note "Parquet is a file, not a stream"
+    `COPY ... FROM STDIN` and `COPY ... TO STDOUT` are CSV-only. A Parquet file's
+    footer is written last and has to be read first, so it is not the row-at-a-time
+    stream the copy protocol carries; asking for it is rejected rather than half
+    honored. Name a path on the coordinator instead.
+
+!!! warning "A named file is on the coordinator, not on your client"
     The path is resolved by the coordinator process, with the coordinator's
     filesystem permissions, and VaireDB has no user or role model to restrict it.
     Treat the ability to connect as the ability to read and write any path the
-    coordinator can. The client-side streaming forms — `COPY ... FROM STDIN`,
-    `COPY ... TO STDOUT` and therefore `psql`'s `\copy` — are not supported yet.
+    coordinator can. Use the `STDIN`/`STDOUT` forms — and therefore `psql`'s
+    `\copy` — when the file should be your client's.
 
 !!! note "Not atomic across shards"
     An import is a multi-shard write. Rows that cannot be routed are rejected with

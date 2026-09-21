@@ -47,6 +47,7 @@ use crate::pgwire_handler::error_enrichment::{
 };
 use crate::pgwire_handler::introspection;
 use crate::pgwire_handler::parser::{self, VairePrepared, VaireQueryParser};
+use crate::pgwire_handler::pg_settings;
 use crate::pgwire_handler::query_router::{self, QueryType};
 use crate::pgwire_handler::sequences;
 use crate::pgwire_handler::session::SessionState;
@@ -313,98 +314,105 @@ impl ExtendedQueryHandler for VaireDbQueryHandler {
         C: ClientInfo + Unpin + Send + Sync,
     {
         let session = SessionState::for_client(client);
-        let prepared = &portal.statement.statement;
-        let Some(stmt) = &prepared.stmt else {
-            return Ok(Response::EmptyQuery);
-        };
+        // The connection's parameters, put where `pg_catalog.pg_settings` can read them —
+        // around the whole dispatch rather than the read branches alone, so no future route
+        // through here has to remember to do it. See [`pg_settings::with_session_settings`].
+        let settings = Arc::new(session.params().await.settings());
+        pg_settings::with_session_settings(settings, async {
+            let prepared = &portal.statement.statement;
+            let Some(stmt) = &prepared.stmt else {
+                return Ok(Response::EmptyQuery);
+            };
 
-        match prepared.query_type {
-            QueryType::SessionParam => {
-                // Answered from the connection's own parameter map — no plan, no shard,
-                // and no bind parameters to decode: a runtime parameter takes a literal
-                // or a bare word, never a `$1`. Routed before the write path because a
-                // `SHOW` returns rows, which the write path has no way to produce.
-                let result = async {
-                    self.check_transaction_allows(stmt, &prepared.query_type, &session)
-                        .await?;
-                    session_params::handle_session_param(
-                        stmt,
-                        &session,
-                        &portal.result_column_format,
-                    )
-                    .await
-                }
-                .await;
-                self.note_failure_in_transaction(result.is_err(), &session)
+            match prepared.query_type {
+                QueryType::SessionParam => {
+                    // Answered from the connection's own parameter map — no plan, no shard,
+                    // and no bind parameters to decode: a runtime parameter takes a literal
+                    // or a bare word, never a `$1`. Routed before the write path because a
+                    // `SHOW` returns rows, which the write path has no way to produce.
+                    let result = async {
+                        self.check_transaction_allows(stmt, &prepared.query_type, &session)
+                            .await?;
+                        session_params::handle_session_param(
+                            stmt,
+                            &session,
+                            &portal.result_column_format,
+                        )
+                        .await
+                    }
                     .await;
-                return result;
-            }
-            QueryType::Explain => {
-                // The plan is the answer, so it was built at Parse and is reused here
-                // verbatim. Bind parameters are not decoded: `EXPLAIN` reports the shape
-                // of a query, and a placeholder's value does not change it — a client
-                // that binds one gets the same plan a `$1` in a SELECT would produce.
-                let result = async {
-                    self.check_transaction_allows(stmt, &prepared.query_type, &session)
-                        .await?;
-                    let plan = prepared.plan.as_ref().ok_or_else(|| {
-                        make_vdb_error(VdbErrorCode::InternalError, "missing plan for EXPLAIN")
-                    })?;
-                    let is_catalog = self.is_catalog_query(stmt);
-                    let ctx = if is_catalog {
-                        &self.local_ctx
-                    } else {
-                        &self.session_ctx
-                    };
-                    introspection::execute_introspection(
-                        ctx,
-                        plan,
-                        &portal.result_column_format,
-                        &introspection::error_context(stmt),
-                    )
-                    .await
+                    self.note_failure_in_transaction(result.is_err(), &session)
+                        .await;
+                    return result;
                 }
-                .await;
-                self.note_failure_in_transaction(result.is_err(), &session)
+                QueryType::Explain => {
+                    // The plan is the answer, so it was built at Parse and is reused here
+                    // verbatim. Bind parameters are not decoded: `EXPLAIN` reports the shape
+                    // of a query, and a placeholder's value does not change it — a client
+                    // that binds one gets the same plan a `$1` in a SELECT would produce.
+                    let result = async {
+                        self.check_transaction_allows(stmt, &prepared.query_type, &session)
+                            .await?;
+                        let plan = prepared.plan.as_ref().ok_or_else(|| {
+                            make_vdb_error(VdbErrorCode::InternalError, "missing plan for EXPLAIN")
+                        })?;
+                        let is_catalog = self.is_catalog_query(stmt);
+                        let ctx = if is_catalog {
+                            &self.local_ctx
+                        } else {
+                            &self.session_ctx
+                        };
+                        introspection::execute_introspection(
+                            ctx,
+                            plan,
+                            &portal.result_column_format,
+                            &introspection::error_context(stmt),
+                        )
+                        .await
+                    }
                     .await;
-                return result;
-            }
-            QueryType::Select => {
-                // Read path: bind typed parameters into the cached logical plan.
-                let result = async {
-                    self.check_transaction_allows(stmt, &prepared.query_type, &session)
-                        .await?;
-                    let plan = prepared.plan.as_ref().ok_or_else(|| {
-                        make_vdb_error(VdbErrorCode::InternalError, "missing plan for SELECT")
-                    })?;
-                    let param_values = self.decode_param_values(portal)?;
-                    self.execute_select_plan(
-                        prepared,
-                        plan,
-                        param_values,
-                        &portal.result_column_format,
-                    )
-                    .await
+                    self.note_failure_in_transaction(result.is_err(), &session)
+                        .await;
+                    return result;
                 }
-                .await;
-                self.note_failure_in_transaction(result.is_err(), &session)
+                QueryType::Select => {
+                    // Read path: bind typed parameters into the cached logical plan.
+                    let result = async {
+                        self.check_transaction_allows(stmt, &prepared.query_type, &session)
+                            .await?;
+                        let plan = prepared.plan.as_ref().ok_or_else(|| {
+                            make_vdb_error(VdbErrorCode::InternalError, "missing plan for SELECT")
+                        })?;
+                        let param_values = self.decode_param_values(portal)?;
+                        self.execute_select_plan(
+                            prepared,
+                            plan,
+                            param_values,
+                            &portal.result_column_format,
+                        )
+                        .await
+                    }
                     .await;
-                return result;
+                    self.note_failure_in_transaction(result.is_err(), &session)
+                        .await;
+                    return result;
+                }
+                _ => {}
             }
-            _ => {}
-        }
 
-        // Write/DDL path: parameters (if any) are bound on DuckDB. Decode them to
-        // ScalarValues for shard routing and transport.
-        let params = match self.decode_param_scalars(portal) {
-            Ok(params) => params,
-            Err(e) => {
-                session.transaction().await.mark_failed();
-                return Err(e);
-            }
-        };
-        self.execute_write_statement(stmt, &prepared.query_type, &params, &session)
-            .await
+            // Write/DDL path: parameters (if any) are bound on DuckDB. Decode them to
+            // ScalarValues for shard routing and transport.
+            let params = match self.decode_param_scalars(portal) {
+                Ok(params) => params,
+                Err(e) => {
+                    session.transaction().await.mark_failed();
+                    return Err(e);
+                }
+            };
+            self.execute_write_statement(stmt, &prepared.query_type, &params, &session)
+                .await
+        })
+        .await
     }
 
     /// Describe a prepared statement: report its parameter OIDs and, for SELECT,
@@ -475,7 +483,12 @@ impl VaireDbQueryHandler {
         session: &SessionState,
     ) -> PgWireResult<Response> {
         let query_type = query_router::classify_statement(stmt);
-        let result = async {
+        // The connection's parameters, put where `pg_catalog.pg_settings` can read them.
+        // Snapshotted per statement rather than per query string, so a `SET` earlier in the
+        // same simple query is already in what the next statement sees. See
+        // [`pg_settings::with_session_settings`].
+        let settings = Arc::new(session.params().await.settings());
+        let result = pg_settings::with_session_settings(settings, async {
             if query_type == QueryType::TransactionControl {
                 return self.handle_transaction_control(stmt, session).await;
             }
@@ -501,6 +514,7 @@ impl VaireDbQueryHandler {
                 QueryType::DropView => self.handle_drop_view(stmt).await,
                 QueryType::CreateSchema => self.handle_create_schema(stmt).await,
                 QueryType::DropSchema => self.handle_drop_schema(stmt).await,
+                QueryType::AlterSchema => self.handle_alter_schema(stmt).await,
                 QueryType::Copy => self.handle_copy(stmt, session).await,
                 // The simple-query protocol has no Bind, so every value on the wire
                 // is text.
@@ -511,7 +525,7 @@ impl VaireDbQueryHandler {
                     Err(unsupported_statement_error(stmt))
                 }
             }
-        }
+        })
         .await;
 
         self.note_failure_in_transaction(result.is_err(), session)
@@ -553,6 +567,7 @@ impl VaireDbQueryHandler {
                 QueryType::DropView => self.handle_drop_view(stmt).await,
                 QueryType::CreateSchema => self.handle_create_schema(stmt).await,
                 QueryType::DropSchema => self.handle_drop_schema(stmt).await,
+                QueryType::AlterSchema => self.handle_alter_schema(stmt).await,
                 QueryType::Copy => self.handle_copy(stmt, session).await,
                 // A read, an `EXPLAIN` and a session parameter each reach the
                 // extended protocol through their own branch in `do_query`, so none

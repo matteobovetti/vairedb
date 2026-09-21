@@ -73,7 +73,7 @@ quorum and tail-replication details.
 A write whose rows do not appear in the statement itself — `INSERT ... SELECT`,
 `CREATE TABLE ... AS SELECT`, `COPY ... FROM` — cannot be sharded as written, because
 the coordinator decides placement from the shard key's value. Those forms run their
-source first (the read path above, or a CSV file on the coordinator) and re-enter this
+source first (the read path above, or a CSV or Parquet file on the coordinator) and re-enter this
 write path as ordinary rows, so placement and replication work exactly as they do for
 a hand-written `INSERT`.
 

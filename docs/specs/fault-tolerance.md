@@ -15,13 +15,13 @@ Snapshotting is not yet implemented. The intended design takes periodic full sna
 3. The resulting self-contained `.duckdb` file is copied to durable object storage (e.g. S3, GCS, MinIO).
 4. The write queue is resumed.
 
-This approach is simple but requires briefly pausing writes on the target node during the file copy. A later version aims to avoid this pause with a dedicated VaireDB snapshot system (see [Roadmap](roadmap.md)).
+This approach is simple but requires briefly pausing writes on the target node during the file copy. A later version aims to avoid this pause with a dedicated VaireDB snapshot system (see [Roadmap](intenal-roadmap.md)).
 
 ## Node Recovery
 
 1. **Transient failure**: the core node restarts, DuckDB recovers from its local WAL, and the node reconnects to the coordinator and rejoins the cluster.
-2. **Permanent failure**: in v0.1, requires manual intervention — a new core node must be provisioned and data restored from snapshots. Automatic shard rebuild from replicas is deferred to a future version (see [Roadmap](roadmap.md)).
-3. **Network partition (core nodes)**: if a core node cannot reach the coordinator, it cannot receive writes or serve Ballista-dispatched reads. In v0.1, the coordinator marks unreachable nodes as dead after the heartbeat timeout and returns errors to clients for operations targeting the affected shards. Automatic traffic redirection to replicas is deferred to a future version (see [Roadmap](roadmap.md)).
+2. **Permanent failure**: currently requires manual intervention — a new core node must be provisioned and data restored from snapshots. Automatic shard rebuild from replicas is deferred to a future version (see [Roadmap](intenal-roadmap.md)).
+3. **Network partition (core nodes)**: if a core node cannot reach the coordinator, it cannot receive writes or serve Ballista-dispatched reads. The coordinator marks unreachable nodes as dead after the heartbeat timeout and returns errors to clients for operations targeting the affected shards. Automatic traffic redirection to replicas is deferred to a future version (see [Roadmap](intenal-roadmap.md)).
 
 ## Quorum and Availability
 

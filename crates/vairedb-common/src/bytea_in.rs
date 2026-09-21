@@ -584,7 +584,8 @@ mod tests {
             DataType::Null,
         ] {
             assert_eq!(
-                f.coerce_types(&[accepted.clone()]).expect("accepted"),
+                f.coerce_types(std::slice::from_ref(&accepted))
+                    .expect("accepted"),
                 vec![DataType::Utf8],
                 "{accepted}"
             );
@@ -595,7 +596,8 @@ mod tests {
             DataType::BinaryView,
         ] {
             assert_eq!(
-                f.coerce_types(&[accepted.clone()]).expect("accepted"),
+                f.coerce_types(std::slice::from_ref(&accepted))
+                    .expect("accepted"),
                 vec![DataType::Binary],
                 "{accepted}"
             );

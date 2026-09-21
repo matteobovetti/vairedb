@@ -24,13 +24,24 @@ use std::ops::ControlFlow;
 use pgwire::error::{PgWireError, PgWireResult};
 
 use vairedb_common::bytea_in::BYTEA_IN_UDF_NAME;
+use vairedb_common::json_agg::{
+    JSON_AGG_NAME, JSON_ARRAY_DOCS_UDF_NAME, JSON_ARRAY_UDF_NAME, JSONB_AGG_NAME,
+};
+use vairedb_common::json_pg::{
+    JSON_GET_TEXT_UDF_NAME, JSON_GET_UDF_NAME, JSON_IN_UDF_NAME, JSON_PATH_TEXT_UDF_NAME,
+    JSON_PATH_UDF_NAME, JSONB_IN_UDF_NAME,
+};
 use vairedb_common::proto::vairedb::v1::VdbErrorCode;
+use vairedb_common::uuid_in::UUID_IN_UDF_NAME;
 
 use crate::error::CoordinatorError;
 use crate::pgwire_handler::error_enrichment::make_vdb_error;
+use crate::pgwire_handler::pg_named_windows;
+use crate::pgwire_handler::pg_set_op_multiplicity;
 use crate::pgwire_handler::pg_subscripts;
+use crate::sqlparser::ast::helpers::attached_token::AttachedToken;
 use crate::sqlparser::ast::{
-    BinaryOperator, CastKind, DataType, Expr, Function, FunctionArg, FunctionArgExpr,
+    BinaryOperator, CaseWhen, CastKind, DataType, Expr, Function, FunctionArg, FunctionArgExpr,
     FunctionArgumentList, FunctionArguments, Ident, ObjectName, Statement, UnaryOperator, Value,
     ValueWithSpan, visit_expressions, visit_expressions_mut,
 };
@@ -43,12 +54,16 @@ use crate::sqlparser::ast::{
 /// expression is rewritten before the one containing it and a rewrite's own
 /// operands are never re-examined.
 pub(super) fn rewrite_pg_expressions(stmt: &mut Statement) -> PgWireResult<()> {
-    // Not an expression, so outside the visit below: a `WINDOW` clause is a property of
-    // the select, and it can lose a clause the same way an `OVER (...)` can.
-    reject_chained_named_windows(stmt)?;
-    // Nor is a set operation an expression: `INTERSECT ALL` and `EXCEPT ALL` are the two
-    // whose answer is wrong rather than absent.
-    reject_multiplicity_set_operations(stmt)?;
+    // Not an expression, so outside the visit below: a `WINDOW` clause is a property of the
+    // select, and the inheritance it can declare — `OVER (w ...)` and `w2 AS (w1 ...)` — has
+    // to be written out before the planner reads a specification whose name it ignores. See
+    // [`pg_named_windows`].
+    pg_named_windows::expand_named_windows(stmt)?;
+    // Nor is a set operation an expression: `INTERSECT ALL` and `EXCEPT ALL` count duplicate
+    // rows, which is the one thing the join DataFusion plans them as does not do, so they are
+    // marked here for the plan-level rewrite that repairs them. See
+    // [`pg_set_op_multiplicity`].
+    pg_set_op_multiplicity::mark_multiplicity_set_operations(stmt)?;
     match visit_expressions_mut(stmt, |expr| match rewrite_expr(expr) {
         Ok(()) => ControlFlow::Continue(()),
         Err(e) => ControlFlow::Break(e),
@@ -90,24 +105,32 @@ fn rewrite_expr(expr: &mut Expr) -> PgWireResult<()> {
         // ordinary `CAST(… AS Binary)`, and VaireDB's own `Utf8` → `Binary` casts — a
         // `COPY`, a schema rebuild — must keep Arrow's meaning. Only the two spellings a
         // client writes, so a `TRY_CAST` is left as it was.
+        //
+        // `::json`, `::jsonb` and `::uuid` are here for a related but not identical reason:
+        // Arrow has no cast at all, because all three are *stored* as text (see
+        // [`vairedb_common::json_pg`] and [`vairedb_common::uuid_in`]) and the cast is a
+        // validation rather than a change of representation. DataFusion's `convert_data_type`
+        // has no arm for any of the three type names, so without this the cast does not plan.
+        // Rewriting them here — and not only for their own sake — is what unblocks the `json`
+        // operator family and `json_agg` below, which is why one planner gap held so much.
         Expr::Cast {
             kind: CastKind::Cast | CastKind::DoubleColon,
-            data_type: DataType::Bytea,
+            data_type: DataType::Bytea | DataType::JSON | DataType::JSONB | DataType::Uuid,
             ..
         } => {}
-        Expr::AllOp {
-            compare_op, right, ..
-        } if matches!(right.as_ref(), Expr::Subquery(_)) => {
-            return Err(quantified_subquery_unsupported(compare_op, "ALL"));
-        }
-        Expr::AnyOp {
-            compare_op,
-            right,
-            is_some,
+        // `@?` asks whether a jsonpath matches. A jsonpath is its own language with its own
+        // parser, which VaireDB does not have, and there is no rewrite that approximates it
+        // — so it is refused by name rather than left to fail as an unsupported operator with
+        // nothing said about why.
+        Expr::BinaryOp {
+            op: op @ BinaryOperator::AtQuestion,
             ..
-        } if matches!(right.as_ref(), Expr::Subquery(_)) => {
-            let quantifier = if *is_some { "SOME" } else { "ANY" };
-            return Err(quantified_subquery_unsupported(compare_op, quantifier));
+        } => {
+            return Err(unsupported(
+                format!("the {op} operator"),
+                "it takes a jsonpath expression, which VaireDB does not implement; extract the \
+                 value with ->, ->>, #> or #>> and test that instead",
+            ));
         }
         // An out-of-range array subscript answers NULL in PostgreSQL and the last element
         // in DataFusion. The clamp is inside the brackets and the subscript stays a
@@ -118,12 +141,21 @@ fn rewrite_expr(expr: &mut Expr) -> PgWireResult<()> {
             return Ok(());
         }
         Expr::Function(func) => {
+            // Before the refusal, because it is what turns `FILTER … OVER` from a refusal
+            // into an answer for the aggregates it is exact for.
+            rewrite_window_filter(func);
             reject_discarded_window_clauses(func)?;
+            reject_ordered_set_without_within_group(func)?;
             reject_percentile_fraction_out_of_range(func)?;
             if let Some(datafusion_name) = postgres_aggregate_alias(&func.name) {
                 func.name = ObjectName::from(vec![Ident::new(datafusion_name)]);
             }
-            return Ok(());
+            rename_hypothetical_set_aggregate(func);
+            // `json_agg` is rewritten rather than renamed, so it falls through to the
+            // arm below; every other function is finished with here.
+            if !is_json_aggregate(&func.name) {
+                return Ok(());
+            }
         }
         Expr::Like {
             pattern,
@@ -138,7 +170,17 @@ fn rewrite_expr(expr: &mut Expr) -> PgWireResult<()> {
             return rewrite_like_escape(pattern, escape_char);
         }
         Expr::BinaryOp {
-            op: BinaryOperator::PGExp | BinaryOperator::PGStartsWith | BinaryOperator::PGOverlap,
+            op:
+                BinaryOperator::PGExp
+                | BinaryOperator::PGStartsWith
+                | BinaryOperator::PGOverlap
+                // The `json` accessors. DataFusion's planner does map all four to an
+                // `Operator`, but nothing implements them, so the failure would come from
+                // physical planning with the client's spelling already gone.
+                | BinaryOperator::Arrow
+                | BinaryOperator::LongArrow
+                | BinaryOperator::HashArrow
+                | BinaryOperator::HashLongArrow,
             ..
         }
         | Expr::UnaryOp {
@@ -150,10 +192,30 @@ fn rewrite_expr(expr: &mut Expr) -> PgWireResult<()> {
     }
 
     match std::mem::replace(expr, Expr::value(Value::Null)) {
-        // `x::bytea` becomes `vaire_bytea_in(x)`. The argument keeps whatever it was, so a
-        // literal is folded by the simplifier and a column is decoded per row.
-        Expr::Cast { expr: inner, .. } => {
-            *expr = call(BYTEA_IN_UDF_NAME, vec![*inner]);
+        // `x::bytea` becomes `vaire_bytea_in(x)`, and the three text-backed types become
+        // their own input conversions. The argument keeps whatever it was, so a literal is
+        // folded by the simplifier and a column is converted per row.
+        Expr::Cast {
+            expr: inner,
+            data_type,
+            ..
+        } => {
+            let name = match data_type {
+                DataType::JSON => JSON_IN_UDF_NAME,
+                DataType::JSONB => JSONB_IN_UDF_NAME,
+                DataType::Uuid => UUID_IN_UDF_NAME,
+                // The borrow-only match above admits no other cast to this arm.
+                _ => BYTEA_IN_UDF_NAME,
+            };
+            *expr = call(name, vec![*inner]);
+            Ok(())
+        }
+        // `json_agg(x)` becomes `vaire_json_array(array_agg(x))`, which is how the
+        // in-aggregate `ORDER BY`, `DISTINCT` and `FILTER` PostgreSQL allows keep working
+        // across a partial aggregate on each shard — see [`vairedb_common::json_agg`] for
+        // why the aggregation is borrowed and only the rendering is ours.
+        Expr::Function(func) => {
+            *expr = json_aggregate_call(func);
             Ok(())
         }
         // `^` is exponentiation in PostgreSQL and in DuckDB; DataFusion's planner reads
@@ -166,6 +228,13 @@ fn rewrite_expr(expr: &mut Expr) -> PgWireResult<()> {
             let name = match op {
                 BinaryOperator::PGExp => "power",
                 BinaryOperator::PGStartsWith => "starts_with",
+                // The two `->` forms take a key or an index, the two `#>` forms a path; the
+                // doubled forms return the extracted value as text where the single ones
+                // return it as json. See [`vairedb_common::json_pg`].
+                BinaryOperator::Arrow => JSON_GET_UDF_NAME,
+                BinaryOperator::LongArrow => JSON_GET_TEXT_UDF_NAME,
+                BinaryOperator::HashArrow => JSON_PATH_UDF_NAME,
+                BinaryOperator::HashLongArrow => JSON_PATH_TEXT_UDF_NAME,
                 _ => "array_has_any",
             };
             *expr = call(name, vec![*left, *right]);
@@ -207,25 +276,35 @@ fn rewrite_expr(expr: &mut Expr) -> PgWireResult<()> {
     }
 }
 
-/// Refuse the three window-function clauses DataFusion parses and then drops.
+/// Refuse the window-function clauses DataFusion parses and then drops, for the forms
+/// [`rewrite_window_filter`] and [`pg_named_windows`] do not turn into an answer first.
 ///
-/// Each of the three is a clause that changes which rows the function sees, so losing
-/// it does not fail — it answers a different question and says nothing about it. All
-/// three were measured against DataFusion 54.1 on a sharded table, and each refusal is
-/// scoped to exactly the form that loses the clause, because the neighbouring forms are
-/// correct and refusing them would cost a working query:
+/// Each of these is a clause that changes which rows the function sees, so losing it does
+/// not fail — it answers a different question and says nothing about it. All were measured
+/// against DataFusion 54.1 on a sharded table, and each refusal is scoped to exactly the
+/// form that loses the clause, because the neighbouring forms are correct and refusing them
+/// would cost a working query:
 ///
 /// * `FILTER` is dropped **only when combined with `OVER`**: the serialized window
 ///   expression has no field to carry it, so `sum(x) FILTER (WHERE x > 10) OVER (...)`
 ///   sums every row. On a plain aggregate `FILTER` is applied correctly and stays
-///   accepted.
-/// * A window spec that *names* another window loses the named window's own
-///   `PARTITION BY` and `ORDER BY` — `OVER (w ORDER BY x)`, and even `OVER (w)`,
-///   aggregate over the whole result instead of over `w`'s partitions. Referring to a
-///   named window without parentheses, `OVER w`, resolves correctly and stays accepted.
+///   accepted. [`rewrite_window_filter`] has already folded the predicate into the
+///   argument for every aggregate where that is exact, so what reaches here is the rest:
+///   the aggregates that count nulls, and `DISTINCT`.
 /// * `IGNORE NULLS` is discarded, so `last_value(x) IGNORE NULLS` still returns the
-///   NULL it was told to skip. `RESPECT NULLS` asks for the default and so loses
-///   nothing by being dropped.
+///   NULL it was told to skip. This one is refused rather than rewritten because
+///   PostgreSQL does not implement it either — §9.22 is explicit that the standard's
+///   `RESPECT NULLS` / `IGNORE NULLS` option on `lead`, `lag`, `first_value`,
+///   `last_value` and `nth_value` "is not implemented in PostgreSQL: the behavior is
+///   always the same as the standard's default, namely RESPECT NULLS". So there is no
+///   PostgreSQL meaning to match, and a refusal is the answer PostgreSQL gives too, only
+///   as a parse error rather than as an unsupported feature. `RESPECT NULLS` asks for
+///   the default and so loses nothing by being dropped.
+/// * A window specification that still *names* another window. [`pg_named_windows`] writes
+///   every such reference out before this runs and refuses the ones PostgreSQL refuses, so
+///   this is a backstop rather than a rule: if some position that pass does not reach ever
+///   appears, the outcome to have is a refusal and not a frame silently widened to the
+///   whole result.
 fn reject_discarded_window_clauses(func: &Function) -> PgWireResult<()> {
     use crate::sqlparser::ast::{NullTreatment, WindowType};
 
@@ -233,9 +312,20 @@ fn reject_discarded_window_clauses(func: &Function) -> PgWireResult<()> {
         return Err(unsupported(
             format!("FILTER on the window function {}", func.name),
             "the window expression carries no filter across the wire, so every row in \
-             the window would be aggregated as though the FILTER were absent; move the \
-             condition into a CASE expression inside the aggregate, or aggregate a \
-             subquery that applies it in its WHERE",
+             the window would be aggregated as though the FILTER were absent, and this \
+             aggregate is one whose answer a null argument changes, so the condition \
+             cannot be folded into the argument for you; aggregate a subquery that \
+             applies the condition in its WHERE instead",
+        ));
+    }
+
+    if matches!(func.null_treatment, Some(NullTreatment::IgnoreNulls)) {
+        return Err(unsupported(
+            format!("IGNORE NULLS on {}", func.name),
+            "the clause is discarded, so a NULL it asks to skip would still be returned; \
+             PostgreSQL does not implement this option either and always behaves as \
+             RESPECT NULLS, so there is no PostgreSQL result to match — filter the nulls \
+             out in a subquery if you need them skipped",
         ));
     }
 
@@ -251,193 +341,102 @@ fn reject_discarded_window_clauses(func: &Function) -> PgWireResult<()> {
         ));
     }
 
-    if matches!(func.null_treatment, Some(NullTreatment::IgnoreNulls)) {
-        return Err(unsupported(
-            format!("IGNORE NULLS on {}", func.name),
-            "the clause is discarded, so a NULL it asks to skip would still be \
-             returned; filter the nulls out in a subquery instead",
-        ));
-    }
-
     Ok(())
 }
 
-/// Refuse a `WINDOW` clause that defines one window in terms of another.
+/// Fold a window function's `FILTER (WHERE p)` into its argument, so
+/// `agg(x) FILTER (WHERE p) OVER (…)` becomes `agg(CASE WHEN p THEN x END) OVER (…)`.
 ///
-/// The same lost clause as the `OVER (w …)` refusal above, declared in the other place
-/// PostgreSQL lets it be declared. `WINDOW w1 AS (PARTITION BY cat ORDER BY id),
-/// w2 AS (w1)` then used as `OVER w2` measured `100, 100, 100, 100` on DataFusion 54.1 —
-/// the whole-table sum — against PostgreSQL's `10, 30, 30, 70`; adding a clause of its
-/// own, `w2 AS (w1 ORDER BY id)`, measured `10, 30, 60, 100`, which is `w1`'s
-/// `PARTITION BY` dropped. Referring to `w1` directly as `OVER w1` is correct and stays
-/// accepted, and so does any definition that names no other window.
+/// `FILTER` beside `OVER` is the one combination DataFusion drops: `Expr::WindowFunction`
+/// has no filter field, so the predicate is parsed, discarded, and every row in the window
+/// aggregated. Ballista would need a proto field and both codecs to carry one — but for the
+/// aggregates that *ignore* nulls, nothing has to be carried at all. Turning the excluded
+/// rows into NULL arguments removes them from the aggregate by the aggregate's own rule,
+/// which is exactly the definition of `FILTER`, and it is the workaround the refusal used to
+/// name. Doing it here means the client does not have to.
 ///
-/// The one inheritance spelling left alone is `w2 AS w1` without parentheses, which is
-/// BigQuery's rather than PostgreSQL's and which DataFusion already rejects by name
-/// (`The window w1 is not defined!`).
-fn reject_chained_named_windows(stmt: &Statement) -> PgWireResult<()> {
-    use crate::sqlparser::ast::{Query, SetExpr, Visit, Visitor};
-
-    struct Chained;
-
-    impl Visitor for Chained {
-        type Break = PgWireError;
-
-        fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<PgWireError> {
-            match check_set_expr(&query.body) {
-                Ok(()) => ControlFlow::Continue(()),
-                Err(e) => ControlFlow::Break(e),
-            }
-        }
-    }
-
-    /// A nested `SetExpr::Query` is deliberately not followed — the visitor reaches that
-    /// `Query` on its own, and checking it here would only duplicate the work.
-    fn check_set_expr(body: &SetExpr) -> PgWireResult<()> {
-        match body {
-            SetExpr::Select(select) => check_named_windows(&select.named_window),
-            SetExpr::SetOperation { left, right, .. } => {
-                check_set_expr(left)?;
-                check_set_expr(right)
-            }
-            _ => Ok(()),
-        }
-    }
-
-    fn check_named_windows(
-        windows: &[crate::sqlparser::ast::NamedWindowDefinition],
-    ) -> PgWireResult<()> {
-        use crate::sqlparser::ast::NamedWindowExpr;
-
-        for crate::sqlparser::ast::NamedWindowDefinition(defined, expr) in windows {
-            if let NamedWindowExpr::WindowSpec(spec) = expr
-                && let Some(inherited) = &spec.window_name
-            {
-                return Err(unsupported(
-                    format!("the window {defined} defined in terms of the window {inherited}"),
-                    "the inherited PARTITION BY and ORDER BY are dropped, so a function \
-                     using it would aggregate over the whole result instead of over that \
-                     window; write the clauses out in each WINDOW definition",
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    match stmt.visit(&mut Chained) {
-        ControlFlow::Continue(()) => Ok(()),
-        ControlFlow::Break(e) => Err(e),
-    }
-}
-
-/// Refuse `INTERSECT ALL` and `EXCEPT ALL`, whose answers ignore how many times a row
-/// appears.
+/// The rewrite is only exact where a NULL argument is *no* input:
 ///
-/// The `ALL` in a set operation is not a synonym for "no `DISTINCT`": it makes the
-/// operation count duplicates, so `INTERSECT ALL` keeps a row as many times as it appears
-/// on *both* sides and `EXCEPT ALL` removes one left row per matching right row. Measured
-/// on a 5-node cluster with the left side holding `1, 1, 1, 2` and the right `1, 1, 3`:
-/// `INTERSECT ALL` answered `1, 1, 1` where PostgreSQL answers `1, 1`, and `EXCEPT ALL`
-/// answered `2` where PostgreSQL answers `1, 2`. Both are the semi/anti join the
-/// `DISTINCT` forms are built from, applied without the multiplicity bookkeeping.
+/// * `count(x)` counts non-null arguments, so `count(*)` becomes `count(CASE WHEN p THEN 1
+///   END)` — the value only has to be non-null.
+/// * `sum`, `avg`, `min`, `max`, the `stddev`/`variance` family, `bool_and`/`bool_or` and
+///   `bit_and`/`bit_or` all skip nulls, and all answer NULL over no rows, which is what
+///   `FILTER` excluding every row answers too.
 ///
-/// So both are refused rather than answered: a row count is exactly what an analytical
-/// client would go on to aggregate, and a plausible wrong one is worse than an error.
-/// `INTERSECT` and `EXCEPT` are correct and stay accepted, and they are what the message
-/// points at. `UNION ALL` is untouched — it concatenates, which is all its `ALL` asks for.
-fn reject_multiplicity_set_operations(stmt: &Statement) -> PgWireResult<()> {
-    use crate::sqlparser::ast::{Query, SetExpr, SetOperator, SetQuantifier, Visit, Visitor};
-
-    struct Multiplicity;
-
-    impl Visitor for Multiplicity {
-        type Break = PgWireError;
-
-        fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<PgWireError> {
-            match check_set_expr(&query.body) {
-                Ok(()) => ControlFlow::Continue(()),
-                Err(e) => ControlFlow::Break(e),
-            }
-        }
+/// It is *not* exact for `array_agg`, `string_agg` or `json_agg`, which keep a null as an
+/// element and would gain one entry per excluded row. Those keep the refusal above, which
+/// now says why. `DISTINCT` is left alone for the same reason it is left alone elsewhere:
+/// `count(DISTINCT x) OVER (…)` is not a form DataFusion evaluates, so folding into it would
+/// only move where the failure comes from.
+fn rewrite_window_filter(func: &mut Function) {
+    if func.over.is_none() {
+        return;
     }
-
-    /// As in [`reject_chained_named_windows`], a nested `SetExpr::Query` is left to the
-    /// visitor, which reaches that `Query` itself.
-    fn check_set_expr(body: &SetExpr) -> PgWireResult<()> {
-        let SetExpr::SetOperation {
-            op,
-            set_quantifier,
-            left,
-            right,
-        } = body
-        else {
-            return Ok(());
-        };
-        // `MINUS` is `EXCEPT` under another name, so it counts duplicates the same way.
-        if matches!(
-            op,
-            SetOperator::Intersect | SetOperator::Except | SetOperator::Minus
-        ) && matches!(
-            set_quantifier,
-            SetQuantifier::All | SetQuantifier::AllByName
-        ) {
-            let distinct = match op {
-                SetOperator::Intersect => "INTERSECT",
-                _ => "EXCEPT",
-            };
-            return Err(unsupported(
-                format!("{op} {set_quantifier}"),
-                &format!(
-                    "duplicate rows are not counted, so it answers neither the number of \
-                     rows PostgreSQL does nor a subset of them; use {distinct}, which \
-                     compares the rows as sets and is correct"
-                ),
-            ));
-        }
-        check_set_expr(left)?;
-        check_set_expr(right)
-    }
-
-    match stmt.visit(&mut Multiplicity) {
-        ControlFlow::Continue(()) => Ok(()),
-        ControlFlow::Break(e) => Err(e),
-    }
-}
-
-/// Refuse a quantified comparison over a subquery in one of the spellings that cannot
-/// cross a stage boundary — every one except the two [`normalize_any_all_subqueries`]
-/// has already turned into `IN`/`NOT IN`.
-///
-/// `x > ALL (SELECT …)`, `x = ALL (…)` and `x > ANY (…)` all plan to a *mark* join, whose
-/// output column is named `mark` on both sides of the join it feeds. Serializing that plan
-/// for an executor fails — `Schema contains duplicate unqualified field name mark` — so
-/// the query reached the client as `XX000` carrying a raw gRPC `Status { … }`. Refusing
-/// says the same thing without the internals, and names the rewrite that works.
-///
-/// The rewrite is *named*, not applied: `x > (SELECT max(c) …)` differs from
-/// `x > ALL (SELECT c …)` on an empty subquery and on one containing a NULL, so
-/// substituting it would answer a different question quietly. Which of the two the client
-/// wants is the client's to decide.
-///
-/// [`normalize_any_all_subqueries`]: super::compat_rewrite::normalize_any_all_subqueries
-fn quantified_subquery_unsupported(
-    compare_op: &BinaryOperator,
-    quantifier: &'static str,
-) -> PgWireError {
-    let aggregate = if quantifier == "ALL" {
-        "max()/min()"
-    } else {
-        "min()/max()"
+    let Some(predicate) = func.filter.clone() else {
+        return;
     };
-    unsupported(
-        format!("{compare_op} {quantifier} (subquery)"),
-        &format!(
-            "the plan it needs cannot be shipped to an executor; compare against an \
-             aggregate over the same subquery instead — {aggregate} for an ordering \
-             operator — or use EXISTS, and note that the aggregate form answers \
-             differently for an empty subquery and for one containing NULLs. \
-             `= ANY (subquery)` and `<> ALL (subquery)` are supported"
-        ),
+    let Some(name) = bare_function_name(&func.name) else {
+        return;
+    };
+    if !aggregate_ignores_null_arguments(&name) {
+        return;
+    }
+    let FunctionArguments::List(list) = &mut func.args else {
+        return;
+    };
+    // A single unnamed argument is the whole of the surface this applies to: the
+    // multi-argument aggregates are the ones excluded above, and `DISTINCT` or a `WITHIN
+    // GROUP`-style clause list means a form whose answer this would not preserve.
+    if list.duplicate_treatment.is_some() || !list.clauses.is_empty() {
+        return;
+    }
+    let [FunctionArg::Unnamed(arg)] = list.args.as_mut_slice() else {
+        return;
+    };
+    let counted = match arg {
+        FunctionArgExpr::Expr(expr) => expr.clone(),
+        // `count(*)` counts rows rather than values, so any non-null stands in for one.
+        FunctionArgExpr::Wildcard => Expr::value(Value::Number("1".to_string(), false)),
+        // `count(t.*)` and Snowflake's `* EXCLUDE (…)`: neither is a value to guard.
+        _ => return,
+    };
+    *arg = FunctionArgExpr::Expr(Expr::Case {
+        case_token: AttachedToken::empty(),
+        end_token: AttachedToken::empty(),
+        operand: None,
+        conditions: vec![CaseWhen {
+            condition: *predicate,
+            result: counted,
+        }],
+        // No `ELSE`, so an excluded row is NULL and the aggregate skips it — which is the
+        // whole of the rewrite.
+        else_result: None,
+    });
+    func.filter = None;
+}
+
+/// Whether a NULL argument is no input at all to this aggregate, which is what makes
+/// [`rewrite_window_filter`] exact. PostgreSQL's own spellings, since the rewrite runs
+/// before [`postgres_aggregate_alias`].
+fn aggregate_ignores_null_arguments(name: &str) -> bool {
+    matches!(
+        name.to_lowercase().as_str(),
+        "count"
+            | "sum"
+            | "avg"
+            | "min"
+            | "max"
+            | "bool_and"
+            | "bool_or"
+            | "every"
+            | "bit_and"
+            | "bit_or"
+            | "stddev"
+            | "stddev_pop"
+            | "stddev_samp"
+            | "variance"
+            | "var_pop"
+            | "var_samp"
     )
 }
 
@@ -474,6 +473,74 @@ fn postgres_aggregate_alias(name: &ObjectName) -> Option<&'static str> {
         "every" => Some("bool_and"),
         "any_value" => Some("min"),
         _ => None,
+    }
+}
+
+/// The bare, unqualified name of a function call, lower-cased.
+fn bare_function_name(name: &ObjectName) -> Option<String> {
+    if name.0.len() != 1 {
+        return None;
+    }
+    Some(name.0.first()?.as_ident()?.value.to_ascii_lowercase())
+}
+
+/// Whether `name` is `json_agg` or `jsonb_agg`.
+fn is_json_aggregate(name: &ObjectName) -> bool {
+    matches!(
+        bare_function_name(name).as_deref(),
+        Some(JSON_AGG_NAME | JSONB_AGG_NAME)
+    )
+}
+
+/// Rewrite `json_agg(…)` into `vaire_json_array(array_agg(…))`.
+///
+/// Only the function's *name* changes; `DISTINCT`, an in-aggregate `ORDER BY`, `FILTER` and
+/// an `OVER` all ride along on the `array_agg` untouched, which is the point of composing
+/// rather than implementing an aggregate — see [`vairedb_common::json_agg`].
+///
+/// The rendering is picked here because this is the last place the difference is visible:
+/// `json_agg` of a json *document* embeds it and `json_agg` of text quotes it, and both are
+/// `Utf8` by planning time. [`produces_json_document`] is what decides.
+fn json_aggregate_call(mut func: Function) -> Expr {
+    let documents = json_aggregate_argument(&func).is_some_and(produces_json_document);
+    func.name = ObjectName::from(vec![Ident::new("array_agg")]);
+    let rendering = match documents {
+        true => JSON_ARRAY_DOCS_UDF_NAME,
+        false => JSON_ARRAY_UDF_NAME,
+    };
+    call(rendering, vec![Expr::Function(func)])
+}
+
+/// The single aggregated expression, if the call has exactly one positional argument.
+fn json_aggregate_argument(func: &Function) -> Option<&Expr> {
+    let FunctionArguments::List(list) = &func.args else {
+        return None;
+    };
+    match list.args.as_slice() {
+        [FunctionArg::Unnamed(FunctionArgExpr::Expr(only))] => Some(only),
+        _ => None,
+    }
+}
+
+/// Whether `expr` produces a json document rather than a value to be quoted as one.
+///
+/// Read off the expression, because the value cannot say: both are `Utf8`. By the time this
+/// runs the expression has already been rewritten — the visit is post-order — so the json
+/// forms are the calls the arms above emitted, not the casts and operators a client wrote.
+///
+/// A bare column *declared* `JSON` or `JSONB` is not recognized, and is quoted: at this
+/// point it is an identifier with no type attached. `json_agg(payload::jsonb)` is the
+/// spelling that embeds; the residue is recorded in `docs/specs/gap-analysis.md`.
+fn produces_json_document(expr: &Expr) -> bool {
+    match expr {
+        Expr::Nested(inner) => produces_json_document(inner),
+        Expr::Function(func) => matches!(
+            bare_function_name(&func.name).as_deref(),
+            // The `_text` accessors are deliberately absent: `->>` and `#>>` return text,
+            // which PostgreSQL quotes here just like any other string.
+            Some(JSON_IN_UDF_NAME | JSONB_IN_UDF_NAME | JSON_GET_UDF_NAME | JSON_PATH_UDF_NAME)
+        ),
+        _ => false,
     }
 }
 
@@ -539,6 +606,71 @@ pub(crate) fn is_byte_order_collation(collation: &ObjectName) -> bool {
         || name.value == "POSIX"
         || name.value.eq_ignore_ascii_case("ucs_basic")
         || name.value.eq_ignore_ascii_case("default")
+}
+
+/// Refuse an ordered-set aggregate called without the clause that makes it one, the way
+/// PostgreSQL refuses it.
+///
+/// `mode()` and `rank(5)` are not functions on their own: the `WITHIN GROUP (ORDER BY …)` is
+/// where their input comes from, so without it there is nothing to aggregate. PostgreSQL says
+/// `WITHIN GROUP is required for ordered-set aggregate mode` with `ERRCODE_WRONG_OBJECT_TYPE`,
+/// and this returns the same sentence and the same `42809`. Left to the planner it would be a
+/// signature-resolution error instead — `'mode' does not support zero arguments … Candidate
+/// functions: mode(Any)` — which advertises an internal arity the client cannot use, since
+/// PostgreSQL's `mode` takes no direct argument at all.
+///
+/// The four hypothetical-set names are only checked when the call *has* arguments. `rank()`
+/// with neither clause is a window function missing its `OVER`, which is a different statement
+/// and a different PostgreSQL message; `rank(5)` can only have meant the aggregate.
+fn reject_ordered_set_without_within_group(func: &Function) -> PgWireResult<()> {
+    if !func.within_group.is_empty() || func.over.is_some() {
+        return Ok(());
+    }
+    let Some(name) = bare_function_name(&func.name) else {
+        return Ok(());
+    };
+    let lowered = name.to_lowercase();
+    let has_arguments = match &func.args {
+        FunctionArguments::List(list) => !list.args.is_empty(),
+        _ => false,
+    };
+    let is_ordered_set = matches!(
+        lowered.as_str(),
+        "mode" | "percentile_cont" | "percentile_disc"
+    ) || (has_arguments
+        && vairedb_common::within_group::hypothetical_set_udaf(&lowered).is_some());
+    if !is_ordered_set {
+        return Ok(());
+    }
+    Err(make_vdb_error(
+        VdbErrorCode::WrongObjectType,
+        format!("WITHIN GROUP is required for ordered-set aggregate {lowered}"),
+    ))
+}
+
+/// Rename `rank(h) WITHIN GROUP (ORDER BY x)` — and its three siblings — to the UDAF that
+/// answers it, leaving `rank() OVER (…)` alone.
+///
+/// The two are different functions that PostgreSQL spells with one name, and DataFusion's
+/// planner resolves `OVER` by looking in the *aggregate* registry first: an aggregate called
+/// `rank` would take the window function away from every query that uses it. So the aggregate
+/// is registered under a name of VaireDB's own and this is where the client's spelling reaches
+/// it — see [`vairedb_common::within_group`], which records the measurement.
+///
+/// The conditions are the whole of the distinction. A `WITHIN GROUP` clause is what makes the
+/// call the aggregate; an `OVER` clause is what makes it the window function, and a call
+/// carrying both is a statement PostgreSQL rejects, so it is left as it is for the planner to
+/// fault rather than quietly turned into one of the two.
+fn rename_hypothetical_set_aggregate(func: &mut Function) {
+    if func.within_group.is_empty() || func.over.is_some() {
+        return;
+    }
+    let Some(name) = bare_function_name(&func.name) else {
+        return;
+    };
+    if let Some(udaf) = vairedb_common::within_group::hypothetical_set_udaf(&name) {
+        func.name = ObjectName::from(vec![Ident::new(udaf)]);
+    }
 }
 
 /// Refuse a percentile whose fraction is a literal outside 0..1, here rather than there.
@@ -1064,6 +1196,89 @@ mod tests {
         }
     }
 
+    // The hypothetical-set aggregates reach their UDAF by being renamed, because the name
+    // the client writes belongs to a window function in DataFusion's planner. `WITHIN GROUP`
+    // and no `OVER` is the whole of the condition — see `rename_hypothetical_set_aggregate`.
+    #[test]
+    fn renames_a_hypothetical_set_aggregate_to_its_udaf() {
+        for (name, udaf) in [
+            ("rank", "vaire_hypothetical_rank"),
+            ("dense_rank", "vaire_hypothetical_dense_rank"),
+            ("percent_rank", "vaire_hypothetical_percent_rank"),
+            ("cume_dist", "vaire_hypothetical_cume_dist"),
+        ] {
+            let sql = format!("SELECT {name}(5) WITHIN GROUP (ORDER BY n) FROM t");
+            assert_eq!(
+                rewritten(&sql).unwrap(),
+                format!("SELECT {udaf}(5) WITHIN GROUP (ORDER BY n) FROM t")
+            );
+        }
+        // The client's own casing is not the name it is matched against.
+        assert_eq!(
+            rewritten("SELECT DENSE_RANK(5) WITHIN GROUP (ORDER BY n) FROM t").unwrap(),
+            "SELECT vaire_hypothetical_dense_rank(5) WITHIN GROUP (ORDER BY n) FROM t"
+        );
+    }
+
+    // The regression the rename exists to prevent: a window function of the same name must
+    // still be the window function, whatever else it carries.
+    #[test]
+    fn leaves_the_window_functions_of_those_names_alone() {
+        for sql in [
+            "SELECT rank() OVER (ORDER BY n) FROM t",
+            "SELECT dense_rank() OVER (PARTITION BY g ORDER BY n) FROM t",
+            "SELECT percent_rank() OVER (ORDER BY n) FROM t",
+            "SELECT cume_dist() OVER (ORDER BY n) FROM t",
+            // Neither clause, so neither aggregate: this is a window function that has lost
+            // its OVER, and the planner's own message about that is the honest one.
+            "SELECT rank() FROM t",
+        ] {
+            assert_eq!(rewritten(sql).unwrap(), sql, "`{sql}` must be untouched");
+        }
+    }
+
+    // `mode()` keeps its name: no window function has it, so nothing has to be protected
+    // from the aggregate.
+    #[test]
+    fn leaves_mode_under_its_own_name() {
+        let sql = "SELECT mode() WITHIN GROUP (ORDER BY n) FROM t";
+        assert_eq!(rewritten(sql).unwrap(), sql);
+    }
+
+    // An ordered-set aggregate without the clause that gives it its input is PostgreSQL's own
+    // error, not a signature-resolution one — and the planner's version advertises an internal
+    // arity (`mode(Any)`) that PostgreSQL's `mode` does not have.
+    #[test]
+    fn refuses_an_ordered_set_aggregate_without_within_group() {
+        for sql in [
+            "SELECT mode() FROM t",
+            "SELECT percentile_cont(0.5) FROM t",
+            "SELECT percentile_disc(0.5) FROM t",
+            "SELECT rank(5) FROM t",
+            "SELECT cume_dist(5) FROM t",
+        ] {
+            let err = rewritten(sql).expect_err("the clause is what makes it an aggregate");
+            assert!(
+                err.contains("WITHIN GROUP is required for ordered-set aggregate"),
+                "{err}"
+            );
+        }
+
+        // The neighbours. With the clause, and as window functions, and `rank()` with neither
+        // clause — which is a window function missing its OVER, a different statement.
+        for sql in [
+            "SELECT mode() WITHIN GROUP (ORDER BY n) FROM t",
+            "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY n) FROM t",
+            "SELECT rank(5) WITHIN GROUP (ORDER BY n) FROM t",
+            "SELECT rank() OVER (ORDER BY n) FROM t",
+            "SELECT cume_dist() OVER (ORDER BY n) FROM t",
+            "SELECT rank() FROM t",
+            "SELECT sum(n) FROM t",
+        ] {
+            rewritten(sql).unwrap_or_else(|e| panic!("`{sql}` must not be refused: {e}"));
+        }
+    }
+
     // A client-chosen `ESCAPE` is one DataFusion refuses outright, so the pattern is
     // re-spelled with the one it does read. The set of strings matched is what has to
     // survive: `a!_%` matches a literal underscore, and so does `a\_%`.
@@ -1272,69 +1487,74 @@ mod tests {
 
     // --- the window clauses DataFusion parses and drops ---
 
-    // `FILTER` survives on a plain aggregate and is lost on a windowed one, so the
-    // refusal has to distinguish the two rather than refuse the keyword.
+    // `FILTER` beside `OVER` is dropped, so the predicate moves into the argument where the
+    // aggregate skipping nulls makes that exact. On a plain aggregate the filter is applied
+    // correctly, so it must come through untouched.
     #[test]
-    fn refuses_filter_only_when_the_aggregate_is_windowed() {
-        let err = rewritten("SELECT sum(x) FILTER (WHERE x > 10) OVER (PARTITION BY g) FROM t")
-            .expect_err("the filter would be dropped and every row summed");
-        assert!(err.contains("FILTER"), "{err}");
+    fn folds_a_windowed_filter_into_the_argument() {
+        assert_eq!(
+            rewritten("SELECT sum(x) FILTER (WHERE x > 10) OVER (PARTITION BY g) FROM t").unwrap(),
+            "SELECT sum(CASE WHEN x > 10 THEN x END) OVER (PARTITION BY g) FROM t"
+        );
+        // `count(*)` counts rows, so any non-null argument stands in for one.
+        assert_eq!(
+            rewritten("SELECT count(*) FILTER (WHERE x > 10) OVER (ORDER BY x) FROM t").unwrap(),
+            "SELECT count(CASE WHEN x > 10 THEN 1 END) OVER (ORDER BY x) FROM t"
+        );
 
         let sql = "SELECT sum(x) FILTER (WHERE x > 10) FROM t GROUP BY g";
         assert_eq!(
             rewritten(sql).unwrap(),
             sql,
-            "an unwindowed FILTER is applied correctly, so refusing it would cost a \
-             working query"
+            "an unwindowed FILTER is applied correctly, so rewriting it would be work \
+             for nothing"
         );
     }
 
-    // Naming a window inside the parentheses loses that window's own clauses; naming it
-    // without them resolves correctly. `OVER (w)` with nothing added is the same defect,
-    // so the refusal keys on the name, not on what accompanies it.
+    // The aggregates a NULL argument is an *input* to keep the refusal: folding the
+    // predicate in would add one null element per excluded row.
     #[test]
-    fn refuses_a_window_spec_that_names_another_window() {
+    fn refuses_a_windowed_filter_on_an_aggregate_that_counts_nulls() {
         for sql in [
-            "SELECT sum(x) OVER (w ORDER BY x) FROM t WINDOW w AS (PARTITION BY g)",
-            "SELECT sum(x) OVER (w) FROM t WINDOW w AS (PARTITION BY g ORDER BY x)",
+            "SELECT array_agg(x) FILTER (WHERE x > 10) OVER (ORDER BY x) FROM t",
+            "SELECT string_agg(x, ',') FILTER (WHERE x > 10) OVER (ORDER BY x) FROM t",
+            // `DISTINCT` is not a windowed form DataFusion evaluates, so folding into it
+            // would only move where the failure comes from.
+            "SELECT count(DISTINCT x) FILTER (WHERE x > 10) OVER (ORDER BY x) FROM t",
         ] {
-            let err = rewritten(sql).expect_err("the named window's clauses would be dropped");
-            assert!(err.contains("named window"), "{err}");
+            let err = rewritten(sql).expect_err("the filter would be dropped");
+            assert!(err.contains("FILTER"), "{err}");
         }
-
-        let sql = "SELECT sum(x) OVER w FROM t WINDOW w AS (PARTITION BY g ORDER BY x)";
-        assert_eq!(rewritten(sql).unwrap(), sql, "`OVER w` resolves correctly");
     }
 
-    // The same lost clause declared in the `WINDOW` list rather than in the `OVER`. Both
-    // spellings measured wrong on 54.1: `w2 AS (w1)` sums the whole table, and
-    // `w2 AS (w1 ORDER BY id)` keeps the order and drops the partition.
+    // The named-window expansion is wired into this pass, which is what the rest of its
+    // rules are tested against in [`super::super::pg_named_windows`].
     #[test]
-    fn refuses_a_window_defined_in_terms_of_another_window() {
-        for sql in [
-            "SELECT sum(x) OVER w2 FROM t WINDOW w1 AS (PARTITION BY g), w2 AS (w1 ORDER BY x)",
-            "SELECT sum(x) OVER w2 FROM t WINDOW w1 AS (PARTITION BY g ORDER BY x), w2 AS (w1)",
-        ] {
-            let err = rewritten(sql).expect_err("the inherited clauses would be dropped");
-            assert!(err.contains("defined in terms of the window w1"), "{err}");
-        }
-
-        // Two independent definitions inherit nothing, so there is nothing to lose.
-        let sql = "SELECT sum(x) OVER w1, sum(x) OVER w2 FROM t \
-                   WINDOW w1 AS (PARTITION BY g), w2 AS (ORDER BY x)";
-        assert_eq!(rewritten(sql).unwrap(), sql);
-    }
-
-    // The chained definition is refused wherever it is written, including inside a
-    // derived table, where the enclosing query's own `WINDOW` list is a different one.
-    #[test]
-    fn refuses_a_chained_window_inside_a_subquery() {
-        let err = rewritten(
+    fn expands_a_window_specification_that_names_a_window() {
+        assert_eq!(
+            rewritten("SELECT sum(x) OVER (w ORDER BY x) FROM t WINDOW w AS (PARTITION BY g)")
+                .unwrap(),
+            "SELECT sum(x) OVER (PARTITION BY g ORDER BY x) FROM t WINDOW w AS (PARTITION BY g)"
+        );
+        assert_eq!(
+            rewritten(
+                "SELECT s FROM (SELECT sum(x) AS s FROM t \
+                 WINDOW w1 AS (PARTITION BY g), w2 AS (w1 ORDER BY x)) d"
+            )
+            .unwrap(),
             "SELECT s FROM (SELECT sum(x) AS s FROM t \
-             WINDOW w1 AS (PARTITION BY g), w2 AS (w1)) d",
+             WINDOW w1 AS (PARTITION BY g), w2 AS (PARTITION BY g ORDER BY x)) d"
+        );
+        // And PostgreSQL's own refusal still arrives through this pass.
+        let err = rewritten(
+            "SELECT sum(x) OVER (w ORDER BY x) FROM t WINDOW w AS (PARTITION BY g ORDER BY g)",
         )
-        .expect_err("a subquery's WINDOW clause loses the same clauses");
-        assert!(err.contains("defined in terms of the window w1"), "{err}");
+        .expect_err("PostgreSQL refuses overriding an inherited ORDER BY");
+        assert!(err.contains("cannot override ORDER BY"), "{err}");
+
+        // `OVER w` names no window inside the parentheses, so there is nothing to expand.
+        let sql = "SELECT sum(x) OVER w FROM t WINDOW w AS (PARTITION BY g ORDER BY x)";
+        assert_eq!(rewritten(sql).unwrap(), sql);
     }
 
     // `IGNORE NULLS` is discarded; `RESPECT NULLS` asks for the default, so dropping it
@@ -1357,38 +1577,32 @@ mod tests {
         assert_eq!(rewritten(sql).unwrap(), sql);
     }
 
-    // `INTERSECT ALL` and `EXCEPT ALL` counted duplicates wrongly rather than not at all,
-    // so the refusal is about an answer, and it names the form that is right.
+    // `INTERSECT ALL` and `EXCEPT ALL` count duplicates wrongly rather than not at all, so
+    // they are marked here for the plan-level rewrite that repairs them rather than refused.
+    // What this asserts is only that the marker is applied, and everywhere a set operation can
+    // be written: whether the marked plan answers PostgreSQL's row counts is
+    // `pg_set_op_multiplicity`'s question.
     #[test]
-    fn refuses_the_set_operations_that_ignore_duplicates() {
-        for (sql, form, workaround) in [
-            (
-                "SELECT k FROM l INTERSECT ALL SELECT k FROM r",
-                "INTERSECT ALL",
-                "use INTERSECT",
-            ),
-            (
-                "SELECT k FROM l EXCEPT ALL SELECT k FROM r",
-                "EXCEPT ALL",
-                "use EXCEPT",
-            ),
-            (
-                "SELECT k FROM l MINUS ALL SELECT k FROM r",
-                "MINUS ALL",
-                "use EXCEPT",
-            ),
+    fn marks_the_set_operations_that_count_duplicates() {
+        for sql in [
+            "SELECT k FROM l INTERSECT ALL SELECT k FROM r",
+            "SELECT k FROM l EXCEPT ALL SELECT k FROM r",
+            "SELECT k FROM l MINUS ALL SELECT k FROM r",
+            // A set operation nested in a subquery or a CTE is reached too: the visitor sees
+            // every `Query`, not only the outermost.
+            "SELECT count(*) FROM (SELECT k FROM l EXCEPT ALL SELECT k FROM r) d",
+            "WITH c AS (SELECT k FROM l INTERSECT ALL SELECT k FROM r) SELECT * FROM c",
         ] {
-            let err = rewritten(sql).expect_err("the row count would be wrong");
-            assert!(err.contains(form), "the message names the form: {err}");
+            let marked = rewritten(sql).expect("marked, not refused");
             assert!(
-                err.contains(workaround),
-                "the message names the correct form: {err}"
+                marked.contains("__vaire_set_op_all"),
+                "`{sql}` should be marked, got: {marked}"
             );
         }
     }
 
-    // The set operations that are correct: the two `DISTINCT` forms the refusals point at,
-    // and `UNION ALL`, whose `ALL` only asks for concatenation.
+    // The set operations that need no marker: the two `DISTINCT` forms, which compare the rows
+    // as sets, and `UNION ALL`, whose `ALL` only asks for concatenation.
     #[test]
     fn leaves_the_set_operations_that_are_correct_alone() {
         for sql in [
@@ -1401,53 +1615,23 @@ mod tests {
         }
     }
 
-    // A set operation nested in a subquery or a CTE is reached too: the visitor sees
-    // every `Query`, not only the outermost.
+    // The quantified comparisons over a subquery are no longer this module's business: they
+    // are lowered on the plan, where the subquery's arity and the position it sits in can be
+    // read, by `pg_set_op_multiplicity`'s neighbour `pg_quantified_subqueries`. So they pass
+    // through here as written.
     #[test]
-    fn refuses_a_multiplicity_set_operation_inside_a_subquery() {
-        let err = rewritten("SELECT count(*) FROM (SELECT k FROM l EXCEPT ALL SELECT k FROM r) d")
-            .expect_err("a nested EXCEPT ALL is as wrong as a top-level one");
-        assert!(err.contains("EXCEPT ALL"), "{err}");
-
-        let err =
-            rewritten("WITH c AS (SELECT k FROM l INTERSECT ALL SELECT k FROM r) SELECT * FROM c")
-                .expect_err("a CTE's body is a query too");
-        assert!(err.contains("INTERSECT ALL"), "{err}");
-    }
-
-    // The quantified comparisons that plan to a mark join reached the client as `XX000`
-    // with a raw gRPC `Status { … }` in it. Refused by name instead, with the aggregate
-    // rewrite spelled out — and with the two spellings that do work named, since they are
-    // one character away from the refused ones.
-    #[test]
-    fn refuses_the_quantified_subquery_forms_that_cannot_be_shipped() {
-        for (sql, form) in [
+    fn leaves_the_quantified_subquery_forms_to_the_plan_pass() {
+        for (sql, rendered) in [
             (
                 "SELECT id FROM l WHERE id > ALL (SELECT id FROM r)",
-                "> ALL",
-            ),
-            (
-                "SELECT id FROM l WHERE id = ALL (SELECT id FROM r)",
-                "= ALL",
-            ),
-            (
-                "SELECT id FROM l WHERE id > ANY (SELECT id FROM r)",
-                "> ANY",
+                "SELECT id FROM l WHERE id > ALL(SELECT id FROM r)",
             ),
             (
                 "SELECT id FROM l WHERE id < SOME (SELECT id FROM r)",
-                "< SOME",
+                "SELECT id FROM l WHERE id < SOME(SELECT id FROM r)",
             ),
         ] {
-            let err = rewritten(sql).expect_err("this plan cannot cross a stage boundary");
-            assert!(
-                err.contains(&format!("{form} (subquery)")),
-                "the message names the form: {err}"
-            );
-            assert!(
-                err.contains("<> ALL (subquery)"),
-                "the message names what does work: {err}"
-            );
+            assert_eq!(rewritten(sql).unwrap(), rendered);
         }
     }
 
@@ -1477,6 +1661,204 @@ mod tests {
             ),
         ] {
             assert_eq!(rewritten(sql).unwrap(), rendered);
+        }
+    }
+
+    // The three text-backed types, each becoming its own input conversion. `bytea` is here
+    // beside them because they all leave through the same arm and the arm has to tell them
+    // apart — a mix-up would validate a UUID as json and say so in the wrong SQLSTATE.
+    #[test]
+    fn rewrites_the_casts_arrow_has_no_conversion_for() {
+        for (sql, rendered) in [
+            ("SELECT x::json FROM t", "SELECT vaire_json_in(x) FROM t"),
+            ("SELECT x::jsonb FROM t", "SELECT vaire_jsonb_in(x) FROM t"),
+            ("SELECT x::uuid FROM t", "SELECT vaire_uuid_in(x) FROM t"),
+            ("SELECT x::bytea FROM t", "SELECT vaire_bytea_in(x) FROM t"),
+            (
+                "SELECT CAST(x AS JSON) FROM t",
+                "SELECT vaire_json_in(x) FROM t",
+            ),
+            (
+                "SELECT CAST(x AS UUID) FROM t",
+                "SELECT vaire_uuid_in(x) FROM t",
+            ),
+            // Reached wherever an expression is, and nested inside another rewrite.
+            (
+                "SELECT 1 FROM t WHERE x::uuid = y::uuid",
+                "SELECT 1 FROM t WHERE vaire_uuid_in(x) = vaire_uuid_in(y)",
+            ),
+        ] {
+            assert_eq!(rewritten(sql).unwrap(), rendered, "`{sql}`");
+        }
+    }
+
+    // A `TRY_CAST` is left alone, exactly as it is for `bytea`: it asks for NULL instead of an
+    // error, which is not what these conversions do, so respelling it would change what the
+    // client asked for rather than only how it is spelled.
+    #[test]
+    fn leaves_a_try_cast_to_a_text_backed_type_alone() {
+        for sql in [
+            "SELECT TRY_CAST(x AS JSON) FROM t",
+            "SELECT TRY_CAST(x AS UUID) FROM t",
+        ] {
+            assert_eq!(rewritten(sql).unwrap(), sql);
+        }
+    }
+
+    // The operator family the cast was blocking. The doubled forms are separate functions
+    // rather than a wrapper, because `->>` returns the extracted value as text where `->`
+    // returns it as json and the two differ for a JSON string.
+    #[test]
+    fn rewrites_the_json_accessors_to_calls() {
+        for (sql, rendered) in [
+            (
+                "SELECT d -> 'k' FROM t",
+                "SELECT vaire_json_get(d, 'k') FROM t",
+            ),
+            (
+                "SELECT d ->> 'k' FROM t",
+                "SELECT vaire_json_get_text(d, 'k') FROM t",
+            ),
+            ("SELECT d -> 0 FROM t", "SELECT vaire_json_get(d, 0) FROM t"),
+            (
+                "SELECT d #> '{a,b}' FROM t",
+                "SELECT vaire_json_path(d, '{a,b}') FROM t",
+            ),
+            (
+                "SELECT d #>> ARRAY['a', 'b'] FROM t",
+                "SELECT vaire_json_path_text(d, ARRAY['a', 'b']) FROM t",
+            ),
+            // Chained, which is the usual way to reach into a nested document. Post-order
+            // visiting is what makes the inner accessor the outer one's argument.
+            (
+                "SELECT d -> 'a' ->> 'b' FROM t",
+                "SELECT vaire_json_get_text(vaire_json_get(d, 'a'), 'b') FROM t",
+            ),
+            // In a predicate, over a cast — both rewrites meeting on one expression.
+            (
+                "SELECT 1 FROM t WHERE (x::jsonb) ->> 'k' = 'v'",
+                "SELECT 1 FROM t WHERE vaire_json_get_text((vaire_jsonb_in(x)), 'k') = 'v'",
+            ),
+        ] {
+            assert_eq!(rewritten(sql).unwrap(), rendered, "`{sql}`");
+        }
+    }
+
+    // `@?` is the one member of the family that is refused rather than rewritten: it takes a
+    // jsonpath, which is a language VaireDB has no parser for. Refusing by name is the honest
+    // shape — the alternative is an unsupported-operator failure that says nothing about why.
+    #[test]
+    fn refuses_the_jsonpath_operator() {
+        let err = rewritten("SELECT 1 FROM t WHERE d @? '$.a'").unwrap_err();
+        assert!(err.contains("@?"), "the operator must be named: {err}");
+        assert!(err.contains("jsonpath"), "the reason must be named: {err}");
+        assert!(err.contains("->>"), "the alternative must be named: {err}");
+    }
+
+    // `json_agg` composes over `array_agg` rather than being its own aggregate, so every
+    // modifier has to survive the rename — that is the whole reason for composing.
+    #[test]
+    fn composes_the_json_aggregates_over_array_agg() {
+        for (sql, rendered) in [
+            (
+                "SELECT json_agg(v) FROM t",
+                "SELECT vaire_json_array(array_agg(v)) FROM t",
+            ),
+            // Both spellings render identically here; see `vairedb_common::json_agg`.
+            (
+                "SELECT jsonb_agg(v) FROM t",
+                "SELECT vaire_json_array(array_agg(v)) FROM t",
+            ),
+            (
+                "SELECT json_agg(v ORDER BY v DESC) FROM t",
+                "SELECT vaire_json_array(array_agg(v ORDER BY v DESC)) FROM t",
+            ),
+            (
+                "SELECT json_agg(DISTINCT v) FROM t",
+                "SELECT vaire_json_array(array_agg(DISTINCT v)) FROM t",
+            ),
+            (
+                "SELECT json_agg(v) FILTER (WHERE v > 1) FROM t",
+                "SELECT vaire_json_array(array_agg(v) FILTER (WHERE v > 1)) FROM t",
+            ),
+            // Case is not significant, and a group key beside it is untouched.
+            (
+                "SELECT k, JSON_AGG(v) FROM t GROUP BY k",
+                "SELECT k, vaire_json_array(array_agg(v)) FROM t GROUP BY k",
+            ),
+        ] {
+            assert_eq!(rewritten(sql).unwrap(), rendered, "`{sql}`");
+        }
+    }
+
+    // The one thing the composition cannot read off the value: whether the aggregated
+    // expression is a json *document* to splice or a value to quote. Both are text by
+    // planning time, so the decision is taken here from the expression — and the expression
+    // has already been rewritten, which is why the check is for the accessor calls.
+    #[test]
+    fn picks_the_document_rendering_for_a_json_argument() {
+        for (sql, rendered) in [
+            (
+                "SELECT json_agg(v::json) FROM t",
+                "SELECT vaire_json_array_docs(array_agg(vaire_json_in(v))) FROM t",
+            ),
+            (
+                "SELECT json_agg(v::jsonb) FROM t",
+                "SELECT vaire_json_array_docs(array_agg(vaire_jsonb_in(v))) FROM t",
+            ),
+            (
+                "SELECT json_agg(d -> 'k') FROM t",
+                "SELECT vaire_json_array_docs(array_agg(vaire_json_get(d, 'k'))) FROM t",
+            ),
+            (
+                "SELECT json_agg(d #> '{a}') FROM t",
+                "SELECT vaire_json_array_docs(array_agg(vaire_json_path(d, '{a}'))) FROM t",
+            ),
+            (
+                "SELECT json_agg((v::json)) FROM t",
+                "SELECT vaire_json_array_docs(array_agg((vaire_json_in(v)))) FROM t",
+            ),
+            // `->>` and `#>>` return text, which PostgreSQL quotes like any other string.
+            (
+                "SELECT json_agg(d ->> 'k') FROM t",
+                "SELECT vaire_json_array(array_agg(vaire_json_get_text(d, 'k'))) FROM t",
+            ),
+            (
+                "SELECT json_agg(d #>> '{a}') FROM t",
+                "SELECT vaire_json_array(array_agg(vaire_json_path_text(d, '{a}'))) FROM t",
+            ),
+            // A bare column declared JSONB is quoted: at this point it is an identifier with
+            // no type attached. The documented residue — see `vairedb_common::json_agg`.
+            (
+                "SELECT json_agg(payload) FROM t",
+                "SELECT vaire_json_array(array_agg(payload)) FROM t",
+            ),
+            // A cast to something else is a value, not a document. It comes back with
+            // sqlparser's own upper-cased type name, which is a rendering and not a rewrite.
+            (
+                "SELECT json_agg(v::text) FROM t",
+                "SELECT vaire_json_array(array_agg(v::TEXT)) FROM t",
+            ),
+        ] {
+            assert_eq!(rewritten(sql).unwrap(), rendered, "`{sql}`");
+        }
+    }
+
+    // The refusals and rewrites above must not reach past what they name. `array_agg` itself
+    // is untouched, a function whose name merely contains `json_agg` is not one, and the
+    // json operators DataFusion does implement over arrays keep their own meaning.
+    #[test]
+    fn leaves_the_neighbouring_forms_alone() {
+        for sql in [
+            "SELECT array_agg(v) FROM t",
+            "SELECT my_json_agg(v) FROM t",
+            "SELECT other.json_agg(v) FROM t",
+            "SELECT string_agg(v, ',') FROM t",
+            // Upper-cased because that is how sqlparser renders a type name back.
+            "SELECT x::TEXT FROM t",
+            "SELECT x::INT FROM t",
+        ] {
+            assert_eq!(rewritten(sql).unwrap(), sql, "`{sql}`");
         }
     }
 }

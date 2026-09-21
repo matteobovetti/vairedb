@@ -102,8 +102,7 @@
 //! * a join whose **left side is another join** (`a JOIN b USING (x) FULL JOIN c USING (y)`),
 //!   where which relation below holds the key is again a catalog fact.
 //! * a side that is neither a named relation nor an aliased derived table, and a
-//!   schema-qualified relation with no alias — whose qualifier is not the catalog key that
-//!   [`super::parser::collapse_schema_qualified_relations`] leaves in the FROM clause.
+//!   schema-qualified relation with no alias — see [`qualifier_of`].
 //!
 //! An **unqualified** key reference inside a nested block is left alone too, and that is
 //! PostgreSQL's own rule rather than a shortcut: a bare name there resolves against that
@@ -297,9 +296,10 @@ fn single_part_keys(keys: &[ObjectName]) -> Option<Vec<Ident>> {
 /// The name a client writes to qualify a column of this relation.
 ///
 /// An alias where one is written, otherwise the relation's own name — but only when that
-/// name is a single part. A schema-qualified relation is collapsed to one quoted catalog key
-/// before planning ([`super::parser::collapse_schema_qualified_relations`]), and the
-/// qualifier for `sales.orders` is neither that key nor the two-part name.
+/// name is a single part. PostgreSQL's qualifier for `sales.orders` is `orders`, and this
+/// rewrite runs before the relation names are respelled for the planner
+/// ([`super::parser::canonicalize_relation_names`]), so a qualified relation with no alias
+/// is left to the refusal rather than guessed at.
 fn qualifier_of(factor: &TableFactor) -> Option<Ident> {
     match factor {
         TableFactor::Table { name, alias, .. } => match alias {

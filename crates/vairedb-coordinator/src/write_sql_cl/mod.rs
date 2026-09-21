@@ -124,4 +124,43 @@ mod tests {
         assert!(sql.contains("t_shard3"), "got: {sql}");
         assert!(sql.contains("$1") && sql.contains("$2"), "got: {sql}");
     }
+
+    /// A column `COLLATE` naming byte order is dropped before the DDL leaves the
+    /// coordinator. DuckDB knows none of PostgreSQL's names for byte order — even the
+    /// two that happen to resolve are an accident — so passing the clause through is a
+    /// `Catalog Error` raised by a shard after the coordinator said yes.
+    #[test]
+    fn a_byte_order_column_collation_is_dropped_before_the_shard_sees_it() {
+        for collation in [
+            "\"C\"",
+            "POSIX",
+            "ucs_basic",
+            "\"default\"",
+            "pg_catalog.default",
+        ] {
+            for sql in [
+                format!("CREATE TABLE t (id INT, s VARCHAR COLLATE {collation})"),
+                format!("ALTER TABLE t ADD COLUMN s VARCHAR COLLATE {collation}"),
+            ] {
+                let mut stmt = parse_one(&sql);
+                transform_to_duckdb(&mut stmt);
+                let rendered = statement_to_sql(&stmt);
+                assert!(
+                    !rendered.to_uppercase().contains("COLLATE"),
+                    "{sql} still carries a collation: {rendered}"
+                );
+                assert!(rendered.contains("s VARCHAR"), "got: {rendered}");
+            }
+        }
+    }
+
+    /// Any other collation is refused when the DDL is planned, so this render is never
+    /// reached with one. The guard stays so that a future planner change shows up as a
+    /// loud shard error rather than as an ordering silently replaced by byte order.
+    #[test]
+    fn any_other_column_collation_is_left_for_the_planner_to_refuse() {
+        let mut stmt = parse_one("CREATE TABLE t (s VARCHAR COLLATE nocase)");
+        transform_to_duckdb(&mut stmt);
+        assert!(statement_to_sql(&stmt).contains("COLLATE nocase"));
+    }
 }

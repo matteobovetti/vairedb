@@ -53,7 +53,7 @@ use crate::pgwire_handler::error_enrichment::{
 };
 use crate::pgwire_handler::handler::VaireDbQueryHandler;
 use crate::pgwire_handler::query_router::{
-    canonical_table_name, canonicalize_ident, qualified_name, schema_of,
+    canonical_table_name, canonicalize_ident, qualified_name, quoted_if_folded, schema_of,
 };
 use crate::sqlparser::ast::{
     CreateIndex, Expr, Ident, ObjectName, ObjectNamePart, ObjectType, Statement,
@@ -485,6 +485,95 @@ fn shard_index_name(index_name: &str, hash_bucket: u32) -> String {
     shard_table_name(index_name, hash_bucket)
 }
 
+/// Render the shard-local `CREATE INDEX` that puts one *recorded* index on one
+/// shard — built from [`IndexMeta`] rather than from a client statement, for the
+/// paths that put an index back without one: a constraint VaireDB enforces with a
+/// per-shard index, and the rebuild a column change performs (see
+/// [`shard_local_alter_with_index_rebuild`]).
+///
+/// `IF NOT EXISTS` for the same reason [`shard_local_create_index_sql`] forces it
+/// on: the coordinator's catalog, not the shards, is what reports a duplicate name,
+/// so a statement re-sent after a partial broadcast has to converge rather than
+/// fail. The column names come back out of the catalog quoted when they carry case,
+/// or a column created as `"Amount"` would be indexed as `amount`.
+pub(super) fn shard_local_recorded_index_sql(
+    index_name: &str,
+    columns: &[String],
+    unique: bool,
+    table_name: &str,
+    hash_bucket: u32,
+) -> String {
+    let columns = columns
+        .iter()
+        .map(|c| quoted_if_folded(c))
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!(
+        "CREATE {}INDEX IF NOT EXISTS {} ON {} ({})",
+        if unique { "UNIQUE " } else { "" },
+        shard_index_name(index_name, hash_bucket),
+        shard_table_name(table_name, hash_bucket),
+        columns
+    )
+}
+
+/// Render the shard-local `DROP INDEX` that takes one recorded index off one shard.
+///
+/// `IF EXISTS` because the physical index is the one thing a retry can find already
+/// gone: the catalog is what decides whether the index exists, and it is written
+/// only after every node has answered.
+pub(super) fn shard_local_drop_index_sql(index_name: &str, hash_bucket: u32) -> String {
+    format!(
+        "DROP INDEX IF EXISTS {}",
+        shard_index_name(index_name, hash_bucket)
+    )
+}
+
+/// The statements one shard runs to apply a column change to a table that carries
+/// indexes: every index off, the change, then the indexes the change leaves standing
+/// back on. Sent as one transaction per node
+/// ([`VaireDbQueryHandler::broadcast_ddl_batch_best_effort`]), so a shard is never
+/// left without an index it is recorded as having.
+///
+/// `before` is what the table's metadata recorded before the change and `after` what
+/// it records once applied, so an index over a renamed column is rebuilt around the
+/// new name, and one the change removed from the metadata is simply absent from the
+/// second list. With no indexes recorded the sequence is the change alone, which is
+/// the statement every unindexed `ALTER TABLE` has always sent.
+///
+/// **Why the indexes have to come off at all**, and why *all* of them do: the shards'
+/// engine treats an index as a dependency on the whole table and refuses to alter a
+/// column no index covers while any index exists. Taking them off inside the same
+/// transaction is what makes the refusal go away; see
+/// [`table_meta_ops::reject_unrebuildable_index`](crate::pgwire_handler::table_meta_ops)
+/// for the two cases where it does not, which are refused before this is reached.
+pub(super) fn shard_local_alter_with_index_rebuild(
+    before: &[IndexMeta],
+    after: &[IndexMeta],
+    alter_sql: String,
+    table_name: &str,
+    hash_bucket: u32,
+) -> Vec<String> {
+    if before.is_empty() {
+        return vec![alter_sql];
+    }
+    let mut statements: Vec<String> = before
+        .iter()
+        .map(|index| shard_local_drop_index_sql(&index.name, hash_bucket))
+        .collect();
+    statements.push(alter_sql);
+    statements.extend(after.iter().map(|index| {
+        shard_local_recorded_index_sql(
+            &index.name,
+            &index.columns,
+            index.unique,
+            table_name,
+            hash_bucket,
+        )
+    }));
+    statements
+}
+
 /// Render the shard-local `CREATE INDEX` for one shard: both names suffixed, the
 /// PostgreSQL-only decorations stripped, and `IF NOT EXISTS` forced on.
 ///
@@ -785,6 +874,107 @@ mod tests {
         )
         .unwrap();
         assert_eq!(index.name, "sales.idx_amount");
+    }
+
+    // --- the rebuild a column change ships ---
+
+    /// A recorded index, as the catalog holds it.
+    fn recorded_index(name: &str, columns: &[&str], unique: bool) -> IndexMeta {
+        IndexMeta {
+            name: name.to_string(),
+            columns: columns.iter().map(|c| c.to_string()).collect(),
+            unique,
+        }
+    }
+
+    // A table with no index sends the change alone: the rebuild must not turn every
+    // `ALTER TABLE` in the cluster into a transaction.
+    #[test]
+    fn an_unindexed_table_sends_the_change_alone() {
+        let sql = shard_local_alter_with_index_rebuild(
+            &[],
+            &[],
+            "ALTER TABLE orders_shard0 DROP COLUMN note".to_string(),
+            "orders",
+            0,
+        );
+        assert_eq!(sql, vec!["ALTER TABLE orders_shard0 DROP COLUMN note"]);
+    }
+
+    // Every index off, the change, the indexes back on — in that order, because the
+    // engine refuses the middle statement while any of them stands.
+    #[test]
+    fn the_rebuild_drops_every_index_alters_then_builds_them_again() {
+        let before = vec![
+            recorded_index("idx_amount", &["amount"], false),
+            recorded_index("idx_note", &["note"], false),
+        ];
+        let sql = shard_local_alter_with_index_rebuild(
+            &before,
+            &before,
+            "ALTER TABLE orders_shard3 ALTER COLUMN note SET NOT NULL".to_string(),
+            "orders",
+            3,
+        );
+        assert_eq!(
+            sql,
+            vec![
+                "DROP INDEX IF EXISTS idx_amount_shard3",
+                "DROP INDEX IF EXISTS idx_note_shard3",
+                "ALTER TABLE orders_shard3 ALTER COLUMN note SET NOT NULL",
+                "CREATE INDEX IF NOT EXISTS idx_amount_shard3 ON orders_shard3 (amount)",
+                "CREATE INDEX IF NOT EXISTS idx_note_shard3 ON orders_shard3 (note)",
+            ]
+        );
+    }
+
+    // What `after` is for: the rebuild is driven by the metadata the change left
+    // behind, not by the statement. A renamed column is rebuilt under its new name,
+    // and an index the metadata no longer lists is not rebuilt at all — see
+    // [`table_meta_ops::apply_alter_operation`](crate::pgwire_handler::table_meta_ops).
+    #[test]
+    fn the_rebuild_follows_the_metadata_the_change_left() {
+        let before = vec![
+            recorded_index("idx_amount", &["amount"], false),
+            recorded_index("idx_note", &["note"], false),
+        ];
+        // `RENAME COLUMN amount TO total` re-keyed the first; the second is gone from
+        // the record.
+        let after = vec![recorded_index("idx_amount", &["total"], false)];
+        let sql = shard_local_alter_with_index_rebuild(
+            &before,
+            &after,
+            "ALTER TABLE orders_shard0 RENAME COLUMN amount TO total".to_string(),
+            "orders",
+            0,
+        );
+        assert_eq!(
+            sql,
+            vec![
+                "DROP INDEX IF EXISTS idx_amount_shard0",
+                "DROP INDEX IF EXISTS idx_note_shard0",
+                "ALTER TABLE orders_shard0 RENAME COLUMN amount TO total",
+                "CREATE INDEX IF NOT EXISTS idx_amount_shard0 ON orders_shard0 (total)",
+            ]
+        );
+    }
+
+    // A column whose case the catalog kept has to be quoted on the way back out, or
+    // the rebuilt index would be built on a column the shard folds to lowercase.
+    #[test]
+    fn the_rebuild_quotes_a_column_that_carries_case() {
+        let before = vec![recorded_index("idx_amount", &["Amount"], false)];
+        let sql = shard_local_alter_with_index_rebuild(
+            &before,
+            &before,
+            "ALTER TABLE orders_shard0 DROP COLUMN note".to_string(),
+            "orders",
+            0,
+        );
+        assert_eq!(
+            sql.last().unwrap(),
+            "CREATE INDEX IF NOT EXISTS idx_amount_shard0 ON orders_shard0 (\"Amount\")"
+        );
     }
 
     // --- DROP INDEX shapes ---

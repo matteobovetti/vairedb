@@ -91,9 +91,15 @@
 //!
 //! ## What this does not cover
 //!
-//! `INTERSECT ALL` and `EXCEPT ALL`, which are refused earlier by
-//! `pg_operators::reject_multiplicity_set_operations` for a different reason (DataFusion drops
-//! the multiplicity) and so never get here.
+//! Multiplicity, which is the other thing DataFusion's semi/anti join gets wrong about a set
+//! operation: `INTERSECT ALL` and `EXCEPT ALL` reach this check as the same join shape, are
+//! type-checked here like any other, and are then rewritten to count duplicates by
+//! `pg_set_op_multiplicity`, which runs immediately after. The order is deliberate — branches
+//! that do not agree on a type are named as such rather than as a set operation the rewrite
+//! cannot handle. An `ALL` operation arrives here with its right branch wrapped in the marker
+//! derived table that pass reads; [`column_is_unknown`] sees through the `SubqueryAlias` the
+//! wrapper becomes, and the branch schemas this check compares are positional, so the wrapper
+//! changes nothing it looks at.
 //!
 //! ## Where this runs
 //!

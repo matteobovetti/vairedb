@@ -30,6 +30,21 @@
 //!
 //! Both are exact, so both hold the whole group in memory — the same trade DataFusion's
 //! own `percentile_cont` makes, and the reason `approx_percentile_cont` exists.
+//!
+//! ## The array-of-fractions overload
+//!
+//! PostgreSQL has a second signature for each: `percentile_cont(float8[])` answers
+//! `float8[]`, and `percentile_disc(float8[])` answers `anyarray` — one element per
+//! fraction, in the order given. It exists because the group is read once for all of
+//! them, which is exactly the saving a client loses by calling the aggregate per
+//! fraction.
+//!
+//! Nothing about the distribution changes: the same accumulator holds the same values
+//! and [`percentile_of`] answers each fraction against the same sorted array. Only the
+//! signature (a second `OneOf` branch that lets the direct argument be a list), the
+//! return type and `evaluate`'s shape differ. A fraction outside `0 … 1` anywhere in
+//! the array is refused as one on its own would be, naming the offending value the way
+//! PostgreSQL does.
 
 use std::any::Any;
 use std::mem::size_of_val;
@@ -44,11 +59,14 @@ use datafusion::common::{Result, ScalarValue, exec_err, internal_err, not_impl_e
 use datafusion::execution::FunctionRegistry;
 use datafusion::logical_expr::function::{AccumulatorArgs, StateFieldsArgs};
 use datafusion::logical_expr::{
-    Accumulator, AggregateUDF, AggregateUDFImpl, Coercion, Signature, TypeSignatureClass,
-    Volatility,
+    Accumulator, AggregateUDF, AggregateUDFImpl, Coercion, Signature, TypeSignature,
+    TypeSignatureClass, Volatility,
 };
 use datafusion::physical_expr::PhysicalExpr;
 use datafusion::physical_expr::expressions::Literal;
+
+use crate::error::tagged_message;
+use crate::proto::vairedb::v1::VdbErrorCode;
 
 /// Register the ordered-set aggregates on `registry`, replacing DataFusion's
 /// `percentile_cont` (and its `quantile_cont` alias) with the exact one.
@@ -96,7 +114,21 @@ impl PercentileCont {
             )
         };
         Self {
-            signature: Signature::coercible(vec![float8(), float8()], Volatility::Immutable),
+            // Two branches, tried in order: the scalar fraction, coerced to `float8` like
+            // PostgreSQL's own signature; and the array-of-fractions overload, whose direct
+            // argument is left exactly as it arrives so that `fraction_arguments` can read
+            // the list literal itself. A scalar always matches the first branch, so the
+            // second only ever sees what the first could not coerce.
+            signature: Signature::one_of(
+                vec![
+                    TypeSignature::Coercible(vec![float8(), float8()]),
+                    TypeSignature::Coercible(vec![
+                        float8(),
+                        Coercion::new_exact(TypeSignatureClass::Any),
+                    ]),
+                ],
+                Volatility::Immutable,
+            ),
             // Kept so shadowing DataFusion's function does not take its alias away.
             aliases: vec![String::from("quantile_cont")],
         }
@@ -116,8 +148,11 @@ impl AggregateUDFImpl for PercentileCont {
         &self.signature
     }
 
-    fn return_type(&self, _arg_types: &[DataType]) -> Result<DataType> {
-        Ok(DataType::Float64)
+    fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
+        Ok(match is_list(arg_types.get(1)) {
+            true => list_of(DataType::Float64),
+            false => DataType::Float64,
+        })
     }
 
     fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
@@ -174,10 +209,13 @@ impl AggregateUDFImpl for PercentileDisc {
     }
 
     fn return_type(&self, arg_types: &[DataType]) -> Result<DataType> {
-        match arg_types.first() {
-            Some(ordered) => Ok(ordered.clone()),
-            None => internal_err!("percentile_disc was called without an ordered value"),
-        }
+        let Some(ordered) = arg_types.first() else {
+            return internal_err!("percentile_disc was called without an ordered value");
+        };
+        Ok(match is_list(arg_types.get(1)) {
+            true => list_of(ordered.clone()),
+            false => ordered.clone(),
+        })
     }
 
     fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
@@ -213,12 +251,31 @@ fn state_fields(function: &str, args: &StateFieldsArgs) -> Result<Vec<FieldRef>>
     ])
 }
 
+/// Whether `data_type` is one of Arrow's list shapes, i.e. PostgreSQL's `float8[]` direct
+/// argument rather than a single fraction.
+fn is_list(data_type: Option<&DataType>) -> bool {
+    matches!(
+        data_type,
+        Some(DataType::List(_) | DataType::LargeList(_) | DataType::FixedSizeList(_, _))
+    )
+}
+
+/// `element[]`, as the nullable-element list PostgreSQL's array-of-fractions overload
+/// answers.
+fn list_of(element: DataType) -> DataType {
+    DataType::List(Arc::new(Field::new_list_field(element, true)))
+}
+
 /// Accumulates the group's values and answers the percentile once it has them all.
 #[derive(Debug)]
 struct PercentileAccumulator {
     kind: Interpolation,
-    /// The fraction, already resolved from its literal argument.
-    fraction: f64,
+    /// The fractions, already resolved from the literal direct argument — one for the
+    /// scalar signature, and the array's elements in order for the overload.
+    fractions: Vec<f64>,
+    /// Whether the answer is an array, which is the direct argument's shape and not the
+    /// number of fractions: `ARRAY[0.5]` answers a one-element array, `0.5` a scalar.
+    array: bool,
     /// `ORDER BY … DESC`, which counts the percentile from the other end.
     descending: bool,
     /// The ordered column's type, needed to describe an empty group's state.
@@ -244,16 +301,26 @@ impl PercentileAccumulator {
         let Some(ordered) = args.expr_fields.first() else {
             return internal_err!("{function} was called without an ordered value");
         };
+        let (fractions, array) = fraction_arguments(args.exprs, function)?;
+        // The element type for the overload, and the whole answer's type otherwise: the
+        // aggregate's declared return type is `element[]` in the array case.
+        let result_type = match (array, args.return_type()) {
+            (true, DataType::List(element) | DataType::LargeList(element)) => {
+                element.data_type().clone()
+            }
+            (_, other) => other.clone(),
+        };
         Ok(Box::new(Self {
             kind,
-            fraction: fraction_argument(args.exprs, function)?,
+            fractions,
+            array,
             descending: args
                 .order_bys
                 .first()
                 .map(|sort| sort.options.descending)
                 .unwrap_or(false),
             ordered_type: ordered.data_type().clone(),
-            result_type: args.return_type().clone(),
+            result_type,
             values: Vec::new(),
         }))
     }
@@ -304,13 +371,31 @@ impl Accumulator for PercentileAccumulator {
     }
 
     fn evaluate(&mut self) -> Result<ScalarValue> {
-        percentile_of(
-            &self.accumulated()?,
-            self.fraction,
-            self.descending,
-            self.kind,
-            &self.result_type,
-        )
+        // Sorted once, whatever the number of fractions: reading the group once for all of
+        // them is the whole point of PostgreSQL's overload.
+        let values = self.accumulated()?;
+        let mut answers = Vec::with_capacity(self.fractions.len());
+        for fraction in &self.fractions {
+            answers.push(percentile_of(
+                &values,
+                *fraction,
+                self.descending,
+                self.kind,
+                &self.result_type,
+            )?);
+        }
+        if !self.array {
+            return match answers.into_iter().next() {
+                Some(answer) => Ok(answer),
+                None => internal_err!("a percentile needs a fraction to answer"),
+            };
+        }
+        let element = Field::new_list_field(self.result_type.clone(), true);
+        Ok(ScalarValue::List(ScalarValue::new_list(
+            &answers,
+            element.data_type(),
+            true,
+        )))
     }
 
     fn size(&self) -> usize {
@@ -387,12 +472,20 @@ fn percentile_of(
     }
 }
 
-/// Read the fraction out of the aggregate's second argument.
+/// Read the fractions out of the aggregate's second argument, and whether they arrived as
+/// an array — which is what decides the answer's shape.
 ///
-/// It has to be a literal — the fraction is fixed for the whole group, so there is no
+/// It has to be a literal — the fractions are fixed for the whole group, so there is no
 /// row to evaluate an expression against — and it is read leniently, because
 /// `parse_float_as_decimal` makes `0.9` arrive as `numeric` rather than `float8`.
-fn fraction_argument(args: &[Arc<dyn PhysicalExpr>], function: &str) -> Result<f64> {
+///
+/// Every refusal here is tagged with the code it deserves. This function runs *on an
+/// executor*, so its `DataFusionError` is rendered to text by the Ballista scheduler and
+/// the variant the coordinator would have classified is gone by the time the failure
+/// arrives; a [`tagged_message`] carries the code across instead. Without it the whole
+/// group below reports `XX000 internal_error`, which tells a client the server broke and
+/// the statement is worth retrying — and none of these will ever succeed on a retry.
+fn fraction_arguments(args: &[Arc<dyn PhysicalExpr>], function: &str) -> Result<(Vec<f64>, bool)> {
     let Some(argument) = args.get(1) else {
         return plan_err!("{function} requires a percentile fraction");
     };
@@ -400,22 +493,82 @@ fn fraction_argument(args: &[Arc<dyn PhysicalExpr>], function: &str) -> Result<f
     // owns that method name too.
     let argument: &dyn Any = argument.as_ref();
     let Some(literal) = argument.downcast_ref::<Literal>() else {
-        return plan_err!("the percentile fraction for {function} must be a literal");
+        return plan_err!(
+            "{}",
+            tagged_message(
+                VdbErrorCode::FeatureNotSupported,
+                format!("the percentile fraction for {function} must be a literal")
+            )
+        );
     };
-    let fraction = match literal.value().cast_to(&DataType::Float64) {
-        Ok(ScalarValue::Float64(Some(fraction))) => fraction,
-        _ => {
-            return plan_err!(
-                "the percentile fraction for {function} must be a number between 0 and 1, not {}",
-                literal.value()
+    // PostgreSQL's array-of-fractions overload. `ScalarValue::List` and its wider siblings
+    // all hold a one-row array, whose single element is the list; every element of it is a
+    // fraction read exactly as a scalar one is.
+    let values = match literal.value() {
+        list @ (ScalarValue::List(_)
+        | ScalarValue::LargeList(_)
+        | ScalarValue::FixedSizeList(_)) => {
+            let elements = list.to_array()?;
+            let Some(elements) = list_elements(&elements) else {
+                return internal_err!("{function} was given a list literal with no list in it");
+            };
+            let mut fractions = Vec::with_capacity(elements.len());
+            for index in 0..elements.len() {
+                fractions.push((ScalarValue::try_from_array(&elements, index)?, true));
+            }
+            fractions
+        }
+        scalar => vec![(scalar.clone(), false)],
+    };
+    let array = values.first().map(|(_, array)| *array).unwrap_or(false);
+
+    let mut fractions = Vec::with_capacity(values.len());
+    for (value, _) in values {
+        let fraction = match value.cast_to(&DataType::Float64) {
+            Ok(ScalarValue::Float64(Some(fraction))) => fraction,
+            _ => {
+                return plan_err!(
+                    "{}",
+                    tagged_message(
+                        VdbErrorCode::InvalidParameterValue,
+                        format!(
+                            "the percentile fraction for {function} must be a number between \
+                             0 and 1, not {value}"
+                        )
+                    )
+                );
+            }
+        };
+        if !(0.0..=1.0).contains(&fraction) {
+            // PostgreSQL: "percentile value 1.5 is not between 0 and 1". Worded and coded
+            // exactly as the coordinator's own pre-flight check words it, so the two places
+            // this can be caught cannot be told apart by a client.
+            return exec_err!(
+                "{}",
+                tagged_message(
+                    VdbErrorCode::InvalidParameterValue,
+                    format!("percentile value {fraction} is not between 0 and 1")
+                )
             );
         }
-    };
-    if !(0.0..=1.0).contains(&fraction) {
-        // PostgreSQL: "percentile value 1.5 is not between 0 and 1".
-        return exec_err!("percentile value {fraction} is not between 0 and 1");
+        fractions.push(fraction);
     }
-    Ok(fraction)
+    if fractions.is_empty() {
+        // `percentile_cont(ARRAY[]::float8[])` — PostgreSQL answers an empty array, so
+        // there is nothing to refuse and nothing to compute.
+        return Ok((fractions, array));
+    }
+    Ok((fractions, array))
+}
+
+/// The single list element of a one-row list array, whatever its list flavour.
+fn list_elements(array: &ArrayRef) -> Option<ArrayRef> {
+    match array.data_type() {
+        DataType::List(_) => array.as_list_opt::<i32>()?.iter().next().flatten(),
+        DataType::LargeList(_) => array.as_list_opt::<i64>()?.iter().next().flatten(),
+        DataType::FixedSizeList(_, _) => array.as_fixed_size_list_opt()?.iter().next().flatten(),
+        _ => None,
+    }
 }
 
 #[cfg(test)]

@@ -15,10 +15,19 @@
 //!   PostgreSQL promises `numeric`.
 //!
 //! That is the failure this codebase refuses everywhere: a plausible wrong answer with
-//! nothing to say it is wrong. Here neither has to be refused, because PostgreSQL's own
-//! answer is reachable by casting the *argument* — a `Decimal128` argument makes
-//! DataFusion accumulate in `Decimal128` and return one, which arrow-pg advertises as
-//! `numeric`, exactly the type PostgreSQL promises.
+//! nothing to say it is wrong. Neither has to be refused, because PostgreSQL's own answer
+//! is reachable — by two different routes, which is what [`Widening`] names:
+//!
+//! * `sum` is fixed by casting the **argument**. A `Decimal128` argument makes DataFusion
+//!   accumulate in `Decimal128` and return one, which arrow-pg advertises as `numeric`,
+//!   exactly the type PostgreSQL promises.
+//! * `avg` is fixed by swapping the **aggregate**, for [`vairedb_common::avg_udaf`]'s
+//!   exact integer average. Casting the argument gets `avg` most of the way — DataFusion's
+//!   decimal average is exact too — but not to PostgreSQL's sixteen decimal places, because
+//!   `avg(Decimal128(38, s))` returns scale `s + 4` and its accumulator scales the total
+//!   *before* dividing, so the places are bought out of the same 38 digits the accumulation
+//!   spends. That module's doc has the arithmetic; the short version is that scaling the
+//!   quotient instead costs nothing, and the aggregate that does so has to be VaireDB's own.
 //!
 //! `sum(integer)` is left alone: DataFusion already accumulates that one in `Int64`,
 //! which is the `bigint` PostgreSQL promises, so it is already right. `avg(integer)` is
@@ -51,7 +60,10 @@
 //! Rewriting the plan instead means Describe and Execute cannot disagree — they are the
 //! same plan — and the rewrite needs no help from the analyzer afterwards: `TypeCoercion`
 //! accepts the decimal argument, and DataFusion's own `sum` over a `Decimal128(38, s)`
-//! already returns `Decimal128(38, s)`.
+//! already returns `Decimal128(38, s)`. The swapped average is the same story from the other
+//! side: `Expr::get_type` applies an aggregate's own `coerce_types` before asking for its
+//! return type, so the plan advertises `numeric(38, 16)` the moment the call is replaced,
+//! with the analyzer's later pass over the argument agreeing rather than deciding.
 //!
 //! Acting before the analyzer is also what makes the rewrite *correct*, not merely
 //! visible. PostgreSQL chooses between `sum(integer)` and `sum(bigint)` by the argument's
@@ -62,12 +74,17 @@
 //! tell them apart and would widen both, getting `sum(integer)` wrong in the other
 //! direction.
 
+use std::sync::Arc;
+
 use datafusion::arrow::datatypes::DataType;
 use datafusion::common::tree_node::Transformed;
 use datafusion::common::{DFSchema, Result};
 use datafusion::logical_expr::expr_rewriter::NamePreserver;
 use datafusion::logical_expr::utils::merge_schema;
-use datafusion::logical_expr::{Expr, ExprSchemable, LogicalPlan, WindowFunctionDefinition};
+use datafusion::logical_expr::{
+    AggregateUDF, Expr, ExprSchemable, LogicalPlan, WindowFunctionDefinition,
+};
+use vairedb_common::avg_udaf::exact_average_udaf;
 
 /// The accumulator `sum` over a `bigint` uses instead of `Int64`.
 ///
@@ -77,47 +94,47 @@ use datafusion::logical_expr::{Expr, ExprSchemable, LogicalPlan, WindowFunctionD
 /// to 38, so this is the type it would have reached anyway.
 const SUM_ACCUMULATOR: DataType = DataType::Decimal128(38, 0);
 
-/// The accumulator `avg` over an integer uses instead of `Float64`.
+/// What a call has to become for PostgreSQL's promise about it to be kept.
 ///
-/// Scale six, where `sum` needs none, because **`avg`'s result scale is derived from its
-/// argument's**: measured against DataFusion 54.1, `avg(Decimal128(38, s))` returns
-/// `Decimal128(38, s + 4)`. An average has a fractional part that the integers it was
-/// computed over do not, so scale 0 would answer `1.6666` for PostgreSQL's
-/// `1.6666666666666667` — right type, right magnitude, and visibly rounded off. Six buys
-/// ten decimal places.
-///
-/// Six and not twelve because scale is bought out of the same 38 digits the accumulation
-/// spends: `avg` sums into `Decimal128(38, s)`, so `N` rows of magnitude up to
-/// `i64::MAX` need `N · 9.22 × 10¹⁸ · 10ˢ < 10³⁸`. At scale 6 that is ~10¹³ rows, past
-/// any cluster; at 12 it is ~10⁷, which an analytical table reaches. And the failure is
-/// loud rather than silent — DataFusion raises `Arithmetic Overflow in AvgAccumulator`
-/// (unlike its `sum`, which wraps) — so the ceiling costs an error, not a wrong number.
-const AVG_ACCUMULATOR: DataType = DataType::Decimal128(38, 6);
+/// Two routes because the two aggregates fail differently. `sum`'s type *is* its
+/// accumulator, so widening the argument is the whole fix; `avg`'s type is derived from its
+/// argument's scale by arithmetic that spends precision on it, so the fix is a different
+/// aggregate rather than a wider argument. See the module doc.
+#[derive(Debug, PartialEq, Eq)]
+enum Widening {
+    /// Cast the argument, so DataFusion accumulates in this type and returns it.
+    Accumulator(DataType),
+    /// Replace the call with [`vairedb_common::avg_udaf`]'s exact integer average, which
+    /// accumulates the integers themselves and applies PostgreSQL's sixteen decimal places
+    /// to the quotient.
+    ExactAverage,
+}
 
-/// The type `name(arg)` should accumulate in, where DataFusion's own choice does not
-/// match PostgreSQL's promise, and `None` where it already does.
+/// How `name(arg)` has to be rewritten, where DataFusion's own answer does not match
+/// PostgreSQL's promise, and `None` where it already does.
 ///
 /// The two aggregates disagree about `integer` and PostgreSQL is why. `sum(integer)` is a
 /// `bigint`, which DataFusion already gives; `avg(integer)` is a `numeric`, which it does
-/// not. So `avg` widens from every integer width and `sum` only from the one that
+/// not. So `avg` is rewritten from every integer width and `sum` only from the one that
 /// overflows.
-fn widening_target(name: &str, arg: &DataType) -> Option<DataType> {
+fn widening_target(name: &str, arg: &DataType) -> Option<Widening> {
     match name {
-        "sum" if *arg == DataType::Int64 => Some(SUM_ACCUMULATOR),
+        "sum" if *arg == DataType::Int64 => Some(Widening::Accumulator(SUM_ACCUMULATOR)),
         "avg" if matches!(arg, DataType::Int64 | DataType::Int32 | DataType::Int16) => {
-            Some(AVG_ACCUMULATOR)
+            Some(Widening::ExactAverage)
         }
         _ => None,
     }
 }
 
-/// Rewrite every `sum` and `avg` in `plan` that PostgreSQL accumulates more widely than
+/// Rewrite every `sum` and `avg` in `plan` that PostgreSQL computes more widely than
 /// DataFusion does.
 ///
 /// A plan with no such aggregate comes back unchanged, and applying this twice is the
-/// same as applying it once — the second pass sees a decimal argument, which
-/// [`widening_target`] declines. `with_subqueries`, because an aggregate in a subquery is
-/// the same aggregate over the same column type and loses precision the same way.
+/// same as applying it once — the second pass sees a decimal argument where `sum` was
+/// widened and a call named `vaire_avg` where the average was swapped, and
+/// [`widening_target`] declines both. `with_subqueries`, because an aggregate in a subquery
+/// is the same aggregate over the same column type and loses precision the same way.
 pub(crate) fn widen_bigint_aggregates(plan: LogicalPlan) -> Result<LogicalPlan> {
     // Every node from the first rewrite upward needs its schema recomputed, not only the
     // ones whose own expressions changed. A `LogicalPlan` caches its schema, and
@@ -159,7 +176,7 @@ fn widen_aggregates_in(plan: LogicalPlan) -> Result<Transformed<LogicalPlan>> {
 }
 
 /// One expression: `sum(<bigint>)` becomes `sum(<bigint> AS decimal)`, `avg(<integer>)`
-/// becomes `avg(<integer> AS decimal)`, and anything else is returned untouched.
+/// becomes `vaire_avg(<integer>)`, and anything else is returned untouched.
 ///
 /// Both spellings DataFusion plans an aggregate under are matched. A grouped `sum(x)` is
 /// an [`Expr::AggregateFunction`]; `sum(x) OVER (…)` is an [`Expr::WindowFunction`]
@@ -175,19 +192,27 @@ fn widen_aggregate(expr: Expr, schema: &DFSchema) -> Result<Transformed<Expr>> {
     let [arg] = args.as_slice() else {
         return Ok(Transformed::no(expr));
     };
-    // Also what makes the rewrite idempotent: a second pass sees a decimal argument, for
-    // which there is no target.
-    let Some(accumulator) = widening_target(name, &arg.get_type(schema)?) else {
+    // Also what makes the rewrite idempotent: a second pass sees a decimal argument or a
+    // call already named `vaire_avg`, for neither of which there is a target.
+    let Some(widening) = widening_target(name, &arg.get_type(schema)?) else {
         return Ok(Transformed::no(expr));
     };
 
     let mut expr = expr;
-    let args = aggregate_args_mut(&mut expr).expect("just matched as an aggregate");
-    let arg = args.remove(0);
-    args.push(Expr::Cast(datafusion::logical_expr::Cast::new(
-        Box::new(arg),
-        accumulator,
-    )));
+    match widening {
+        Widening::Accumulator(accumulator) => {
+            let args = aggregate_args_mut(&mut expr).expect("just matched as an aggregate");
+            let arg = args.remove(0);
+            args.push(Expr::Cast(datafusion::logical_expr::Cast::new(
+                Box::new(arg),
+                accumulator,
+            )));
+        }
+        // The argument is left exactly as it is: the aggregate that replaces `avg` takes
+        // the integers themselves, and widening one integer to another is what its own
+        // `coerce_types` does when the analyzer runs.
+        Widening::ExactAverage => set_aggregate_udf(&mut expr, exact_average_udaf()),
+    }
 
     Ok(Transformed::yes(expr))
 }
@@ -216,6 +241,21 @@ fn aggregate_args_mut(expr: &mut Expr) -> Option<&mut Vec<Expr>> {
     }
 }
 
+/// Point an aggregate call [`aggregate_call`] matched at `udaf` instead, keeping its
+/// arguments, its `DISTINCT`, its filter and — for the windowed spelling — its frame.
+///
+/// Replacing the function and not the whole expression is what makes the window form free:
+/// a frame, a partitioning and an ordering are all still the client's, and only the
+/// arithmetic underneath them changes.
+fn set_aggregate_udf(expr: &mut Expr, udaf: Arc<AggregateUDF>) {
+    match expr {
+        Expr::AggregateFunction(agg) => agg.func = udaf,
+        Expr::WindowFunction(window) => window.fun = WindowFunctionDefinition::AggregateUDF(udaf),
+        // Unreachable through [`widen_aggregate`], which matched one of the two above.
+        _ => {}
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -225,10 +265,10 @@ mod tests {
     use datafusion::arrow::datatypes::{Field, Schema};
     use datafusion::execution::context::SessionContext;
 
-    /// What `avg` over [`AVG_ACCUMULATOR`] returns: DataFusion adds four to the
-    /// argument's scale. Written out rather than computed, so that a change to the rule
-    /// upstream fails a test here instead of being absorbed by it.
-    const AVG_ACCUMULATOR_RESULT: DataType = DataType::Decimal128(38, 10);
+    /// What the swapped average reports: PostgreSQL's sixteen decimal places. Written out
+    /// rather than read from the aggregate, so that a change to the type it returns fails a
+    /// test here instead of being absorbed by it.
+    const EXACT_AVERAGE_RESULT: DataType = DataType::Decimal128(38, 16);
 
     /// One table: two `bigint` values whose exact sum is just past `i64::MAX`, and the
     /// same magnitudes as `integer`.
@@ -372,10 +412,10 @@ mod tests {
     async fn a_bigint_average_past_the_float_mantissa_is_exact() {
         let (dt, text) = one_row("SELECT avg(big) FROM t").await;
         assert_eq!(
-            dt, AVG_ACCUMULATOR_RESULT,
+            dt, EXACT_AVERAGE_RESULT,
             "advertised as numeric, as PG does"
         );
-        assert_eq!(text, "4611686018427387905.0000000000");
+        assert_eq!(text, "4611686018427387905.0000000000000000");
     }
 
     // Where `sum` must leave `integer` alone, `avg` must not: PostgreSQL's `avg` is
@@ -384,8 +424,8 @@ mod tests {
     #[tokio::test]
     async fn an_integer_average_is_widened_where_an_integer_total_is_not() {
         let (dt, text) = one_row("SELECT avg(small) FROM t").await;
-        assert_eq!(dt, AVG_ACCUMULATOR_RESULT);
-        assert_eq!(text, "1.5000000000");
+        assert_eq!(dt, EXACT_AVERAGE_RESULT);
+        assert_eq!(text, "1.5000000000000000");
 
         // The neighbour, restated here because the pair *is* the rule.
         let (dt, _) = one_row("SELECT sum(small) FROM t").await;
@@ -397,17 +437,17 @@ mod tests {
     #[tokio::test]
     async fn a_windowed_average_reports_the_type_the_grouped_one_does() {
         let (dt, text) = one_row("SELECT avg(big) OVER () FROM t LIMIT 1").await;
-        assert_eq!(dt, AVG_ACCUMULATOR_RESULT);
-        assert_eq!(text, "4611686018427387905.0000000000");
+        assert_eq!(dt, EXACT_AVERAGE_RESULT);
+        assert_eq!(text, "4611686018427387905.0000000000000000");
     }
 
-    // A non-terminating average is where the accumulator's *scale* is visible, and it is
-    // the reason `avg` casts to scale 6 where `sum` casts to scale 0: ten decimal places
-    // rather than four. PostgreSQL answers `1.6666666666666667` — this is that number
-    // truncated, not a different one, and the remaining digits are the narrowing recorded
-    // in the gap analysis.
+    // A non-terminating average is where the swapped aggregate is visible rather than merely
+    // exact: PostgreSQL answers `1.6666666666666667` and so does this, digit for digit. The
+    // argument cast this rewrite used to apply instead could only reach ten of those places,
+    // and the last six are what replacing the aggregate buys. See
+    // [`vairedb_common::avg_udaf`].
     #[tokio::test]
-    async fn a_non_terminating_average_keeps_ten_decimal_places() {
+    async fn a_non_terminating_average_keeps_postgresqls_sixteen_places() {
         let ctx = SessionContext::new();
         let schema = Arc::new(Schema::new(vec![Field::new("n", DataType::Int64, false)]));
         let batch = RecordBatch::try_new(
@@ -419,11 +459,11 @@ mod tests {
 
         let plan = read_path_plan(&ctx, "SELECT avg(n) FROM r").await;
         let df = ctx.execute_logical_plan(plan).await.unwrap();
-        assert_eq!(df.schema().field(0).data_type(), &AVG_ACCUMULATOR_RESULT);
+        assert_eq!(df.schema().field(0).data_type(), &EXACT_AVERAGE_RESULT);
         let batches = df.collect().await.unwrap();
         let text = datafusion::arrow::util::display::array_value_to_string(batches[0].column(0), 0)
             .unwrap();
-        assert_eq!(text, "1.6666666666");
+        assert_eq!(text, "1.6666666666666667");
     }
 
     // `avg` over a type PostgreSQL answers in `double precision` must stay there. Widening
@@ -444,6 +484,35 @@ mod tests {
         let plan = read_path_plan(&ctx, "SELECT avg(f) FROM f").await;
         let df = ctx.execute_logical_plan(plan).await.unwrap();
         assert_eq!(df.schema().field(0).data_type(), &DataType::Float64);
+    }
+
+    // The rewritten plan travels to the scheduler as protobuf, where an aggregate is a
+    // *name* resolved from that node's registry. So the name in the plan is the contract
+    // between this rewrite and the two registries that hold the aggregate, and it has to be
+    // the one they register.
+    #[tokio::test]
+    async fn the_rewritten_average_travels_under_the_name_the_registries_hold() {
+        let ctx = ctx();
+        for sql in ["SELECT avg(big) FROM t", "SELECT avg(small) OVER () FROM t"] {
+            let plan = read_path_plan(&ctx, sql).await;
+            let plan = plan.display_indent().to_string();
+            assert!(
+                plan.contains(vairedb_common::avg_udaf::EXACT_AVG_UDAF_NAME),
+                "`{sql}` calls the registered aggregate: {plan}"
+            );
+        }
+    }
+
+    // The client's own label survives the swap. `NamePreserver` is what does it, and it
+    // matters more here than for `sum`: the expression's schema name is derived from the
+    // function's name, so an unpinned rewrite would rename the column to `vaire_avg(t.big)`
+    // and put VaireDB's internal spelling in front of the client.
+    #[tokio::test]
+    async fn the_swapped_average_keeps_the_column_name_the_client_sees() {
+        let ctx = ctx();
+        let plan = read_path_plan(&ctx, "SELECT avg(big) FROM t").await;
+        let df = ctx.execute_logical_plan(plan).await.unwrap();
+        assert_eq!(df.schema().field(0).name(), "avg(t.big)");
     }
 
     // Idempotence for the second aggregate too — the plan is widened on the coordinator

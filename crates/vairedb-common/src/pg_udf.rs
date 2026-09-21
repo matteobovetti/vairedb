@@ -56,8 +56,10 @@ use datafusion_pg_catalog::pg_catalog::{
     create_pg_get_partkeydef_udf, create_pg_get_statisticsobjdef_columns_udf,
     create_pg_get_userbyid_udf, create_pg_relation_is_publishable_udf, create_pg_relation_size_udf,
     create_pg_stat_get_numscans, create_pg_table_is_visible, create_pg_total_relation_size_udf,
-    format_type, has_privilege_udf, pg_get_expr_udf, quote_ident_udf,
+    has_privilege_udf, pg_get_expr_udf, quote_ident_udf,
 };
+
+use crate::pg_format_type::format_type_udf;
 
 /// Register the `pg_catalog` scalar functions that can appear in a serialized plan.
 ///
@@ -83,7 +85,10 @@ fn pg_catalog_scalar_functions() -> Vec<ScalarUDF> {
         has_privilege_udf::create_has_privilege_udf("has_database_privilege"),
         has_privilege_udf::create_has_privilege_udf("has_any_column_privilege"),
         create_pg_table_is_visible(),
-        format_type::create_format_type_udf(),
+        // VaireDB's own, not upstream's: the signature upstream declares cannot resolve a
+        // string OID, which is what a driver that interpolates its introspection query
+        // sends. See [`crate::pg_format_type`].
+        format_type_udf().as_ref().clone(),
         pg_get_expr_udf::create_pg_get_expr_udf(),
         create_pg_get_partkeydef_udf(),
         create_pg_relation_is_publishable_udf(),
@@ -115,7 +120,19 @@ mod tests {
             "a bare context should not have it, or this test proves nothing"
         );
         register_pg_catalog_scalar_functions(&mut ctx).expect("registration failed");
-        assert!(ctx.udf("format_type").is_ok());
+        let udf = ctx.udf("format_type").expect("resolved");
+        // And it is VaireDB's widened one, since this set is the only place either version
+        // is named — see [`crate::pg_format_type`].
+        use datafusion::arrow::datatypes::{DataType, Field};
+        use datafusion::logical_expr::type_coercion::functions::fields_with_udf;
+        let string_oid = [
+            Arc::new(Field::new("oid", DataType::Utf8, true)),
+            Arc::new(Field::new("typemod", DataType::Int32, true)),
+        ];
+        assert!(
+            fields_with_udf(&string_oid, udf.as_ref()).is_ok(),
+            "the set has to carry the signature a string OID resolves against"
+        );
     }
 
     /// Every name in the set has to resolve, because the wire carries only the name.

@@ -46,8 +46,9 @@ use crate::pgwire_handler::error_enrichment::{
     ErrorContext, enrich_coordinator_error, make_vdb_error,
 };
 use crate::pgwire_handler::handler::VaireDbQueryHandler;
+use crate::pgwire_handler::indexes;
 use crate::pgwire_handler::query_router::{
-    canonicalize_ident, qualified_name, relation_of, schema_of,
+    canonicalize_ident, qualified_name, quoted_if_folded, relation_of, schema_of,
 };
 use crate::sqlparser::ast::{
     AlterTableOperation, CheckConstraint, ColumnOption, ColumnOptionDef, CreateTable, Expr, Ident,
@@ -356,43 +357,23 @@ const ADD_CONSTRAINT: &str = "ALTER TABLE ... ADD CONSTRAINT";
 const DROP_CONSTRAINT: &str = "ALTER TABLE ... DROP CONSTRAINT";
 
 /// The shard-local statement that enforces an index-backed constraint on one
-/// shard.
+/// shard: the same per-shard `CREATE UNIQUE INDEX` a recorded index is rebuilt
+/// from, because that is exactly what the constraint is.
 ///
-/// `IF NOT EXISTS` is what makes a partially-broadcast ADD CONSTRAINT safe to retry
-/// — the shards that already have the index accept the statement again — and it
-/// costs nothing, because the coordinator's catalog check, not the shards, reports
-/// a duplicate name to the client. Building the index is also what validates the
-/// rows already stored: a shard holding duplicates rejects the statement, and the
-/// catalog is left unchanged.
+/// Building the index is also what validates the rows already stored: a shard
+/// holding duplicates rejects the statement, and the catalog is left unchanged.
 fn shard_local_unique_index_sql(
     meta: &ConstraintMeta,
     table_name: &str,
     hash_bucket: u32,
 ) -> String {
-    let columns = meta
-        .columns
-        .iter()
-        .map(|c| quote_if_folded(c))
-        .collect::<Vec<_>>()
-        .join(", ");
-    format!(
-        "CREATE UNIQUE INDEX IF NOT EXISTS {} ON {} ({})",
-        shard_table_name(&meta.name, hash_bucket),
-        shard_table_name(table_name, hash_bucket),
-        columns
+    indexes::shard_local_recorded_index_sql(
+        &meta.name,
+        &meta.columns,
+        true,
+        table_name,
+        hash_bucket,
     )
-}
-
-/// Render a canonical identifier for shard SQL: bare when it folds to itself,
-/// double-quoted when it carries case the engine would fold away. A column created
-/// as `"Amount"` is stored canonical with its case, and naming it unquoted here
-/// would look for `amount` instead.
-fn quote_if_folded(name: &str) -> String {
-    if name.chars().any(|c| c.is_ascii_uppercase()) {
-        format!("\"{name}\"")
-    } else {
-        name.to_string()
-    }
 }
 
 // --- Keeping constraints and columns consistent ---
@@ -613,7 +594,7 @@ fn declared_from_column_option(
             Declared {
                 name,
                 kind: ConstraintKind::Unique,
-                definition: format!("UNIQUE ({})", quote_if_folded(column)),
+                definition: format!("UNIQUE ({})", quoted_if_folded(column)),
                 columns,
             }
         }
@@ -622,7 +603,7 @@ fn declared_from_column_option(
             Declared {
                 name,
                 kind: ConstraintKind::PrimaryKey,
-                definition: format!("PRIMARY KEY ({})", quote_if_folded(column)),
+                definition: format!("PRIMARY KEY ({})", quoted_if_folded(column)),
                 columns,
             }
         }
@@ -872,7 +853,7 @@ fn check_columns(expr: &Expr, table_columns: &[ColumnDef]) -> Vec<String> {
 fn rendered_column_list(columns: &[String]) -> String {
     columns
         .iter()
-        .map(|c| quote_if_folded(c))
+        .map(|c| quoted_if_folded(c))
         .collect::<Vec<_>>()
         .join(", ")
 }

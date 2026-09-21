@@ -37,7 +37,7 @@ system (see the [Roadmap](../roadmap.md)).
 1. **Transient failure** — the core node restarts, DuckDB recovers from its
    local WAL, and the node reconnects to the coordinator and rejoins the
    cluster.
-2. **Permanent failure** — in v0.1, requires manual intervention: a new core
+2. **Permanent failure** — currently requires manual intervention: a new core
    node must be provisioned and data restored from snapshots. Automatic shard
    rebuild from replicas is deferred to a future version.
 3. **Network partition (core nodes)** — if a core node cannot reach the

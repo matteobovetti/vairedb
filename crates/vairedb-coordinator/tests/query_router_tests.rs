@@ -410,3 +410,52 @@ fn test_canonicalize_ident_str_folds_like_an_identifier() {
     assert_eq!(canonicalize_ident_str("\"Customer_ID\""), "Customer_ID");
     assert_eq!(canonicalize_ident_str(""), "");
 }
+
+// The one place a flat catalog key becomes a structured DataFusion name. A qualified key
+// has to become a *two-part* reference: the expression tree carries a column's qualifier as
+// a `TableReference` too, and `datafusion-proto` encodes it by printing and decodes it by
+// re-parsing — a bare name holding a dot comes back as `Partial`, matching nothing.
+#[test]
+fn test_table_reference_makes_a_qualified_key_structured() {
+    use datafusion::common::TableReference;
+    use vairedb_coordinator::pgwire_handler::query_router::table_reference;
+
+    assert_eq!(
+        table_reference("sales.orders"),
+        TableReference::partial("sales", "orders")
+    );
+    // A bare key names a relation in the default schema, and `public` is what DataFusion
+    // resolves a bare reference through anyway.
+    assert_eq!(table_reference("orders"), TableReference::bare("orders"));
+    // Case is carried verbatim: the key is already canonical, so re-folding it here would
+    // lose the case a quoted name was created with.
+    assert_eq!(
+        table_reference("Sales.MyTable"),
+        TableReference::partial("Sales", "MyTable")
+    );
+
+    // The residue: a key whose *relation* part still holds a dot (`CREATE TABLE sales."a.b"`)
+    // has no two-part reference, so it keeps the flat name and keeps today's behaviour.
+    assert_eq!(
+        table_reference("sales.a.b"),
+        TableReference::bare("sales.a.b")
+    );
+}
+
+// And the round trip the registration key exists for: printing a reference and re-parsing it
+// — what `datafusion-proto` does to every column qualifier in a distributed plan — has to be
+// the identity, or a filtered read of the relation cannot resolve its own columns.
+#[test]
+fn test_a_structured_reference_survives_the_proto_round_trip() {
+    use datafusion::common::TableReference;
+    use vairedb_coordinator::pgwire_handler::query_router::table_reference;
+
+    for key in ["orders", "sales.orders", "Sales.MyTable"] {
+        let reference = table_reference(key);
+        let round_tripped = TableReference::parse_str_normalized(&reference.to_string(), true);
+        assert_eq!(
+            round_tripped, reference,
+            "the qualifier for `{key}` must survive being printed and re-parsed"
+        );
+    }
+}

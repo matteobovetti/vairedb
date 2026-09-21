@@ -648,13 +648,12 @@ async fn test_numeric_bind_parameter_insert() {
     drop_table(&client, &tbl).await;
 }
 
-// The remaining exact-numeric fault: arrow-pg encodes `numeric` through rust_decimal,
-// whose 96-bit mantissa caps at 29 digits, so binary-format clients get SQLSTATE 22003
-// at the top of DuckDB's legal DECIMAL range. Text-format clients are unaffected
-// because VaireDB renders text cells itself — the two wire formats disagree. Needs an
-// upstream encoder that does not go through rust_decimal.
+// arrow-pg encoded `numeric` through rust_decimal, whose 96-bit mantissa caps at 29
+// digits, so binary-format clients used to get SQLSTATE 22003 at the top of DuckDB's
+// legal DECIMAL range while text-format clients read the same value exactly — the two
+// wire formats disagreed. VaireDB now writes the binary `numeric` itself, digit group by
+// digit group, so the wire carries every digit DuckDB can store.
 #[tokio::test]
-#[ignore = "gap (Exact numeric): binary-format NUMERIC encoding goes through rust_decimal, which caps at 29 digits and raises 22003 for wider DuckDB decimals"]
 async fn test_numeric_38_digit_value_in_binary_format() {
     let client = ready_client().await;
     let tbl = create_table(
@@ -699,10 +698,11 @@ async fn test_numeric_38_digit_value_in_binary_format() {
 }
 
 // PostgreSQL NUMERIC supports up to 1000 digits of precision. VaireDB caps at
-// DuckDB's 38, and the Arrow type that would carry more (Decimal256) has no
-// arrow-pg mapping, so it cannot even be advertised.
+// DuckDB's 38, because the value has to be *stored*: `DECIMAL(40,2)` is rejected by
+// DuckDB at CREATE TABLE. The wire is no longer the obstacle — see
+// `test_numeric_above_38_digits_computed_in_the_coordinator`.
 #[tokio::test]
-#[ignore = "gap (Exact numeric): NUMERIC(p,s) with p > 38 is rejected by DuckDB, and Decimal256 has no into_pg_type arm in arrow-pg — needs upstream support in both duckdb-rs and arrow-pg"]
+#[ignore = "gap (Exact numeric): a NUMERIC(p,s) column with p > 38 cannot be stored — DuckDB's DECIMAL caps at 38 digits, so the shard rejects the CREATE TABLE"]
 async fn test_numeric_precision_above_38() {
     let client = ready_client().await;
     let tbl = create_table(
@@ -724,6 +724,61 @@ async fn test_numeric_precision_above_38() {
         .await
         .unwrap();
     assert_eq!(rows[0][0].as_deref(), Some(wide));
+
+    drop_table(&client, &tbl).await;
+}
+
+// A `NUMERIC` wider than DuckDB can store is still reachable: DataFusion widens to
+// `Decimal256` for a declared precision above 38, so a cast produces one even though no
+// column can hold one. arrow-pg has no `Decimal256` arm at all — the column used to be
+// refused with `XX000 Unsupported Datatype` — so VaireDB advertises and encodes it itself.
+#[tokio::test]
+async fn test_numeric_above_38_digits_computed_in_the_coordinator() {
+    let client = ready_client().await;
+    let tbl = create_table(
+        &client,
+        "tr_num_wide",
+        &format!("(id INTEGER NOT NULL, big NUMERIC(38,0) NOT NULL) {CREATE_OPTS}"),
+    )
+    .await;
+
+    let wide = "12345678901234567890123456789012345678";
+    execute(
+        &client,
+        &format!("INSERT INTO {tbl} (id, big) VALUES (1, {wide})"),
+    )
+    .await
+    .unwrap();
+
+    let sql = format!("SELECT CAST(big AS NUMERIC(40,2)) FROM {tbl}");
+    assert_eq!(
+        describe_result_types(&client, &sql).await,
+        vec![Type::NUMERIC],
+        "a 40-digit decimal must be advertised as numeric, not refused"
+    );
+
+    let rows = simple_query_rows(&client, &sql).await.unwrap();
+    assert_eq!(
+        rows[0][0].as_deref(),
+        Some(format!("{wide}.00").as_str()),
+        "every digit must survive the widening"
+    );
+
+    // And in binary, where the encoder is VaireDB's own. rust_decimal backs this client's
+    // codec and caps at 29 digits, so a decode error is the client's limit — what matters
+    // is that the server produced the row rather than failing the query.
+    let rows = client
+        .query(
+            &format!("SELECT CAST(big AS NUMERIC(40,2)) FROM {tbl} WHERE id = $1"),
+            &[&1i32],
+        )
+        .await
+        .expect("a binary-format read of a 40-digit NUMERIC must succeed");
+    match rows[0].try_get::<_, Option<Decimal>>(0) {
+        Ok(Some(big)) => assert_eq!(big.to_string(), format!("{wide}.00")),
+        Ok(None) => panic!("a 40-digit NUMERIC must not read back as NULL"),
+        Err(_) => { /* client-side 29-digit cap; the server half is correct */ }
+    }
 
     drop_table(&client, &tbl).await;
 }
@@ -1719,8 +1774,11 @@ async fn test_jsonb_round_trip() {
     drop_table(&client, &tbl).await;
 }
 
+// The declared type is remembered on the Arrow field, so the OID follows the client's own
+// declaration even though the values travel as `Utf8`. JSONB is advertised as `json`, not
+// `jsonb`: VaireDB stores the document text as written, and `jsonb` would promise the key
+// normalization and binary `0x01` framing that PostgreSQL's own jsonb implies.
 #[tokio::test]
-#[ignore = "gap (DataFusion-unsupported SQL types): JSON/JSONB columns are advertised as text instead of json (OID 114)"]
 async fn test_json_column_type() {
     let client = ready_client().await;
     let tbl = create_table(
@@ -1747,8 +1805,10 @@ async fn test_json_column_type() {
     drop_table(&client, &tbl).await;
 }
 
+// Advertising OID 2950 is a promise about bytes as well as about the name: PostgreSQL's
+// binary `uuid` is the 16 raw bytes, not the 36-character spelling, so VaireDB encodes the
+// cell itself rather than letting the `Utf8` array write its string under a uuid OID.
 #[tokio::test]
-#[ignore = "gap (DataFusion-unsupported SQL types): UUID columns are advertised as text instead of uuid (OID 2950)"]
 async fn test_uuid_column_type() {
     let client = ready_client().await;
     let tbl = create_table(
@@ -1777,6 +1837,90 @@ async fn test_uuid_column_type() {
         .await
         .unwrap();
     assert_eq!(rows[0][0].as_deref(), Some(uuid));
+
+    // The binary half. A typed `query` asks for binary encoding, and the client decodes
+    // the 16 bytes back — which it could only do if that is what was sent.
+    let rows = client
+        .query(&format!("SELECT u FROM {tbl} WHERE id = $1"), &[&1i32])
+        .await
+        .expect("a binary-format read of a UUID column must succeed");
+    assert_eq!(
+        rows[0].get::<_, uuid::Uuid>(0),
+        uuid.parse::<uuid::Uuid>().unwrap(),
+        "binary uuid is the 16 raw bytes, not the 36-character spelling"
+    );
+
+    drop_table(&client, &tbl).await;
+}
+
+// `CHAR(n)` is `bpchar` and `VARCHAR(n)` is `varchar`, not `text`: the length parameter is
+// gone from the Arrow type, but the declaration itself travels beside it, so the name a
+// client is told back is the name it declared.
+//
+// The `n` is **reported and not enforced** — the shards' engine ignores it, so a longer
+// value is stored rather than refused (`test_varchar_length_is_not_enforced` pins that).
+// And the wire cannot carry the modifier at all: pgwire's `RowDescription` hardcodes
+// `type_modifier: -1`, so `psql`'s `\d` still prints these without their `(n)`.
+#[tokio::test]
+async fn test_char_and_varchar_column_types() {
+    let client = ready_client().await;
+    let tbl = create_table(
+        &client,
+        "tr_charlen",
+        &format!(
+            "(id INTEGER NOT NULL, c CHAR(3) NOT NULL, v VARCHAR(64) NOT NULL, \
+             t TEXT NOT NULL) {CREATE_OPTS}"
+        ),
+    )
+    .await;
+
+    execute(
+        &client,
+        &format!("INSERT INTO {tbl} (id, c, v, t) VALUES (1, 'abc', 'hello', 'world')"),
+    )
+    .await
+    .unwrap();
+
+    let types = describe_result_types(&client, &format!("SELECT c, v, t FROM {tbl}")).await;
+    assert_eq!(
+        types,
+        vec![Type::BPCHAR, Type::VARCHAR, Type::TEXT],
+        "a character type keeps its own name; TEXT is the one that really is text"
+    );
+
+    let rows = simple_query_rows(&client, &format!("SELECT c, v, t FROM {tbl}"))
+        .await
+        .unwrap();
+    let got: Vec<&str> = rows[0].iter().map(|c| c.as_deref().unwrap()).collect();
+    assert_eq!(got, vec!["abc", "hello", "world"]);
+
+    // An expression over the column is `text`, in PostgreSQL too: the declared type
+    // belongs to the column, not to what a function made of it.
+    let types = describe_result_types(&client, &format!("SELECT v || '!' FROM {tbl}")).await;
+    assert_eq!(types, vec![Type::TEXT]);
+
+    drop_table(&client, &tbl).await;
+}
+
+// The other half of "reported, not enforced": the declared length is a name, and a value
+// longer than it is stored and returned. PostgreSQL raises 22001 here.
+#[tokio::test]
+#[ignore = "gap (DataFusion-unsupported SQL types): VARCHAR(n)/CHAR(n) lengths are not enforced — the shards' engine ignores them, so an over-long value is stored instead of raising 22001"]
+async fn test_varchar_length_is_not_enforced() {
+    let client = ready_client().await;
+    let tbl = create_table(
+        &client,
+        "tr_charlim",
+        &format!("(id INTEGER NOT NULL, v VARCHAR(4) NOT NULL) {CREATE_OPTS}"),
+    )
+    .await;
+
+    assert_sqlstate(
+        &client,
+        &format!("INSERT INTO {tbl} (id, v) VALUES (1, 'far too long')"),
+        SQLSTATE_STRING_DATA_RIGHT_TRUNCATION,
+    )
+    .await;
 
     drop_table(&client, &tbl).await;
 }

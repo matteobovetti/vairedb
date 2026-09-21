@@ -4,28 +4,59 @@ VaireDB is early-stage software.
 
 The tables below reflect the current planned work. Status labels are the project's own.
 
-## Toward v0.1
+## Roadmap to v0.3
 
 | Status | Description |
 |--------|-------------|
-| PLANNED | **Compliance** — define a DAG of connected tables and create a vectorized representation of data takeout or deletion to be performed; plus a set of anonymization algorithms for hashing specified columns. |
-| PLANNED | **Data quality** — async data quality checks and metrics defined with a specific SQL instruction (designed on top of the DuckDB SQL dialect). |
-| PLANNED | Review & fix E2E test ignored bugs. |
+| PLANNED | Fuzzy testing crate with massive testing suite for all the db features. |
 
-## Toward v0.2
+## Roadmap to v0.4
 
 | Status | Description |
 |--------|-------------|
-| TODO | VaireDB CLI with a psql client and client-side streaming bulk load (`COPY … FROM STDIN`, i.e. `\copy`). Server-side `COPY` to and from a CSV file on the coordinator already works — see [Bulk load and export](sql/querying.md#bulk-load-and-export). |
-| TODO | Microbenchmark core pieces of the codebase. |
-| TODO | v0.1 performance tests (distributed). |
+| TODO | Security: TLS, users, groups. |
+
+## Roadmap to v0.5
+
+| Status | Description |
+|--------|-------------|
+| TODO/SPEC READY | Feature **Compliance - Data Deletion (DDR) - Delete or anonymize all user data** |
+| VALIDATE | Feature **Compliance - Data Takeout (SAR) - Subject Access Request: Provide all user data** |
+
+## Roadmap to v0.6
+
+| Status | Description |
+|--------|-------------|
+| TODO | Feature **Data quality** - The system is able to perform async data quality checks and metrics defined with a specific SQL instruction (designed on top of DuckDB SQL dialect). |
+
+## Roadmap to v0.7
+
+| Status | Description |
+|--------|-------------|
+| TODO | Feature **Rich data catalog** - [Include](https://opendatacontract.com/) |
+
+## Roadmap to v1.0 (production readiness)
+
+| Status | Description |
+|--------|-------------|
 | TODO | Coordinator WAL. |
-| VALIDATE | Metadata / Catalog API. |
+| TODO | Coordinator HA. |
+| TODO | External salt-key for pseudonymization managed in a KMS. |
+| TODO | Performance tests (distributed). |
+| TODO | Microbenchmark core pieces of the code base. |
 
-## Known limitations (v0.1)
+## Bank of ideas
 
-These are tracked as [non-goals](concepts/design-goals.md#non-goals-for-v01) for
-the current version:
+| Status | Description |
+|--------|-------------|
+| VALIDATE | Metadata/Catalog API. |
+| VALIDATE | Mutation batch with trigger interval and max number of command executed. |
+| VALIDATE | Coordinator WAL. |
+
+## Known limitations
+
+These are tracked as [non-goals](concepts/design-goals.md#non-goals) for the
+current version:
 
 - **Single coordinator** — a single point of failure for reads and writes.
 - **No online resharding** — shard count and key are fixed at table creation.

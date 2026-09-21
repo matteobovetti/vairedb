@@ -11,8 +11,11 @@ futures = "0.3"
 tokio = { version = "1", features = ["full"] }
 # `with-chrono-0_4` supplies the ToSql/FromSql impls needed to bind and read
 # DATE / TIME / TIMESTAMP / TIMESTAMPTZ parameters over the extended protocol —
-# required by the data-type suite (tests/data_types_round_trips.rs).
-tokio-postgres = { version = "0.7", features = ["with-chrono-0_4"] }
+# required by the data-type suite (tests/data_types_round_trips.rs). `with-uuid-1`
+# does the same for `uuid`, whose binary form is 16 raw bytes rather than the
+# 36-character spelling: without a real client codec the test could not tell the
+# two apart.
+tokio-postgres = { version = "0.7", features = ["with-chrono-0_4", "with-uuid-1"] }
 # The payload type `tokio-postgres`' `copy_in` sink takes (`T: Buf`). Needed by the
 # COPY streaming tests, which send a CSV in pieces that ignore row boundaries.
 bytes = "1"
@@ -25,3 +28,4 @@ sha2 = "0.10"
 chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 rust_decimal = { version = "1", features = ["db-postgres"] }
 pg_interval = "0.5"
+uuid = "1"

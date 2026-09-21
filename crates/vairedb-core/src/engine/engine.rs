@@ -6,8 +6,17 @@ use duckdb::arrow::record_batch::RecordBatch;
 
 use crate::error::CoreError;
 
-/// Bring the database's arithmetic in line with PostgreSQL's, which is the dialect a
-/// VaireDB client speaks.
+/// DuckDB's name for comparing text by byte value, which is what it does out of the box
+/// and what every other layer of VaireDB does: an empty `default_collation`.
+///
+/// Empty rather than `"C"`: DuckDB's collation names are ICU ones, it has no `C`, and the
+/// unset setting *is* the binary comparison PostgreSQL calls `C`.
+const BYTE_ORDER_COLLATION: &str = "";
+
+/// Bring the database's arithmetic and its text ordering in line with PostgreSQL's, which
+/// is the dialect a VaireDB client speaks.
+///
+/// ## `integer_division`
 ///
 /// One setting, and it decides an answer rather than a spelling. DuckDB's `/` is
 /// floating-point division whatever its operands are, so `7 / 2` answers `3.5` on a
@@ -28,9 +37,47 @@ use crate::error::CoreError;
 ///   [`DuckDbEngine::clone_connection`] — which every read and every write goes through
 ///   — hands out a connection where it has reverted to `false`. `SET GLOBAL` is what
 ///   survives the clone.
+///
+/// ## `default_collation`
+///
+/// The same kind of setting for the same kind of reason, and it decides an *ordering*.
+/// Every other layer of VaireDB compares text by byte value: DataFusion does on the read
+/// path, and both paths refuse a `COLLATE` that names anything else — an expression one in
+/// [`reject_unsupported_collation`](../../../vairedb_coordinator/pgwire_handler/pg_operators/fn.reject_unsupported_collation.html)
+/// and a column one at DDL. DuckDB is the one layer with a knob, and its default happens
+/// to agree; so it is **pinned** to the agreement rather than left to happen to hold, and
+/// read back to confirm the pin took. `SET GLOBAL default_collation = 'nocase'` makes
+/// `'B' < 'a'` false where every other layer answers true, and a shard evaluating a
+/// pushed-down comparison that way returns *fewer* rows than the query asked for —
+/// silently, because the coordinator only ever re-filters the rows a shard did send.
+/// Pinning it is what lets the coordinator push an ordering comparison on a text column at
+/// all (see
+/// [`filter_pushdown`](../../../vairedb_coordinator/scheduler/filter_pushdown/index.html)).
+///
+/// Verified and not merely set: a DuckDB build whose default was something else, or one
+/// that stopped accepting the setting, would otherwise turn into wrong answers rather than
+/// into a node that refuses to start.
 fn apply_postgres_semantics(conn: &Connection) -> Result<(), CoreError> {
     conn.execute_batch("SET GLOBAL integer_division = true")
-        .map_err(|e| CoreError::engine("failed to set integer_division", e))
+        .map_err(|e| CoreError::engine("failed to set integer_division", e))?;
+    conn.execute_batch(&format!(
+        "SET GLOBAL default_collation = '{BYTE_ORDER_COLLATION}'"
+    ))
+    .map_err(|e| CoreError::engine("failed to set default_collation", e))?;
+
+    let effective: String = conn
+        .query_row("SELECT current_setting('default_collation')", [], |row| {
+            row.get(0)
+        })
+        .map_err(|e| CoreError::engine("failed to read back default_collation", e))?;
+    if effective != BYTE_ORDER_COLLATION {
+        return Err(CoreError::Engine(format!(
+            "this node's DuckDB reports default_collation = '{effective}' after it was pinned to \
+             byte order: text would be ordered differently here than by the coordinator, so the \
+             node will not serve queries"
+        )));
+    }
+    Ok(())
 }
 
 /// Owns the node's DuckDB connection and serves as the factory for the
@@ -154,6 +201,157 @@ mod tests {
         let nested = dir.path().join("nested").join("deep");
         let _engine = DuckDbEngine::open(&nested).unwrap();
         assert!(nested.join("core.duckdb").exists());
+    }
+
+    // The pin, and what it is a pin *against*. `'B' < 'a'` is the cheapest expression
+    // that tells the two collations apart — byte order answers true, an ICU one false —
+    // so it is asserted both ways round: true on a connection this engine opened, and
+    // false once the setting is changed, which is what makes the pin load-bearing rather
+    // than decorative.
+    #[test]
+    fn text_is_ordered_by_byte_value() {
+        let engine = DuckDbEngine::open_in_memory().unwrap();
+        let collation: String = engine
+            .read_connection()
+            .unwrap()
+            .query_row("SELECT current_setting('default_collation')", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(collation, BYTE_ORDER_COLLATION);
+
+        let conn = engine.read_connection().unwrap();
+        let byte_order: bool = conn
+            .query_row("SELECT 'B' < 'a'", [], |row| row.get(0))
+            .unwrap();
+        assert!(byte_order, "'B' < 'a' is true by byte value");
+
+        conn.execute_batch("SET GLOBAL default_collation = 'nocase'")
+            .unwrap();
+        let case_insensitive: bool = conn
+            .query_row("SELECT 'B' < 'a'", [], |row| row.get(0))
+            .unwrap();
+        assert!(
+            !case_insensitive,
+            "a collation this node did not pin must be able to change the ordering, or the \
+             pin is testing nothing"
+        );
+    }
+
+    /// What an index costs a column change, and what it takes to pay it — the four
+    /// measurements the coordinator's rebuild of an indexed table is built on, pinned
+    /// here because they are DuckDB's behaviour rather than VaireDB's decision.
+    ///
+    /// 1. An index is a *dependency on the table*, so it blocks a column change the
+    ///    index does not even cover. This is the whole obstacle.
+    /// 2. Dropping the index, altering the column and creating the index again is
+    ///    accepted inside **one** transaction, which is what lets the coordinator ship
+    ///    a column change against an indexed table all-or-nothing per shard.
+    /// 3. **Dropping or retyping the covered column itself** is what the rebuild cannot
+    ///    carry: those two paths consult the column's own index list, which the drop in
+    ///    the same transaction has not yet updated, and answer `Cannot drop this
+    ///    column` / `Cannot change the type of this column: an index depends on it!`.
+    ///    A rename or a nullability change on the same column goes through.
+    /// 4. A **unique** index is the index the rebuild cannot carry: its name is not
+    ///    free again until the transaction that dropped it commits, so the sequence
+    ///    fails `An index with the name … already exists!`. A rebuild that would have
+    ///    to take a unique index's name back cannot be one transaction, which is why
+    ///    the coordinator refuses the change instead of splitting it in two — half a
+    ///    rebuild would leave a shard enforcing no uniqueness at all.
+    #[test]
+    fn a_column_change_rebuilds_a_plain_index_in_one_transaction_but_not_a_unique_one() {
+        let engine = DuckDbEngine::open_in_memory().unwrap();
+        let conn = engine.write_connection().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE t (id INTEGER, amount INTEGER, note VARCHAR);
+             INSERT INTO t VALUES (1, 10, 'a'), (2, 20, 'b');
+             CREATE INDEX idx_amount ON t (amount);",
+        )
+        .unwrap();
+
+        // 1. The index covers `amount`, and dropping `note` is refused anyway.
+        let blocked = conn
+            .execute_batch("ALTER TABLE t DROP COLUMN note")
+            .expect_err("an index is a dependency on the whole table");
+        assert!(
+            blocked.to_string().contains("depend"),
+            "expected a dependency error, got: {blocked}"
+        );
+
+        // 2. The same change inside one transaction, with the index taken off and put
+        //    back, is accepted — and the index is there afterwards.
+        conn.execute_batch(
+            "BEGIN TRANSACTION;
+             DROP INDEX idx_amount;
+             ALTER TABLE t DROP COLUMN note;
+             CREATE INDEX idx_amount ON t (amount);
+             COMMIT;",
+        )
+        .unwrap();
+        let indexes: i64 = conn
+            .query_row(
+                "SELECT count(*) FROM duckdb_indexes() WHERE index_name = 'idx_amount'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(indexes, 1, "the index is rebuilt by the same transaction");
+
+        // 3. Dropping or retyping the very column the dropped index covered is still
+        //    refused; a rename or a nullability change on it is not.
+        for column_change in [
+            "ALTER TABLE t DROP COLUMN amount",
+            "ALTER TABLE t ALTER COLUMN amount SET DATA TYPE BIGINT",
+        ] {
+            let refused = conn
+                .execute_batch(&format!(
+                    "BEGIN TRANSACTION; DROP INDEX idx_amount; {column_change};"
+                ))
+                .expect_err("this path consults the column's index list, not the transaction's");
+            assert!(
+                refused.to_string().contains("an index depends on it"),
+                "`{column_change}` should be refused for the index, got: {refused}"
+            );
+            conn.execute_batch("ROLLBACK").unwrap();
+        }
+        conn.execute_batch(
+            "BEGIN TRANSACTION;
+             DROP INDEX idx_amount;
+             ALTER TABLE t RENAME COLUMN amount TO total;
+             ALTER TABLE t ALTER COLUMN total SET NOT NULL;
+             CREATE INDEX idx_amount ON t (total);
+             COMMIT;",
+        )
+        .expect("a rename and a nullability change on the covered column are carried");
+        conn.execute_batch(
+            "BEGIN TRANSACTION;
+             DROP INDEX idx_amount;
+             ALTER TABLE t RENAME COLUMN total TO amount;
+             ALTER TABLE t ALTER COLUMN amount DROP NOT NULL;
+             CREATE INDEX idx_amount ON t (amount);
+             COMMIT;",
+        )
+        .unwrap();
+
+        // 4. A unique index cannot take its own name back in that transaction, even
+        //    for a change the plain index above came through unharmed.
+        conn.execute_batch("CREATE UNIQUE INDEX uq_id ON t (id)")
+            .unwrap();
+        let refused = conn
+            .execute_batch(
+                "BEGIN TRANSACTION;
+                 DROP INDEX idx_amount;
+                 DROP INDEX uq_id;
+                 ALTER TABLE t ALTER COLUMN amount SET NOT NULL;
+                 CREATE INDEX idx_amount ON t (amount);
+                 CREATE UNIQUE INDEX uq_id ON t (id);",
+            )
+            .expect_err("a unique index's name is not free until the drop commits");
+        assert!(
+            refused.to_string().contains("already exists"),
+            "expected a duplicate-name error, got: {refused}"
+        );
+        conn.execute_batch("ROLLBACK").unwrap();
     }
 
     #[test]

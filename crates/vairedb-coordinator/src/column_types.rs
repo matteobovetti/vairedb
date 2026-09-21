@@ -29,16 +29,23 @@
 //! `VARCHAR(64)`, `TIMESTAMP(6)` — are stripped and ignored, which is what PostgreSQL does
 //! to them on the wire too.
 //!
-//! ## What is deliberately left as text
+//! ## What is deliberately left as text, and what is told beside it
 //!
 //! `_ => Utf8` remains the fallback, and after DDL-time restriction of the types that
 //! cannot be served it is reached only by types whose *values* are faithful as text:
-//! `UUID`, `CHAR`/`BPCHAR`, `JSON`, `ENUM`, `STRUCT`. Their OIDs are cosmetically wrong
-//! (`text` rather than `uuid`/`json`), which is a smaller defect than the alternative and
-//! is tracked separately. `ENUM` is not mapped to `Dictionary(UInt8, Utf8)` even though
-//! arrow-pg accepts it: the dictionary would still sort by decoded string, so the one
-//! behavior that would justify the change — PostgreSQL's ordering by declaration order —
-//! would not follow.
+//! `UUID`, `CHAR`/`BPCHAR`, `JSON`, `ENUM`, `STRUCT`. `ENUM` is not mapped to
+//! `Dictionary(UInt8, Utf8)` even though arrow-pg accepts it: the dictionary would still
+//! sort by decoded string, so the one behavior that would justify the change —
+//! PostgreSQL's ordering by declaration order — would not follow.
+//!
+//! `Utf8` is `text`, though, and four of those types are not text to a client that asks
+//! what they are. The Arrow type has nowhere to say so, so the **declared string travels
+//! beside it** in the field's metadata ([`column_field`]) and is read back by
+//! [`pg_declared_type`] wherever a PostgreSQL type has to be named: the OID in a
+//! `RowDescription`, and `pg_attribute`'s `atttypid`/`atttypmod`, which is what `\d` reads.
+//! Only those columns carry metadata — a field that already says everything PostgreSQL
+//! would say carries none, so the shard-batch fast path in `coerce_batch_to_schema` is
+//! unaffected for every other column.
 //!
 //! ## And what is refused outright
 //!
@@ -48,6 +55,7 @@
 //! choice about. Those are refused at `CREATE TABLE`, which is the difference between a
 //! statement that fails and a table that accepts rows and then cannot return them.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use datafusion::arrow::datatypes::{
@@ -123,6 +131,113 @@ pub fn parse_data_type(type_str: &str) -> DataType {
         "DECIMAL" | "NUMERIC" => decimal_type(parameters),
         _ => DataType::Utf8,
     }
+}
+
+/// The Arrow field metadata key under which a column's declared type travels.
+///
+/// Namespaced, because the metadata map is shared with anything else that annotates a
+/// field — arrow-pg reads `ARROW:extension:name` out of the same map.
+pub const DECLARED_TYPE_KEY: &str = "vairedb:declared_type";
+
+/// A PostgreSQL type a column was declared as that its Arrow type does not name.
+///
+/// Four of the declared types [`parse_data_type`] answers `Utf8` for are not `text` to a
+/// client: the values are faithful, and the *type* is not the one the client declared. This
+/// is the difference, and [`pg_declared_type`] is where a declared string becomes one.
+///
+/// Every variant is a type whose PostgreSQL semantics VaireDB actually delivers, which is
+/// the bar for naming it at all — a name is a promise about behaviour and not only about
+/// bytes. So `JSONB` is reported as `json`: PostgreSQL's `jsonb` normalizes a document,
+/// ordering and de-duplicating its keys, and VaireDB returns the text the client stored, so
+/// `json` is the truth about it and `jsonb` would not be. `CHAR(n)` is reported as `bpchar`
+/// **with no length**, for the same reason: `bpchar` without a type modifier is the
+/// unbounded, unpadded character type, which is what the shards store.
+///
+/// `ENUM` is absent, and that is not an omission: a PostgreSQL enum has no fixed OID at all
+/// — each one is a `pg_type` row with an OID allocated when it is created — so there is no
+/// OID to advertise until VaireDB owns a `pg_type` row for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PgDeclaredType {
+    /// `JSON` and `JSONB` — PostgreSQL's `json`.
+    Json,
+    /// `UUID`.
+    Uuid,
+    /// `CHAR`, `BPCHAR`, `CHARACTER` — PostgreSQL's `bpchar`.
+    BpChar,
+    /// `VARCHAR`, `CHARACTER VARYING` — PostgreSQL's `varchar`.
+    VarChar,
+}
+
+/// What PostgreSQL calls a column declared as `type_str`, and with what type modifier, or
+/// `None` where the Arrow type from [`parse_data_type`] already says it.
+///
+/// The modifier is `-1` — PostgreSQL's "none" — for everything but a character type given a
+/// length, where it is the length plus the 4-byte `VARHDRSZ` header PostgreSQL stores it
+/// with. That is what makes `\d` print `character varying(64)` rather than `text`.
+///
+/// **A length is reported, not enforced.** The shards' engine ignores `VARCHAR(n)`
+/// entirely, so a longer value is stored and returned rather than refused; reporting the
+/// declaration back is the client's own `VARCHAR(64)` read back, not a promise that 64 is
+/// checked. The missing `22001` is a gap of its own.
+///
+/// An array is `None`: its element's PostgreSQL type is derived from the Arrow list's
+/// element type, and a `text[]` is what a `JSON[]` would have to be advertised as anyway.
+pub fn pg_declared_type(type_str: &str) -> Option<(PgDeclaredType, i32)> {
+    /// The 4 bytes PostgreSQL prefixes a variable-length value with, and so the offset
+    /// between a declared length and the `atttypmod` that records it.
+    const VARHDRSZ: i32 = 4;
+
+    let upper = type_str.trim().to_uppercase();
+    if array_element(&upper).is_some() {
+        return None;
+    }
+    let (base, parameters) = split_parameters(&upper);
+
+    let declared = match base.as_str() {
+        "JSON" | "JSONB" => PgDeclaredType::Json,
+        "UUID" => PgDeclaredType::Uuid,
+        "CHAR" | "BPCHAR" | "CHARACTER" => PgDeclaredType::BpChar,
+        "VARCHAR" | "CHARACTER VARYING" | "CHAR VARYING" => PgDeclaredType::VarChar,
+        _ => return None,
+    };
+    // Only a character type has a length, and only a length that is really a number is one:
+    // a `CHAR` with no parentheses is the unbounded type, which `-1` is the name of.
+    let typmod = match declared {
+        PgDeclaredType::BpChar | PgDeclaredType::VarChar => parameters
+            .and_then(|p| p.trim().parse::<i32>().ok())
+            .filter(|length| *length > 0)
+            .map_or(-1, |length| length + VARHDRSZ),
+        _ => -1,
+    };
+    Some((declared, typmod))
+}
+
+/// The Arrow field a column declared as `declared` is advertised as.
+///
+/// [`parse_data_type`]'s Arrow type, plus the declared string itself where — and only where
+/// — [`pg_declared_type`] has something to read out of it. The metadata is what carries a
+/// `JSON`, `UUID` or `CHAR(n)` column's identity through a plan that types it `Utf8`; a
+/// field whose Arrow type is already the whole truth carries none, so nothing that compares
+/// schemas sees a difference on it.
+pub fn column_field(name: &str, declared: &str, nullable: bool) -> Field {
+    let field = Field::new(name, parse_data_type(declared), nullable);
+    match pg_declared_type(declared) {
+        None => field,
+        Some(_) => field.with_metadata(HashMap::from([(
+            DECLARED_TYPE_KEY.to_string(),
+            declared.trim().to_string(),
+        )])),
+    }
+}
+
+/// The PostgreSQL type a *field* was declared as, read back out of its metadata.
+///
+/// The reading half of [`column_field`]. `None` for a field that carries no declared type,
+/// which is every field whose Arrow type already names its PostgreSQL one and every field
+/// an expression produced rather than a column — `json_col || ''` is `text`, in PostgreSQL
+/// too.
+pub fn field_declared_type(field: &Field) -> Option<(PgDeclaredType, i32)> {
+    pg_declared_type(field.metadata().get(DECLARED_TYPE_KEY)?)
 }
 
 /// Whether a column declared as `type_str` is *really* text, rather than a type that only
@@ -481,6 +596,97 @@ mod tests {
     #[test]
     fn a_bracket_inside_a_declaration_is_not_an_array_suffix() {
         assert_eq!(parse_data_type("STRUCT(a INTEGER[])"), DataType::Utf8);
+    }
+
+    // The four types whose values are text and whose *name* is not, told apart from the
+    // ones whose Arrow type already says everything PostgreSQL would.
+    #[test]
+    fn a_declared_type_arrow_cannot_name_is_named_beside_it() {
+        use PgDeclaredType as P;
+        for (declared, expected) in [
+            ("JSON", (P::Json, -1)),
+            ("jsonb", (P::Json, -1)),
+            ("UUID", (P::Uuid, -1)),
+            ("CHAR", (P::BpChar, -1)),
+            ("BPCHAR", (P::BpChar, -1)),
+            ("CHARACTER", (P::BpChar, -1)),
+            ("VARCHAR", (P::VarChar, -1)),
+            ("character varying", (P::VarChar, -1)),
+            // The length, as PostgreSQL records it: the declaration plus `VARHDRSZ`.
+            ("VARCHAR(64)", (P::VarChar, 68)),
+            ("CHAR(3)", (P::BpChar, 7)),
+            ("CHARACTER VARYING(10)", (P::VarChar, 14)),
+        ] {
+            assert_eq!(pg_declared_type(declared), Some(expected), "`{declared}`");
+        }
+
+        for declared in [
+            // Already named by its Arrow type.
+            "INTEGER",
+            "TEXT",
+            "STRING",
+            "TIMESTAMPTZ",
+            "DECIMAL(10,2)",
+            "BLOB",
+            // An array's element type is derived from the Arrow list, not from here.
+            "JSON[]",
+            "VARCHAR(10)[]",
+            // Named by nothing: an enum has no OID until a `pg_type` row owns one, and a
+            // type this layer has never heard of has no PostgreSQL name to claim.
+            "ENUM('a', 'b')",
+            "STRUCT(a INTEGER)",
+            "GEOMETRY",
+        ] {
+            assert_eq!(pg_declared_type(declared), None, "`{declared}`");
+        }
+    }
+
+    // A length that is not a length does not become one, and neither does a zero.
+    #[test]
+    fn a_length_that_is_not_a_number_is_no_modifier_at_all() {
+        assert_eq!(
+            pg_declared_type("VARCHAR(x)"),
+            Some((PgDeclaredType::VarChar, -1))
+        );
+        assert_eq!(
+            pg_declared_type("VARCHAR()"),
+            Some((PgDeclaredType::VarChar, -1))
+        );
+        assert_eq!(
+            pg_declared_type("VARCHAR(0)"),
+            Some((PgDeclaredType::VarChar, -1))
+        );
+        assert_eq!(
+            pg_declared_type("VARCHAR(-2)"),
+            Some((PgDeclaredType::VarChar, -1))
+        );
+    }
+
+    // The metadata is carried only where it says something, so that every other column's
+    // field stays byte-identical to the one a shard batch arrives with.
+    #[test]
+    fn only_a_column_with_something_to_say_carries_metadata() {
+        let json = column_field("j", "JSON", true);
+        assert_eq!(json.data_type(), &DataType::Utf8);
+        assert_eq!(field_declared_type(&json), Some((PgDeclaredType::Json, -1)));
+
+        let varchar = column_field("s", "VARCHAR(64)", false);
+        assert!(!varchar.is_nullable());
+        assert_eq!(
+            field_declared_type(&varchar),
+            Some((PgDeclaredType::VarChar, 68))
+        );
+
+        for declared in ["INTEGER", "TEXT", "DECIMAL(10,2)", "ENUM('a')"] {
+            let field = column_field("c", declared, true);
+            assert!(
+                field.metadata().is_empty(),
+                "`{declared}` has nothing to carry, so its field must be bare"
+            );
+            assert_eq!(field_declared_type(&field), None);
+            // And it is the same field the bare mapping produces, metadata included.
+            assert_eq!(field, Field::new("c", parse_data_type(declared), true));
+        }
     }
 
     #[test]

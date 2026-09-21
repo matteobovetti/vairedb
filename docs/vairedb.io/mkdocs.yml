@@ -76,6 +76,7 @@ nav:
       - Querying Data: sql/querying.md
       - Column Pseudonymization: sql/pseudonymization.md
       - Worked Example: sql/examples.md
+      - PostgreSQL Compatibility: sql/compatibility.md
   - Reference:
       - reference/index.md
       - Configuration Reference: reference/configuration.md

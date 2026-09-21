@@ -19,7 +19,8 @@ DuckDB instance optimized for OLAP queries.
     ---
 
     Speak the PostgreSQL wire protocol (v3). Connect with `psql`, JDBC/ODBC,
-    `psycopg`, `pgx`, or any BI tool — no proprietary driver required.
+    `psycopg`, `pgx`, or any BI tool — no proprietary driver required. See the
+    [compatibility status](sql/compatibility.md) for what diverges, axis by axis.
 
 -   :material-arrow-expand-horizontal: __Horizontally scalable__
 
@@ -110,7 +111,7 @@ and serve analytical, read-optimized workloads. Common use cases:
 See [System Architecture](concepts/system-architecture.md) for the full picture.
 
 !!! warning "Project status"
-    VaireDB is an early-stage (v0.1) project. The single coordinator is a known
+    VaireDB is an early-stage project. The single coordinator is a known
     single point of failure, and several features (snapshots, range sharding,
     automatic failover, security, observability) are planned but not yet
     implemented. See the [Roadmap](roadmap.md) for details.

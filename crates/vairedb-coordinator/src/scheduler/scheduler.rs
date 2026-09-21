@@ -18,6 +18,8 @@ use ballista_scheduler::config::SchedulerConfig;
 use ballista_scheduler::metrics::default_metrics_collector;
 use ballista_scheduler::scheduler_server::SchedulerServer;
 use datafusion::arrow::datatypes::{Field, Schema};
+use datafusion::catalog::MemorySchemaProvider;
+use datafusion::common::TableReference;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::execution::SessionState;
 use datafusion::execution::context::SessionContext;
@@ -30,8 +32,9 @@ use tokio::net::TcpListener;
 use ballista_core::serde::protobuf::scheduler_grpc_server::SchedulerGrpcServer;
 
 use crate::catalog::{MetadataCatalog, ShardMeta, VaireDbCatalogSchema};
-use crate::column_types::parse_data_type;
+use crate::column_types::column_field;
 use crate::error::{CoordinatorError, Result};
+use crate::pgwire_handler::query_router;
 
 use super::codec::VairePhysicalCodec;
 use super::filter_pushdown::OpaqueTextColumns;
@@ -231,6 +234,13 @@ pub(crate) fn register_postgres_functions(
     if let Err(e) = vairedb_common::udaf::register_ordered_set_aggregates(registry) {
         tracing::warn!(error = %e, "failed to register the ordered-set aggregates");
     }
+    // The rest of PostgreSQL's `WITHIN GROUP` family — `mode()` and the hypothetical-set
+    // `rank`/`dense_rank`/`percent_rank`/`cume_dist`, none of which DataFusion has as an
+    // aggregate at all. Same reason as the percentiles above: the executor has to resolve the
+    // identical names. See [`vairedb_common::within_group`].
+    if let Err(e) = vairedb_common::within_group::register_within_group_aggregates(registry) {
+        tracing::warn!(error = %e, "failed to register the WITHIN GROUP aggregates");
+    }
     // PostgreSQL's float division, which the read path rewrites `/` into so a zero divisor
     // raises `22012` instead of answering an infinity. Also here rather than in the
     // coordinator alone: the rewrite happens on the logical plan the client submits, so the
@@ -256,6 +266,25 @@ pub(crate) fn register_postgres_functions(
     if let Err(e) = vairedb_common::bytea_in::register_bytea_in(registry) {
         tracing::warn!(error = %e, "failed to register the bytea input conversion");
     }
+    // The `json`/`jsonb` input conversions and the four accessors `->`, `->>`, `#>` and
+    // `#>>`, which the read path rewrites those casts and operators into. Here for the same
+    // reason as `bytea` above: the calls are in the AST the client submits, so the scheduler
+    // decodes their names and an executor runs them. See [`vairedb_common::json_pg`].
+    if let Err(e) = vairedb_common::json_pg::register_json_functions(registry) {
+        tracing::warn!(error = %e, "failed to register the json functions");
+    }
+    // The rendering half of `json_agg`/`jsonb_agg`, which the read path composes over
+    // DataFusion's own `array_agg` so the in-aggregate `ORDER BY` survives a partial
+    // aggregate per shard. See [`vairedb_common::json_agg`].
+    if let Err(e) = vairedb_common::json_agg::register_json_aggregates(registry) {
+        tracing::warn!(error = %e, "failed to register the json aggregates");
+    }
+    // PostgreSQL's `uuid` input conversion, which `::uuid` becomes — a validation that also
+    // canonicalizes, so two spellings of one UUID compare equal. Same reason again. See
+    // [`vairedb_common::uuid_in`].
+    if let Err(e) = vairedb_common::uuid_in::register_uuid_in(registry) {
+        tracing::warn!(error = %e, "failed to register the uuid input conversion");
+    }
     // PostgreSQL's `nth_value`, which refuses an offset of zero instead of answering NULL
     // for every row. Unlike the four above it is not a name the read path rewrites into:
     // it *replaces* DataFusion's function under DataFusion's own name, so a registry that
@@ -264,6 +293,48 @@ pub(crate) fn register_postgres_functions(
     // [`vairedb_common::nth_value`].
     if let Err(e) = vairedb_common::nth_value::register_nth_value(registry) {
         tracing::warn!(error = %e, "failed to register the checked nth_value");
+    }
+    // The variance and standard deviation family, which PostgreSQL answers in `numeric`
+    // over an exact input and DataFusion answers in `float8` over every input. Shadowing,
+    // like `nth_value` above and for the same reason: the names are DataFusion's own, so a
+    // registry that misses these keeps the inexact answer instead of failing to resolve.
+    // See [`vairedb_common::stats_udaf`].
+    if let Err(e) = vairedb_common::stats_udaf::register_statistics_aggregates(registry) {
+        tracing::warn!(error = %e, "failed to register the exact statistics aggregates");
+    }
+    // PostgreSQL's `ntile`, which is an `int4` where every other ranking function is an
+    // `int8`. Shadowing for the same reason again — and the type matters here rather than
+    // the value, which stays DataFusion's. See [`vairedb_common::ntile`].
+    if let Err(e) = vairedb_common::ntile::register_ntile(registry) {
+        tracing::warn!(error = %e, "failed to register the int4 ntile");
+    }
+    // The exact integer average, which the aggregate rewrite below turns `avg(integer)` into
+    // so the answer carries PostgreSQL's sixteen decimal places. Not a shadow — a name of
+    // VaireDB's own, because which arguments it applies to is a question only the rewrite
+    // can answer — so here for the same reason as the division above: the call is on the
+    // plan the client submits, and the scheduler decodes the name an executor then runs.
+    // See [`vairedb_common::avg_udaf`].
+    if let Err(e) = vairedb_common::avg_udaf::register_exact_average(registry) {
+        tracing::warn!(error = %e, "failed to register the exact integer average");
+    }
+    // `pg_typeof`, which reports the type of its argument by PostgreSQL's SQL name. A name of
+    // PostgreSQL's own that nothing rewrites into, so this line and its twin on the executor
+    // are the whole of it. See [`vairedb_common::pg_typeof`].
+    if let Err(e) = vairedb_common::pg_typeof::register_pg_typeof(registry) {
+        tracing::warn!(error = %e, "failed to register pg_typeof");
+    }
+    // `format`, `quote_literal` and `quote_nullable` — the family a client uses to build SQL
+    // text, where the quoting rules are the answer and getting them wrong is an injection.
+    // See [`vairedb_common::pg_format`].
+    if let Err(e) = vairedb_common::pg_format::register_format_functions(registry) {
+        tracing::warn!(error = %e, "failed to register the format functions");
+    }
+    // The calendar-arithmetic half of PostgreSQL's datetime surface: `age`, `make_timestamp`,
+    // `make_interval`, `isfinite`, the three `justify_*` and the two clock readers. The
+    // `datafusion-pg-functions` `datetime` category is an empty module in 0.1, so none of
+    // these arrive with the `register_all` above. See [`vairedb_common::pg_datetime`].
+    if let Err(e) = vairedb_common::pg_datetime::register_datetime_functions(registry) {
+        tracing::warn!(error = %e, "failed to register the datetime functions");
     }
 }
 
@@ -346,20 +417,27 @@ pub fn refresh_catalog_tables(ctx: &SessionContext, catalog: &MetadataCatalog) -
     let tables = catalog.list_tables()?;
 
     for table_meta in &tables {
-        // Register/look up under a bare TableReference so the canonical logical
-        // name is used verbatim — passing a &str would re-run identifier
-        // normalization and lowercase quoted names, breaking resolution.
-        let table_ref = datafusion::common::TableReference::bare(table_meta.table_name.clone());
+        // Register/look up under a `TableReference` built from the canonical key rather
+        // than by passing a `&str`, which would re-run identifier normalization and
+        // lowercase a quoted name, breaking resolution. A qualified key becomes a *two
+        // part* reference — see [`query_router::table_reference`] for why the flat form
+        // does not survive a distributed plan.
+        let table_ref = query_router::table_reference(&table_meta.table_name);
         if ctx.table_exist(table_ref.clone()).unwrap_or(false) {
             continue;
         }
+        // A two-part reference resolves through a schema, so the schema has to be there
+        // before the table is: DataFusion's catalog does not create one on demand, and
+        // `public` is the only one it starts with.
+        ensure_schema_registered(ctx, &table_ref)?;
+        // `column_field` rather than `Field::new`, because the declared string says things
+        // the Arrow type cannot: a `JSON`, `UUID` or `VARCHAR(64)` column is `Utf8` either
+        // way, and only here is the declaration still in hand to carry beside it. See
+        // [`crate::column_types::pg_declared_type`].
         let fields: Vec<Field> = table_meta
             .columns
             .iter()
-            .map(|col| {
-                let dt = parse_data_type(&col.data_type);
-                Field::new(&col.name, dt, col.nullable)
-            })
+            .map(|col| column_field(&col.name, &col.data_type, col.nullable))
             .collect();
 
         let schema = Arc::new(Schema::new(fields));
@@ -390,6 +468,32 @@ pub fn refresh_catalog_tables(ctx: &SessionContext, catalog: &MetadataCatalog) -
         })?;
     }
 
+    Ok(())
+}
+
+/// Make sure the schema `table_ref` resolves through exists in `ctx`, adding an empty
+/// in-memory one if it does not.
+///
+/// The provider is a plain [`MemorySchemaProvider`] because nothing about the schema itself
+/// is dynamic — the relations in it are registered one by one by
+/// [`refresh_catalog_tables`], and what a client may *see* is answered from the metadata
+/// catalog by `information_schema`/`pg_catalog`, not from here. A bare reference needs
+/// nothing: it resolves through `public`, which DataFusion always has.
+fn ensure_schema_registered(ctx: &SessionContext, table_ref: &TableReference) -> Result<()> {
+    let TableReference::Partial { schema, .. } = table_ref else {
+        return Ok(());
+    };
+    let catalog = ctx.catalog("datafusion").ok_or_else(|| {
+        CoordinatorError::Internal("internal query engine configuration error".to_string())
+    })?;
+    if catalog.schema(schema).is_some() {
+        return Ok(());
+    }
+    catalog
+        .register_schema(schema, Arc::new(MemorySchemaProvider::new()))
+        .map_err(|e| {
+            CoordinatorError::Internal(format!("failed to register schema '{schema}': {e}"))
+        })?;
     Ok(())
 }
 
@@ -567,6 +671,33 @@ pub fn setup_pg_catalog_schema(ctx: &SessionContext) -> Result<()> {
 
     setup_pg_catalog(ctx, "datafusion", EmptyContextProvider)
         .map_err(|e| CoordinatorError::Internal(format!("failed to set up pg_catalog: {e}")))?;
+    // `setup_pg_catalog` registers its own scalar functions, and it runs *after*
+    // `register_postgres_functions` on both contexts — so it has just replaced VaireDB's
+    // `format_type` with the one whose signature a string OID cannot resolve against. Put
+    // VaireDB's back. Only this one name is contested: every other function in
+    // `pg_udf`'s set is upstream's own. See [`vairedb_common::pg_format_type`].
+    ctx.register_udf(
+        vairedb_common::pg_format_type::format_type_udf()
+            .as_ref()
+            .clone(),
+    );
+
+    // `pg_settings` in front of upstream's, so the table answers for the connection that is
+    // scanning it rather than returning one hardcoded row. Registered over the schema
+    // `setup_pg_catalog` just installed, because that provider offers no way in — see
+    // [`crate::pgwire_handler::pg_settings`].
+    let catalog = ctx.catalog("datafusion").ok_or_else(|| {
+        CoordinatorError::Internal("internal query engine configuration error".to_string())
+    })?;
+    let upstream = catalog
+        .schema("pg_catalog")
+        .ok_or_else(|| CoordinatorError::Internal("pg_catalog was not registered".to_string()))?;
+    catalog
+        .register_schema(
+            "pg_catalog",
+            Arc::new(crate::pgwire_handler::pg_settings::VaireDbPgCatalog::wrapping(upstream)),
+        )
+        .map_err(|e| CoordinatorError::Internal(format!("failed to wrap pg_catalog: {e}")))?;
 
     Ok(())
 }

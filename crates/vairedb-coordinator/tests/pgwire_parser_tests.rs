@@ -3,7 +3,7 @@
 
 use vairedb_coordinator::error::CoordinatorError;
 use vairedb_coordinator::pgwire_handler::parser::{
-    collapse_schema_qualified_relations, parse_sql, transform_to_char_format_for_read,
+    canonicalize_relation_names, parse_sql, transform_to_char_format_for_read,
 };
 
 #[test]
@@ -115,39 +115,78 @@ fn test_ddl_is_parsed_verbatim() {
     assert!(sql.to_lowercase().contains("oid"), "got: {sql}");
 }
 
-// --- Read path: collapse a schema-qualified relation to its catalog key ---
+// --- Read path: respell a relation as the name its provider is registered under ---
 
-// A schema is a coordinator-catalog namespace, not a DataFusion one: the collapse
-// rewrites `schema.tbl` to the single quoted identifier `"schema.tbl"`, which is
-// the name the relation is registered under for planning.
-#[test]
-fn test_collapse_schema_qualified_relation() {
-    let sql = "SELECT id FROM ident_schema.orders WHERE id = 1";
+/// The statement `sql` after the rewrite, as SQL.
+fn canonicalized(sql: &str) -> String {
     let mut stmts = parse_sql(sql).unwrap();
-    collapse_schema_qualified_relations(&mut stmts[0]);
-    let result = stmts[0].to_string();
-    assert!(result.contains("\"ident_schema.orders\""), "got: {result}");
+    canonicalize_relation_names(&mut stmts[0]);
+    stmts[0].to_string()
+}
+
+// A relation in a non-default schema is registered under a two-part `TableReference` — the
+// one form that survives a distributed plan's column qualifiers intact — so a name that
+// already spells those two parts has nothing to rewrite and is left byte-identical.
+#[test]
+fn test_canonicalize_keeps_a_qualified_relation_in_two_parts() {
+    for sql in [
+        "SELECT id FROM ident_schema.orders WHERE id = 1",
+        // A quoted part is taken verbatim into the key, so it already spells it too.
+        "SELECT id FROM ident_schema.\"MyTable\"",
+    ] {
+        let before = parse_sql(sql).unwrap()[0].to_string();
+        assert_eq!(canonicalized(sql), before, "for: {sql}");
+    }
 }
 
 #[test]
-fn test_collapse_leaves_single_part_relation_untouched() {
+fn test_canonicalize_leaves_single_part_relation_untouched() {
     let sql = "SELECT id FROM orders WHERE id = 1";
-    let mut stmts = parse_sql(sql).unwrap();
-    let before = stmts[0].to_string();
-    collapse_schema_qualified_relations(&mut stmts[0]);
-    let after = stmts[0].to_string();
-    assert_eq!(before, after);
+    let before = parse_sql(sql).unwrap()[0].to_string();
+    assert_eq!(canonicalized(sql), before);
 }
 
-// The key keeps a quoted part's case, and the whole key is quoted so nothing folds
-// it away again.
+// Where the written name and the key differ, the key wins, and each part is quoted so
+// nothing folds it away a second time.
 #[test]
-fn test_collapse_preserves_quoted_last_part() {
-    let sql = "SELECT id FROM ident_schema.\"MyTable\"";
-    let mut stmts = parse_sql(sql).unwrap();
-    collapse_schema_qualified_relations(&mut stmts[0]);
-    let result = stmts[0].to_string();
-    assert!(result.contains("\"ident_schema.MyTable\""), "got: {result}");
+fn test_canonicalize_writes_the_folded_case_of_an_unquoted_name() {
+    let result = canonicalized("SELECT id FROM Ident_Schema.Orders");
+    assert!(
+        result.contains("\"ident_schema\".\"orders\""),
+        "got: {result}"
+    );
+}
+
+// `public` is not a qualifier in the catalog: the relation is registered bare, so the
+// qualifier is dropped rather than carried into a two-part name nothing is registered
+// under.
+#[test]
+fn test_canonicalize_drops_the_default_schema_qualifier() {
+    let result = canonicalized("SELECT id FROM public.orders");
+    assert!(result.contains("FROM \"orders\""), "got: {result}");
+    assert!(!result.contains("public"), "got: {result}");
+}
+
+// A quoted name holding a dot is documented as the same key as the qualified form, so it
+// has to reach the same two-part reference — otherwise it would resolve to nothing.
+#[test]
+fn test_canonicalize_splits_a_quoted_name_holding_a_dot() {
+    let result = canonicalized("SELECT id FROM \"ident_schema.orders\"");
+    assert!(
+        result.contains("\"ident_schema\".\"orders\""),
+        "got: {result}"
+    );
+}
+
+// A leading catalog part is not part of the key: only the last two are read.
+#[test]
+fn test_canonicalize_drops_a_leading_catalog_part() {
+    let result = canonicalized("SELECT id FROM mydb.ident_schema.orders");
+    assert!(
+        result.contains("\"ident_schema\".\"orders\""),
+        "got: {result}"
+    );
+    assert!(!result.contains("mydb"), "got: {result}");
 }
 
 // --- Read path: keep to_char, translate only the format string ---

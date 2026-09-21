@@ -10,7 +10,7 @@ psql -h 127.0.0.1 -p 5432 "sslmode=disable"
 ```
 
 !!! note "TLS"
-    v0.1 does not implement TLS (it is a [non-goal](../concepts/design-goals.md)
+    VaireDB does not implement TLS yet (it is a [non-goal](../concepts/design-goals.md)
     for now), so pass `sslmode=disable`.
 
 ## Connection strings

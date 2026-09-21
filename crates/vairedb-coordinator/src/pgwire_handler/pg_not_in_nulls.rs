@@ -104,10 +104,12 @@ impl<'n> TreeNodeVisitor<'n> for NotInNulls {
 
     fn f_down(&mut self, node: &'n LogicalPlan) -> DFResult<TreeNodeRecursion> {
         // Only the two nodes whose expressions become a join: a `WHERE`, `HAVING` or
-        // `QUALIFY` predicate is a `Filter`, and a join's `ON` is a `Join`. Elsewhere — in a
-        // select list above all — DataFusion refuses an `InSubquery` on its own
-        // (`probe.k NOT IN (<subquery>) is not yet supported`), and a second refusal there
-        // would only replace one loud error with another.
+        // `QUALIFY` predicate is a `Filter`, and a join's `ON` is a `Join`. A select list is
+        // not one of them, and does not need to be:
+        // [`super::pg_projection_subqueries`] respells a `NOT IN` there into a three-valued
+        // `CASE` over `count(*)` subqueries, which reproduces PostgreSQL's NULL rules exactly
+        // rather than relying on a join to. So no anti join is built from that position and
+        // there is nothing here to judge.
         let checked = match node {
             LogicalPlan::Filter(filter) => {
                 check_expr(&filter.predicate, filter.input.schema().as_ref())
@@ -359,11 +361,12 @@ mod tests {
         assert!(reject_null_unaware_not_in(&plan).is_ok());
     }
 
-    /// A `NOT IN` in a select list is DataFusion's own loud failure, and stays that way:
-    /// refusing it here would replace one error with another and hide the position from the
-    /// message.
+    /// A `NOT IN` in a select list is not this check's business either: it is answered, by
+    /// [`super::super::pg_projection_subqueries`], with the NULL rules written into the
+    /// expression rather than left to a join. Refusing it here would take away a query that
+    /// works.
     #[tokio::test]
-    async fn a_not_in_in_a_select_list_is_left_to_datafusion() {
+    async fn a_not_in_in_a_select_list_is_left_to_the_select_list_rewrite() {
         accepted("SELECT id, k NOT IN (SELECT k FROM r) FROM l").await;
     }
 }

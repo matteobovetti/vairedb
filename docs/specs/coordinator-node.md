@@ -36,4 +36,4 @@ The coordinator maintains a cluster-wide catalog:
 
 **Storage backend**
 
-The metadata catalog is stored in a local embedded KV store on the single coordinator node. A future version may introduce a distributed KV store with Raft consensus (similar to [tikv](https://tikv.org) or [etcd](https://etcd.io/)) to support multi-coordinator HA (see [Roadmap](roadmap.md)).
+The metadata catalog is stored in a local embedded KV store on the single coordinator node. A future version may introduce a distributed KV store with Raft consensus (similar to [tikv](https://tikv.org) or [etcd](https://etcd.io/)) to support multi-coordinator HA (see [Roadmap](intenal-roadmap.md)).

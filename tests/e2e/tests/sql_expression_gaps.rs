@@ -607,6 +607,63 @@ async fn test_ranking_functions_are_bigint() {
     drop_table(&client, &tbl).await;
 }
 
+// `ntile(n)` is the one ranking function PostgreSQL does *not* answer in `bigint`: its
+// result is a bucket number and its argument is an `int4`, so the result is `int4` too.
+// DataFusion types it `UInt64` like the other three, and the widening that turns those
+// into the `bigint` they promise lands `ntile` on `bigint` as well — a driver that bound
+// an `int4` receive buffer from the OID reads four bytes of an eight-byte body. Both
+// halves are asserted, because Describe and Execute have to agree.
+#[tokio::test]
+async fn test_ntile_is_an_integer() {
+    let client = ready_client().await;
+    let tbl = setup_probe_table(&client, "expr_ntile_oid").await;
+
+    let sql = format!("SELECT ntile(2) OVER (ORDER BY id) FROM {tbl}");
+    assert_eq!(
+        describe_result_types(&client, &sql).await,
+        vec![Type::INT4],
+        "ntile is int4, not the int8 the other ranking functions are"
+    );
+
+    // Reading the column as an i32 is what a driver does with that OID, so this fails if
+    // Execute sends an eight-byte body under the int4 header Describe promised.
+    let stmt = client.prepare(&sql).await.unwrap();
+    let rows = client.query(&stmt, &[]).await.unwrap();
+    let buckets: Vec<i32> = rows.iter().map(|r| r.get::<_, i32>(0)).collect();
+    assert_eq!(buckets, vec![1, 1, 2], "3 rows into 2 buckets is 2, 1");
+
+    // The three that *are* bigint stay bigint in the same statement, so the narrowing is
+    // scoped to the function whose result is narrow and not to ranking functions.
+    assert_eq!(
+        describe_result_types(
+            &client,
+            &format!(
+                "SELECT ntile(2) OVER (ORDER BY id), row_number() OVER (ORDER BY id), \
+                 rank() OVER (ORDER BY id), dense_rank() OVER (ORDER BY id) FROM {tbl}"
+            )
+        )
+        .await,
+        vec![Type::INT4, Type::INT8, Type::INT8, Type::INT8],
+    );
+
+    // And the narrowed type survives being used as a number rather than only described:
+    // a bucket that arrived as a `numeric` or a `bigint` would not compare against an
+    // `int4` grouping key without a cast the client never wrote.
+    assert_eq!(
+        scalar(
+            &client,
+            &format!(
+                "SELECT count(*) FROM (SELECT ntile(2) OVER (ORDER BY id) AS b FROM {tbl}) s \
+                 WHERE b = 1"
+            )
+        )
+        .await,
+        "2"
+    );
+
+    drop_table(&client, &tbl).await;
+}
+
 // ============================================================================
 // 7. Decimal literals are exact
 // ============================================================================
@@ -633,9 +690,10 @@ async fn test_decimal_literals_are_exact() {
 
 // The same setting governs integer literals too large for `i64`, which used to become
 // `Float64` and lose their low digits with nothing said. They are now exact for as far
-// as an exact type reaches: `Decimal128` holds 38 digits, and past that the literal is
-// `Decimal256`, which has no PostgreSQL OID here — so it is refused rather than
-// rounded, which is the same choice the rest of this file makes.
+// as an exact type reaches, and that is now as far as Arrow reaches: `Decimal128` holds
+// 38 digits, and past that the literal is a `Decimal256`, which VaireDB advertises as
+// `numeric` and whose wire bytes it writes itself. It used to be refused for want of an
+// OID; a refusal is no longer the honest answer when the digits are all there.
 #[tokio::test]
 async fn test_large_integer_literals_keep_their_digits() {
     let client = ready_client().await;
@@ -645,8 +703,18 @@ async fn test_large_integer_literals_keep_their_digits() {
         "123456789012345678901234567890",
         "30 digits, exact — this used to read back as 123456789012345680000000000000"
     );
-    // 39 digits: one past what `Decimal128` can hold.
-    assert_rejected(&client, "SELECT 123456789012345678901234567890123456789").await;
+    // 39 digits: one past what `Decimal128` can hold, so this literal is a `Decimal256`.
+    let wide = "123456789012345678901234567890123456789";
+    assert_eq!(
+        scalar(&client, &format!("SELECT {wide}")).await,
+        wide,
+        "39 digits, exact — a Decimal256, which used to be refused rather than rounded"
+    );
+    assert_eq!(
+        describe_result_types(&client, &format!("SELECT {wide}")).await,
+        vec![Type::NUMERIC],
+        "a Decimal256 is a PostgreSQL numeric, which has no precision limit to exceed"
+    );
 }
 
 // ============================================================================
@@ -768,6 +836,178 @@ async fn test_uncorrelated_projection_subquery_shapes_are_answered() {
         "the placeholder binds in the subquery, which runs"
     );
 
+    drop_table(&client, &orders).await;
+    drop_table(&client, &lines).await;
+}
+
+// DISTRIBUTED. § 2.5: a membership test written as a *column* rather than as a filter.
+// PostgreSQL answers both `EXISTS (q)` and `x IN (q)` in a select list; VaireDB reached the
+// physical planner with the expression the planner built and failed there — `Physical plan
+// does not support logical expression Exists(…)` — and on the cluster it did not get that
+// far, because datafusion-proto encodes neither variant, so the plan could not be cut into
+// stages. Both are respelled as the `count(*)` scalar subquery that means the same thing,
+// which datafusion-proto does encode and which DataFusion does decorrelate.
+#[tokio::test]
+async fn test_a_membership_test_in_the_select_list_is_answered() {
+    let client = ready_client().await;
+    let (orders, lines) = setup_order_tables(&client, "expr_sqex").await;
+
+    // Order 4 has no lines, so its `EXISTS` is false and the other three are true. Both
+    // sides span shards: `lines` is sharded on `lines.id`.
+    let rows = simple_query_rows(
+        &client,
+        &format!(
+            "SELECT o.id, EXISTS (SELECT 1 FROM {lines} l WHERE l.oid = o.id) \
+             FROM {orders} o ORDER BY o.id"
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|r| (r[0].as_deref(), r[1].as_deref()))
+            .collect::<Vec<_>>(),
+        vec![
+            (Some("1"), Some("t")),
+            (Some("2"), Some("t")),
+            (Some("3"), Some("t")),
+            (Some("4"), Some("f")),
+        ],
+        "a boolean column per row, and false — not NULL — where there are no rows"
+    );
+
+    // `NOT EXISTS` is the same count compared the other way.
+    let rows = simple_query_rows(
+        &client,
+        &format!(
+            "SELECT o.id, NOT EXISTS (SELECT 1 FROM {lines} l WHERE l.oid = o.id AND l.amount > 20) \
+             FROM {orders} o ORDER BY o.id"
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        rows.iter().map(|r| r[1].as_deref()).collect::<Vec<_>>(),
+        vec![Some("t"), Some("t"), Some("f"), Some("t")],
+        "only order 3 has a line over 20"
+    );
+
+    // `IN (q)`, correlated the same way. Order 3's lines are 30 and 40, so 30 is in them.
+    let rows = simple_query_rows(
+        &client,
+        &format!(
+            "SELECT o.id, 30 IN (SELECT l.amount FROM {lines} l WHERE l.oid = o.id) \
+             FROM {orders} o ORDER BY o.id"
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        rows.iter().map(|r| r[1].as_deref()).collect::<Vec<_>>(),
+        vec![Some("f"), Some("f"), Some("t"), Some("f")],
+        "an empty candidate list is false, not NULL"
+    );
+
+    // An uncorrelated `q` of any shape, including one the correlated case could not take —
+    // here a `GROUP BY … HAVING` — and `NOT IN`, whose PostgreSQL reading is the three-valued
+    // one: no candidate is NULL here, so it is a plain negation.
+    let rows = simple_query_rows(
+        &client,
+        &format!(
+            "SELECT o.id, o.id IN (SELECT l.oid FROM {lines} l GROUP BY l.oid HAVING count(*) > 1), \
+             o.id NOT IN (SELECT l.oid FROM {lines} l) \
+             FROM {orders} o ORDER BY o.id"
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|r| (r[1].as_deref(), r[2].as_deref()))
+            .collect::<Vec<_>>(),
+        vec![
+            (Some("t"), Some("f")),
+            (Some("f"), Some("f")),
+            (Some("t"), Some("f")),
+            (Some("f"), Some("t")),
+        ],
+        "orders 1 and 3 have more than one line; only order 4 has none"
+    );
+
+    // The three-valued rule that a select-list `NOT IN` shares with the predicate one: a
+    // NULL among the candidates makes every non-matching row NULL rather than true.
+    let nulls = create_table(
+        &client,
+        "expr_sqex_n",
+        &format!("(id INTEGER NOT NULL, k INTEGER) {CREATE_OPTS}"),
+    )
+    .await;
+    execute(
+        &client,
+        &format!("INSERT INTO {nulls} (id, k) VALUES (1, 1), (2, NULL)"),
+    )
+    .await
+    .unwrap();
+    let rows = simple_query_rows(
+        &client,
+        &format!("SELECT o.id, o.id NOT IN (SELECT k FROM {nulls}) FROM {orders} o ORDER BY o.id"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        rows.iter().map(|r| r[1].as_deref()).collect::<Vec<_>>(),
+        vec![Some("f"), None, None, None],
+        "1 is present so it is false; the rest are unknown because a candidate is NULL"
+    );
+
+    // Ordering by the membership test is still refused, because a correlated scalar subquery
+    // outside a projection is rejected outright — and the refusal names the select-list alias
+    // that reaches the same result.
+    let err = assert_sqlstate(
+        &client,
+        &format!(
+            "SELECT o.id FROM {orders} o \
+             ORDER BY EXISTS (SELECT 1 FROM {lines} l WHERE l.oid = o.id)"
+        ),
+        SQLSTATE_FEATURE_NOT_SUPPORTED,
+    )
+    .await;
+    assert!(
+        err.message().to_uppercase().contains("EXISTS"),
+        "the refusal names the form: {}",
+        err.message()
+    );
+
+    // And the workaround it names answers.
+    let rows = simple_query_rows(
+        &client,
+        &format!(
+            "SELECT o.id FROM (SELECT o.id AS id, \
+             EXISTS (SELECT 1 FROM {lines} l WHERE l.oid = o.id) AS has \
+             FROM {orders} o) o ORDER BY o.has, o.id"
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows[0][0].as_deref(), Some("4"));
+
+    // The predicate position, which DataFusion's own decorrelation has always handled, must
+    // be untouched by all of this.
+    let rows = simple_query_rows(
+        &client,
+        &format!(
+            "SELECT o.id FROM {orders} o \
+             WHERE EXISTS (SELECT 1 FROM {lines} l WHERE l.oid = o.id) ORDER BY o.id"
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        rows.iter().map(|r| r[0].as_deref()).collect::<Vec<_>>(),
+        vec![Some("1"), Some("2"), Some("3")]
+    );
+
+    drop_table(&client, &nulls).await;
     drop_table(&client, &orders).await;
     drop_table(&client, &lines).await;
 }
@@ -912,23 +1152,74 @@ async fn setup_window_table(client: &Client, prefix: &str) -> String {
     tbl
 }
 
-// REFUSAL ×3. Three clauses PostgreSQL implements, DataFusion's parser accepts, and
-// DataFusion's planner then discards — each of which turns a precise question into a
-// plausible wrong answer with nothing to mark it. Each refusal is scoped to exactly the
-// form that loses the clause, which is why the working neighbours are asserted in the
-// same test: refusing the keyword instead of the form would have cost three queries
-// that answer correctly today.
+// The window clause surface: the three clauses PostgreSQL implements, DataFusion's parser
+// accepts, and DataFusion's planner then discards. Two of the three are answered here
+// rather than refused, because the client's statement is an abbreviation of one the planner
+// does read — the named-window inheritance is written out before planning
+// (`pg_named_windows`) and a windowed `FILTER` is folded into the aggregate's argument. What
+// stays refused is what has no PostgreSQL meaning to match, and PostgreSQL's own refusals
+// are returned with PostgreSQL's class.
 #[tokio::test]
-async fn test_window_clauses_datafusion_discards_are_refused() {
+async fn test_the_window_clause_surface_answers_what_postgresql_answers() {
     let client = ready_client().await;
     let tbl = setup_window_table(&client, "expr_wdw").await;
 
-    // FILTER on a *windowed* aggregate: the filter does not cross into the window
-    // expression, so every row of the window would be counted as though the client had
-    // never written the condition.
+    // FILTER on a *windowed* aggregate. The filter does not cross into the window
+    // expression, so it moves into the argument instead: 30 and 40 and 50 pass, 10 and the
+    // two NULLs do not, and `count` counts per partition and running order.
+    let rows = simple_query_rows(
+        &client,
+        &format!(
+            "SELECT count(*) FILTER (WHERE n > 20) OVER (PARTITION BY g ORDER BY id)              FROM {tbl} ORDER BY g, id"
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        rows.iter().map(|r| r[0].as_deref()).collect::<Vec<_>>(),
+        vec![
+            Some("0"),
+            Some("0"),
+            Some("1"),
+            Some("1"),
+            Some("2"),
+            Some("2")
+        ],
+        "the FILTER applies inside the window, not to the whole partition"
+    );
+
+    // And on `sum`, where an excluded row is NULL rather than 0 — which is what
+    // PostgreSQL answers for a partition with nothing passing the filter.
+    let rows = simple_query_rows(
+        &client,
+        &format!(
+            "SELECT sum(n) FILTER (WHERE n > 20) OVER (PARTITION BY g ORDER BY id)              FROM {tbl} ORDER BY g, id"
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        rows.iter().map(|r| r[0].as_deref()).collect::<Vec<_>>(),
+        vec![None, None, Some("30"), Some("40"), Some("90"), Some("90")]
+    );
+
+    // The same FILTER without OVER is an ordinary aggregate filter, and was always
+    // correct: three rows pass.
+    assert_eq!(
+        scalar(
+            &client,
+            &format!("SELECT count(*) FILTER (WHERE n > 20) FROM {tbl}")
+        )
+        .await,
+        "3",
+        "FILTER without OVER is unaffected"
+    );
+
+    // An aggregate a NULL argument is an *input* to keeps the refusal: folding the
+    // condition in would add one null element per excluded row.
     let err = assert_sqlstate(
         &client,
-        &format!("SELECT count(*) FILTER (WHERE n > 20) OVER (PARTITION BY g) FROM {tbl}"),
+        &format!("SELECT array_agg(n) FILTER (WHERE n > 20) OVER (PARTITION BY g) FROM {tbl}"),
         SQLSTATE_FEATURE_NOT_SUPPORTED,
     )
     .await;
@@ -938,55 +1229,114 @@ async fn test_window_clauses_datafusion_discards_are_refused() {
         err.message()
     );
 
-    // The same FILTER without OVER is an ordinary aggregate filter, and correct: 30 and
-    // 40 and 50 pass, 10 and the two NULLs do not.
-    assert_eq!(
-        scalar(
+    // A window specification that only *names* another window inherits all of it: group 1
+    // runs 10, 10, 40 and group 2 runs 40, 90, 90. Widening to the whole table would have
+    // answered 130 in every row.
+    for sql in [
+        format!(
+            "SELECT sum(n) OVER (w) FROM {tbl} \
+             WINDOW w AS (PARTITION BY g ORDER BY id) ORDER BY g, id"
+        ),
+        format!(
+            "SELECT sum(n) OVER (w ORDER BY id) FROM {tbl} \
+             WINDOW w AS (PARTITION BY g) ORDER BY g, id"
+        ),
+        format!(
+            "SELECT sum(n) OVER w2 FROM {tbl} \
+             WINDOW w1 AS (PARTITION BY g ORDER BY id), w2 AS (w1) ORDER BY g, id"
+        ),
+        format!(
+            "SELECT sum(n) OVER w2 FROM {tbl} \
+             WINDOW w1 AS (PARTITION BY g), w2 AS (w1 ORDER BY id) ORDER BY g, id"
+        ),
+    ] {
+        let rows = simple_query_rows(&client, &sql).await.unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r[0].as_deref()).collect::<Vec<_>>(),
+            vec![
+                Some("10"),
+                Some("10"),
+                Some("40"),
+                Some("40"),
+                Some("90"),
+                Some("90")
+            ],
+            "the inherited PARTITION BY and ORDER BY both survive: {sql}"
+        );
+    }
+
+    // A frame of its own beside an inherited partition and ordering. This is the form that
+    // measured *nondeterministic* before the expansion — five runs, five answers — so it is
+    // asserted repeatedly, and the frame is written out rather than carried as a name.
+    for _ in 0..5 {
+        let rows = simple_query_rows(
             &client,
-            &format!("SELECT count(*) FILTER (WHERE n > 20) FROM {tbl}")
+            &format!(
+                "SELECT sum(n) OVER (w ROWS 1 PRECEDING) FROM {tbl} \
+                 WINDOW w AS (PARTITION BY g ORDER BY id) ORDER BY g, id"
+            ),
         )
-        .await,
-        "3",
-        "FILTER without OVER is not refused and not wrong"
-    );
+        .await
+        .unwrap();
+        assert_eq!(
+            rows.iter().map(|r| r[0].as_deref()).collect::<Vec<_>>(),
+            vec![
+                Some("10"),
+                Some("10"),
+                Some("30"),
+                Some("40"),
+                Some("90"),
+                Some("50")
+            ],
+            "the same data answers the same way every run"
+        );
+    }
 
-    // A window specification that only *names* another window: the named window's own
-    // PARTITION BY and ORDER BY are dropped, so the function would aggregate over the
-    // whole result instead of over that window.
-    for sql in [
-        format!("SELECT sum(n) OVER (w) FROM {tbl} WINDOW w AS (PARTITION BY g ORDER BY id)"),
-        format!("SELECT sum(n) OVER (w ORDER BY id) FROM {tbl} WINDOW w AS (PARTITION BY g)"),
+    // The three inheritances PostgreSQL itself refuses, with PostgreSQL's wording and
+    // PostgreSQL's class. A copy may not redefine the window's identity, and a window with
+    // a frame cannot be copied at all because the frame is relative to its own ordering.
+    for (sql, expected) in [
+        (
+            format!(
+                "SELECT sum(n) OVER (w ORDER BY n) FROM {tbl} \
+                 WINDOW w AS (PARTITION BY g ORDER BY id)"
+            ),
+            "cannot override ORDER BY clause of window \"w\"",
+        ),
+        (
+            format!(
+                "SELECT sum(n) OVER (w PARTITION BY id) FROM {tbl} \
+                 WINDOW w AS (PARTITION BY g)"
+            ),
+            "cannot override PARTITION BY clause of window \"w\"",
+        ),
+        (
+            format!(
+                "SELECT sum(n) OVER (w) FROM {tbl} \
+                 WINDOW w AS (PARTITION BY g ORDER BY id ROWS 1 PRECEDING)"
+            ),
+            "cannot copy window \"w\" because it has a frame clause",
+        ),
     ] {
-        let err = assert_sqlstate(&client, &sql, SQLSTATE_FEATURE_NOT_SUPPORTED).await;
+        let err = assert_sqlstate(&client, &sql, SQLSTATE_WINDOWING_ERROR).await;
         assert!(
-            err.message().contains('w'),
-            "the refusal names the window: {}",
+            err.message().contains(expected),
+            "expected PostgreSQL's own wording {expected:?}: {}",
             err.message()
         );
     }
 
-    // The same lost clause declared in the WINDOW list instead of the OVER: `w2 AS (w1)`
-    // drops w1's partition, so the sum covers the whole table.
-    for sql in [
-        format!(
-            "SELECT sum(n) OVER w2 FROM {tbl} \
-             WINDOW w1 AS (PARTITION BY g ORDER BY id), w2 AS (w1)"
-        ),
-        format!(
-            "SELECT sum(n) OVER w2 FROM {tbl} \
-             WINDOW w1 AS (PARTITION BY g), w2 AS (w1 ORDER BY id)"
-        ),
-    ] {
-        let err = assert_sqlstate(&client, &sql, SQLSTATE_FEATURE_NOT_SUPPORTED).await;
-        assert!(
-            err.message().contains("w1"),
-            "the refusal names the inherited window: {}",
-            err.message()
-        );
-    }
+    // A name no WINDOW clause declares, which the planner would read as no window at all.
+    let err = assert_sqlstate(
+        &client,
+        &format!("SELECT sum(n) OVER (nope) FROM {tbl} WINDOW w AS (PARTITION BY g)"),
+        SQLSTATE_UNDEFINED_OBJECT,
+    )
+    .await;
+    assert!(err.message().contains("nope"), "{}", err.message());
 
-    // Two WINDOW definitions that inherit nothing from each other lose nothing, so both
-    // are answered: the group's total beside the row's own.
+    // Two WINDOW definitions that inherit nothing from each other were always answered, so
+    // the expansion must not have changed them: the group's total beside the row's own.
     let rows = simple_query_rows(
         &client,
         &format!(
@@ -996,15 +1346,10 @@ async fn test_window_clauses_datafusion_discards_are_refused() {
     )
     .await
     .unwrap();
-    assert_eq!(
-        rows[0][0].as_deref(),
-        Some("40"),
-        "an independent WINDOW definition is not refused"
-    );
+    assert_eq!(rows[0][0].as_deref(), Some("40"));
     assert_eq!(rows[0][1].as_deref(), Some("10"));
 
-    // Referring to the window without parentheses keeps its clauses, and is the spelling
-    // the refusal above suggests. Group 1 totals 40 and group 2 totals 90.
+    // And referring to the window without parentheses, which never lost anything.
     let rows = simple_query_rows(
         &client,
         &format!(
@@ -1029,8 +1374,11 @@ async fn test_window_clauses_datafusion_discards_are_refused() {
         "OVER w without parentheses keeps the named window's PARTITION BY"
     );
 
-    // IGNORE NULLS is discarded, so a NULL the client asked to skip would be returned as
-    // the answer — the worst of the three, because the value looks like data.
+    // IGNORE NULLS stays refused, and is the one clause here with no PostgreSQL meaning to
+    // match: PostgreSQL does not implement the standard's option at all and always behaves
+    // as RESPECT NULLS, so an answer would be an answer to a question PostgreSQL declines.
+    // Discarding it silently was the worst case of the three, because the NULL it asked to
+    // skip comes back looking like data.
     let err = assert_sqlstate(
         &client,
         &format!("SELECT last_value(n) IGNORE NULLS OVER (PARTITION BY g ORDER BY id) FROM {tbl}"),
@@ -1054,6 +1402,80 @@ async fn test_window_clauses_datafusion_discards_are_refused() {
         "10",
         "RESPECT NULLS is a no-op here, so it is accepted"
     );
+
+    drop_table(&client, &tbl).await;
+}
+
+// Legal PostgreSQL: a window function written inline in the outer ORDER BY, which orders
+// the result by a ranking it does not project. Measured as `XX000` before this — and it
+// plans and answers correctly in a single process, so what it exercises is the distributed
+// path, not the planner.
+#[tokio::test]
+async fn test_a_window_function_in_the_outer_order_by_is_answered() {
+    let client = ready_client().await;
+    let tbl = setup_window_table(&client, "expr_wdw_ord").await;
+
+    // Descending by n with the NULLs last, so the ranking the sort uses is the reverse of
+    // the ids: 5, 4, 3, 1, then the two NULLs in id order. The `id` key inside the window is
+    // not decoration — two rows have a null `n`, and without it their two ranks are peers
+    // and the order between them is whichever the plan happens to produce.
+    let rows = simple_query_rows(
+        &client,
+        &format!(
+            "SELECT id, n FROM {tbl} \
+             ORDER BY row_number() OVER (ORDER BY n DESC NULLS LAST, id)"
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        rows.iter().map(|r| r[0].as_deref()).collect::<Vec<_>>(),
+        vec![
+            Some("5"),
+            Some("4"),
+            Some("3"),
+            Some("1"),
+            Some("2"),
+            Some("6")
+        ],
+        "the ordering is by the window function, not by the projection"
+    );
+
+    // A window function in the projection *and* a different one in the ORDER BY, so the two
+    // windows have to coexist in one plan.
+    let rows = simple_query_rows(
+        &client,
+        &format!(
+            "SELECT id, sum(n) OVER (PARTITION BY g ORDER BY id) FROM {tbl} \
+             ORDER BY rank() OVER (ORDER BY g DESC), id"
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|r| (r[0].as_deref(), r[1].as_deref()))
+            .collect::<Vec<_>>(),
+        vec![
+            (Some("4"), Some("40")),
+            (Some("5"), Some("90")),
+            (Some("6"), Some("90")),
+            (Some("1"), Some("10")),
+            (Some("2"), Some("10")),
+            (Some("3"), Some("40")),
+        ],
+        "group 2 first, because the ORDER BY ranks g descending"
+    );
+
+    // Ordering by the output alias is the workaround the refusal used to name, so it has to
+    // keep working.
+    let rows = simple_query_rows(
+        &client,
+        &format!("SELECT id, row_number() OVER (ORDER BY id DESC) AS r FROM {tbl} ORDER BY r"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows[0][0].as_deref(), Some("6"));
 
     drop_table(&client, &tbl).await;
 }
@@ -1111,13 +1533,179 @@ async fn test_a_function_column_is_labelled_the_way_postgres_labels_it() {
         vec!["sum", "count"]
     );
 
-    // PostgreSQL would return two columns both called `sum` here; DataFusion refuses a
-    // projection with two fields of one name outright, so the label is left off rather
-    // than turning a working query into a planning error. Verbose, and answering.
-    let labels =
-        describe_result_labels(&client, &format!("SELECT sum(n), sum(g) FROM {tbl}")).await;
-    assert_eq!(labels.len(), 2);
-    assert_ne!(labels[0], labels[1], "the two labels stay distinct");
+    // PostgreSQL returns two columns both called `sum` here, and a DataFusion projection
+    // cannot hold two fields of one name — so the repeat is numbered inside the plan with a
+    // NUL suffix no client-supplied identifier can contain, and collapsed at the wire.
+    assert_eq!(
+        describe_result_labels(&client, &format!("SELECT sum(n), sum(g) FROM {tbl}")).await,
+        vec!["sum", "sum"]
+    );
+    // Three of them, and one beside a column the client aliased as the same name.
+    assert_eq!(
+        describe_result_labels(
+            &client,
+            &format!("SELECT sum(n), sum(g), sum(n + g) FROM {tbl}")
+        )
+        .await,
+        vec!["sum", "sum", "sum"]
+    );
+    assert_eq!(
+        describe_result_labels(&client, &format!("SELECT sum(n) AS sum, sum(g) FROM {tbl}")).await,
+        vec!["sum", "sum"],
+        "the client's own alias occupies its slot as itself"
+    );
+
+    // A label is a name, not an answer: the values come back in order under the repeated
+    // name, so a client reading positionally is unaffected by the collapse.
+    let rows = simple_query_rows(&client, &format!("SELECT sum(n), sum(g) FROM {tbl}"))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].len(), 2);
+    assert_ne!(rows[0][0], rows[0][1], "two columns, two answers");
+
+    drop_table(&client, &tbl).await;
+}
+
+// PostgreSQL has no name for an expression that is not a call, a column or a cast: it
+// calls the column `?column?` and will happily return several of them under that one
+// name. DataFusion named such a column after the expression as it renders internally
+// (`n + Int64(1)`, and after a rewrite something far longer), which is a name no
+// PostgreSQL client would ever see. It also refuses a projection holding two fields of
+// one name, so the label is numbered inside the plan and the numbering is dropped at the
+// wire — a client is told `?column?` as often as PostgreSQL would say it.
+#[tokio::test]
+async fn test_a_nameless_expression_is_labelled_the_way_postgres_labels_it() {
+    let client = ready_client().await;
+    let tbl = setup_window_table(&client, "expr_anon").await;
+
+    for projection in [
+        "n + 1",
+        "-n",
+        "n > 1",
+        "n IS NULL",
+        "n BETWEEN 1 AND 2",
+        "n IN (1, 2)",
+    ] {
+        let sql = format!("SELECT {projection} FROM {tbl}");
+        assert_eq!(
+            describe_result_labels(&client, &sql).await,
+            vec!["?column?".to_string()],
+            "`{sql}`"
+        );
+    }
+
+    // Several of them, all under the one name: the numbering the plan needs is not a
+    // client's business.
+    assert_eq!(
+        describe_result_labels(&client, &format!("SELECT n + 1, g * 2, 3 FROM {tbl}")).await,
+        vec!["?column?", "?column?", "?column?"]
+    );
+    // Beside named columns, so the numbering is seen to count only its own kind.
+    assert_eq!(
+        describe_result_labels(
+            &client,
+            &format!("SELECT n + 1, id, sum(n) OVER () FROM {tbl}")
+        )
+        .await,
+        vec!["?column?", "id", "sum"]
+    );
+    // And an alias the client wrote is never replaced by one.
+    assert_eq!(
+        describe_result_labels(&client, &format!("SELECT n + 1 AS bumped FROM {tbl}")).await,
+        vec!["bumped"]
+    );
+
+    // A label is a name, not an answer: the values still come back, in order, under the
+    // repeated name.
+    let rows = simple_query_rows(
+        &client,
+        &format!("SELECT n + 1, g * 2 FROM {tbl} WHERE id = 1"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        rows,
+        vec![vec![Some("11".to_string()), Some("2".to_string())]]
+    );
+
+    // The fallbacks PostgreSQL uses before giving up on a name: a cast falls back to the
+    // type's own internal name, a CASE to `case`, a constructor to what it constructs.
+    for (projection, want) in [
+        ("'1'::int", "int4"),
+        ("'1'::bigint", "int8"),
+        ("'x'::text", "text"),
+        // Unqualified, because a cast that *asks* for a length is refused rather than
+        // silently widened. See `test_cast_length_is_refused_rather_than_discarded`.
+        ("'x'::varchar", "varchar"),
+        ("'1.5'::numeric", "numeric"),
+        ("'2020-01-01'::date", "date"),
+        ("CAST('1' AS DOUBLE PRECISION)", "float8"),
+        ("CASE WHEN true THEN 1 ELSE 2 END", "case"),
+        ("ARRAY[1, 2]", "array"),
+        ("EXTRACT(YEAR FROM '2020-01-01'::date)", "extract"),
+        ("TRIM(' x ')", "btrim"),
+        ("SUBSTRING('abc' FROM 2 FOR 1)", "substring"),
+    ] {
+        let sql = format!("SELECT {projection}");
+        assert_eq!(
+            describe_result_labels(&client, &sql).await,
+            vec![want.to_string()],
+            "`{sql}`"
+        );
+    }
+
+    // A column cast keeps the column's name, which is stronger than the type's: this is
+    // the one place the two fallbacks are ordered.
+    assert_eq!(
+        describe_result_labels(&client, &format!("SELECT n::bigint FROM {tbl}")).await,
+        vec!["n"]
+    );
+
+    // RESIDUE. PostgreSQL says `int4` here, for the same reason it says `date` above: the
+    // cast's argument is a string with no name, so the target type names the column. It
+    // says `array` only when the argument is a constructor — `ARRAY[1,2]::int[]`. VaireDB
+    // says `array` for both, because upstream's `FixArrayLiteral` rule has already turned
+    // the string into a constructor by the time any of the read path sees the statement,
+    // and after that rewrite the two spellings are one AST. Pinned rather than fixed: the
+    // label is still a name PostgreSQL uses for an array-valued column, and unpicking it
+    // would mean labelling a second, unrewritten parse of every statement.
+    assert_eq!(
+        describe_result_labels(&client, "SELECT '{1,2}'::int[]").await,
+        vec!["array"],
+        "`array`, not `int4`: see FixArrayLiteral"
+    );
+
+    drop_table(&client, &tbl).await;
+}
+
+// A `HEADER` names the result columns, so it is the second place a label reaches a
+// client, and it has to agree with what a RowDescription would have said — including
+// repeating `?column?`, which is the very thing the plan is not allowed to do.
+#[tokio::test]
+async fn test_a_copy_header_names_columns_the_way_a_row_description_does() {
+    use futures::TryStreamExt;
+
+    let client = ready_client().await;
+    let tbl = setup_window_table(&client, "expr_anon_copy").await;
+
+    let stream = client
+        .copy_out(&format!(
+            "COPY (SELECT n + 1, g * 2, id FROM {tbl} WHERE id = 1) \
+             TO STDOUT (FORMAT CSV, HEADER)"
+        ))
+        .await
+        .expect("the copy must open");
+    let chunks: Vec<bytes::Bytes> = stream.try_collect().await.expect("the copy must complete");
+    let csv = String::from_utf8(chunks.concat()).expect("CSV is text");
+
+    let mut lines = csv.lines();
+    assert_eq!(
+        lines.next(),
+        Some("?column?,?column?,id"),
+        "the header must name the columns as a RowDescription would: {csv:?}"
+    );
+    assert_eq!(lines.next(), Some("11,2,1"), "{csv:?}");
 
     drop_table(&client, &tbl).await;
 }
@@ -1254,13 +1842,14 @@ async fn test_avg_of_an_integer_is_exact_numeric() {
         vec![Type::NUMERIC],
         "avg(integer) is numeric, unlike sum(integer)"
     );
-    // Non-terminating: PostgreSQL answers 1.6666666666666667. Ten decimal places is the
-    // accumulator's scale, and the narrowing recorded in the gap analysis — what is
-    // asserted here is that the digits present are right.
-    let text = scalar(&client, &small).await;
-    assert!(
-        text.starts_with("1.6666666666"),
-        "ten correct decimal places: got {text}"
+    // Non-terminating, which is where the number itself is visible and not only the type:
+    // PostgreSQL answers 1.6666666666666667 and so does this, digit for digit. Sixteen
+    // places is the exact average's scale, and `NUMERIC_MIN_SIG_DIGITS` is why it is
+    // sixteen.
+    assert_eq!(
+        scalar(&client, &small).await,
+        "1.6666666666666667",
+        "PostgreSQL's own sixteen decimal places"
     );
 
     // The window spelling reports what the grouped one reports, or a client gets two
@@ -2270,12 +2859,26 @@ async fn test_a_pg_catalog_function_over_a_column_survives_distribution() {
         "\"a b\""
     );
 
-    // The residue, pinned so the gap analysis's claim stays honest: what closed is the
-    // serialization of the plan `\gdesc` builds, not `format_type`'s argument coercion. The
-    // signature is `OneOf(Exact(Int32, Int32), … Exact(Int64, Int64))` with no `(Utf8, …)`
-    // arm, so an untyped literal OID is refused where PostgreSQL coerces it to `oid`.
-    // See `gap-analysis.md` § 4 items 18 and 23.
-    assert_unsupported(&client, "SELECT format_type('23', 0)").await;
+    // An untyped literal OID, which PostgreSQL coerces to `oid`. Upstream's signature is
+    // `OneOf(Exact(Int32, Int32), … Exact(Int64, Int64))` with no `(Utf8, …)` arm, so this
+    // used to be refused; VaireDB widens the signature and reads the spelling the way
+    // PostgreSQL's `oidin` does. See `gap-analysis.md` § 4 items 18 and 23.
+    assert_eq!(
+        scalar(&client, "SELECT format_type('23', 0)").await,
+        "integer"
+    );
+    // Both arguments as strings, with a modifier that is read rather than ignored.
+    assert_eq!(
+        scalar(&client, "SELECT format_type('1043', '14')").await,
+        "character varying(10)"
+    );
+    // And a spelling that is not an OID is PostgreSQL's own `22P02`, not a cast failure.
+    assert_sqlstate(
+        &client,
+        "SELECT format_type('notanoid', NULL)",
+        SQLSTATE_INVALID_TEXT_REPRESENTATION,
+    )
+    .await;
 
     drop_table(&client, &tbl).await;
 }
@@ -2359,9 +2962,12 @@ async fn test_a_non_decimal_integer_literal_is_the_number_it_spells() {
         scalar_number(&client, &format!("SELECT n FROM {tbl} WHERE id = 1")).await,
         31.0
     );
-    execute(&client, &format!("UPDATE {tbl} SET n = 0o17 WHERE id = 0x1"))
-        .await
-        .unwrap();
+    execute(
+        &client,
+        &format!("UPDATE {tbl} SET n = 0o17 WHERE id = 0x1"),
+    )
+    .await
+    .unwrap();
     assert_eq!(
         scalar_number(&client, &format!("SELECT n FROM {tbl} WHERE id = 1")).await,
         15.0
@@ -2409,14 +3015,14 @@ async fn test_an_out_of_range_subscript_is_null_and_an_empty_slice() {
     let tbl = create_table(
         &client,
         "expr_subscript",
-        &format!(
-            "(id INTEGER NOT NULL, tags INTEGER[], v INTEGER, part INTEGER[]) {CREATE_OPTS}"
-        ),
+        &format!("(id INTEGER NOT NULL, tags INTEGER[], v INTEGER, part INTEGER[]) {CREATE_OPTS}"),
     )
     .await;
     execute(
         &client,
-        &format!("INSERT INTO {tbl} (id, tags) VALUES (1, ARRAY[10, 20, 30]), (2, ARRAY[10, 20, 30])"),
+        &format!(
+            "INSERT INTO {tbl} (id, tags) VALUES (1, ARRAY[10, 20, 30]), (2, ARRAY[10, 20, 30])"
+        ),
     )
     .await
     .unwrap();
@@ -2498,9 +3104,12 @@ async fn test_an_out_of_range_subscript_is_null_and_an_empty_slice() {
         Some("{20,30}".to_string())
     );
     assert_eq!(
-        execute(&client, &format!("DELETE FROM {tbl} WHERE tags[-1] IS NULL"))
-            .await
-            .unwrap(),
+        execute(
+            &client,
+            &format!("DELETE FROM {tbl} WHERE tags[-1] IS NULL")
+        )
+        .await
+        .unwrap(),
         2,
         "every row's tags[-1] is NULL, so the DELETE removes both"
     );
@@ -2549,7 +3158,10 @@ async fn test_a_bytea_literal_is_decoded_the_way_postgres_decodes_it() {
         let got: Vec<u8> = rows[0].get(0);
         assert_eq!(got, want, "`{sql}`");
         // And it is a `bytea` to a driver, not a string that happens to hold hex.
-        assert_eq!(describe_result_types(&client, &sql).await, vec![Type::BYTEA]);
+        assert_eq!(
+            describe_result_types(&client, &sql).await,
+            vec![Type::BYTEA]
+        );
     }
 
     // `CAST(… AS BYTEA)` is the same cast written the other way.
@@ -2970,6 +3582,2003 @@ async fn test_a_zero_nth_value_offset_raises_rather_than_answering_null() {
     assert_eq!(
         (rows[0][0].as_deref(), rows[0][1].as_deref()),
         (Some("1"), Some("3"))
+    );
+
+    drop_table(&client, &tbl).await;
+}
+
+// REFUSAL, DISTRIBUTED. § 1.3's boundary, and the class every refusal raised on the far
+// side of it used to lose. A nested aggregate and a misplaced window function are both
+// caught by DataFusion's *physical* planner — which runs on the Ballista scheduler, not
+// here — and Ballista's `FailedTask` has nowhere to put an error but a `String`, so what
+// came back was `XX000 internal_error`: the one class that tells a driver the server broke
+// and the statement is worth retrying. None of these will ever succeed on a retry.
+//
+// PostgreSQL raises `42803` for an aggregate in a position aggregates are not evaluated
+// and `42P20` for a window function in one, at parse time. Both are now recovered from the
+// rendered text, so a client's error handling reads the same code whichever side noticed.
+#[tokio::test]
+async fn test_a_misplaced_aggregate_or_window_is_a_grouping_error_not_an_internal_one() {
+    let client = ready_client().await;
+    let tbl = setup_window_table(&client, "expr_misplaced").await;
+
+    // The § 2.3 row: an aggregate inside another aggregate.
+    for sql in [
+        format!("SELECT max(sum(n)) FROM {tbl}"),
+        format!("SELECT sum(max(n)) FROM {tbl} GROUP BY g"),
+    ] {
+        let err = assert_sqlstate(&client, &sql, SQLSTATE_GROUPING_ERROR).await;
+        assert!(
+            err.message().contains("aggregate"),
+            "the refusal names what is misplaced: {}",
+            err.message()
+        );
+    }
+
+    // The § 2.4 row: a window function in each of the four positions PostgreSQL refuses it
+    // in — `WHERE`, `GROUP BY`, `HAVING`, and nested inside another window function.
+    for sql in [
+        format!("SELECT * FROM {tbl} WHERE row_number() OVER () > 1"),
+        format!("SELECT g, sum(n) FROM {tbl} GROUP BY g, row_number() OVER ()"),
+        format!("SELECT g FROM {tbl} GROUP BY g HAVING row_number() OVER () > 0"),
+        format!("SELECT rank() OVER (ORDER BY row_number() OVER ()) FROM {tbl}"),
+    ] {
+        let err = assert_sqlstate(&client, &sql, SQLSTATE_WINDOWING_ERROR).await;
+        assert!(
+            err.message().contains("window"),
+            "the refusal names what is misplaced: {}",
+            err.message()
+        );
+    }
+
+    // Nothing about DataFusion's internal planner reaches the client with it. The message
+    // used to be the `Expr` debug dump the physical planner refused, job id and all.
+    let err = assert_sqlstate(
+        &client,
+        &format!("SELECT max(sum(n)) FROM {tbl}"),
+        SQLSTATE_GROUPING_ERROR,
+    )
+    .await;
+    for leaked in [
+        "Physical plan",
+        "AggregateUDF",
+        "Signature",
+        "Job ",
+        "stage",
+        "DataFusionError",
+    ] {
+        assert!(
+            !err.message().contains(leaked),
+            "`{leaked}` survived into the message: {}",
+            err.message()
+        );
+    }
+
+    // The over-reach probe, and the reason the recovery keys on the physical planner's own
+    // refusal rather than on the words "aggregate" or "window": every legal placement still
+    // answers exactly what it answered before.
+    for (sql, want) in [
+        // An aggregate in `HAVING`, which is the position `WHERE` is refused in favour of.
+        (
+            format!("SELECT sum(n) FROM {tbl} GROUP BY g HAVING count(*) > 2 ORDER BY 1"),
+            vec![Some("40".to_string()), Some("90".to_string())],
+        ),
+        // A window over an aggregate — legal PostgreSQL, and the window runs after the
+        // grouping rather than inside it.
+        (
+            format!("SELECT row_number() OVER (ORDER BY sum(n)) FROM {tbl} GROUP BY g"),
+            vec![Some("1".to_string()), Some("2".to_string())],
+        ),
+        // A plain window aggregate, which is neither nested nor misplaced.
+        (
+            format!("SELECT DISTINCT sum(n) OVER (PARTITION BY g) FROM {tbl} ORDER BY 1"),
+            vec![Some("40".to_string()), Some("90".to_string())],
+        ),
+    ] {
+        let rows = simple_query_rows(&client, &sql)
+            .await
+            .unwrap_or_else(|e| panic!("`{sql}` is legal and must be answered: {e}"));
+        assert_eq!(
+            rows.iter().map(|r| r[0].clone()).collect::<Vec<_>>(),
+            want,
+            "`{sql}`"
+        );
+    }
+
+    drop_table(&client, &tbl).await;
+}
+
+// DISTRIBUTED. The § 2.3 row where the *pair* disagreed. PostgreSQL has an
+// array-of-fractions overload on both percentiles; VaireDB had it on neither, and refused it
+// in two different classes — `percentile_cont` at signature resolution on the coordinator
+// with `0A000`, and `percentile_disc` inside its own fraction check on an executor with
+// `XX000`. Same missing feature, same statement shape, two codes.
+//
+// It is now implemented on both, so what this asserts is the answer: one array per group,
+// with the fractions in the order the client wrote them, interpolated for `cont` and an
+// input value for `disc`. The class agreement is still tested, on the fraction range check
+// that remains a refusal — the guard that decides it runs where the aggregate runs, so it
+// cannot be moved to the coordinator, and it tags its message with the code instead.
+#[tokio::test]
+async fn test_both_percentiles_answer_an_array_of_fractions() {
+    let client = ready_client().await;
+    let tbl = setup_percentile_table(&client, "expr_pctl_array").await;
+
+    // Over 1..10: `cont` interpolates — 0.25 falls between 3 and 4 at 3.25, 0.5 between 5
+    // and 6 at 5.5, 0.9 between 9 and 10 at 9.1 — and `disc` returns the input value at or
+    // past each fraction.
+    assert_eq!(
+        scalar(
+            &client,
+            &format!(
+                "SELECT percentile_cont(ARRAY[0.25, 0.5, 0.9]) WITHIN GROUP (ORDER BY n) \
+                 FROM {tbl}"
+            )
+        )
+        .await,
+        "{3.25,5.5,9.1}",
+        "the array is answered element by element, in the order written"
+    );
+    assert_eq!(
+        scalar(
+            &client,
+            &format!(
+                "SELECT percentile_disc(ARRAY[0.25, 0.5, 0.9]) WITHIN GROUP (ORDER BY n) \
+                 FROM {tbl}"
+            )
+        )
+        .await,
+        // Not the 0.9th of the range but the first value whose position over the count
+        // reaches 0.9, which over 1..10 is the ninth.
+        "{3,5,9}"
+    );
+
+    // A fraction outside 0..1 inside the array is still the argument error it is outside
+    // one, raised on the executor that holds the group and reaching the client in the class
+    // the coordinator's own check uses.
+    let err = assert_sqlstate(
+        &client,
+        &format!("SELECT percentile_cont(ARRAY[0.5, 1.5]) WITHIN GROUP (ORDER BY n) FROM {tbl}"),
+        SQLSTATE_INVALID_PARAMETER_VALUE,
+    )
+    .await;
+    assert!(
+        err.message().contains("1.5"),
+        "the refusal names the fraction: {}",
+        err.message()
+    );
+    // The transport tag is an implementation detail of the boundary and must not reach the
+    // client: exactly one `[VDB-…]` code in the message, and nothing of the scheduler.
+    assert_eq!(
+        err.message().matches("[VDB-").count(),
+        1,
+        "one code, not a second one from the executor: {}",
+        err.message()
+    );
+    for leaked in ["Job ", "stage", "DataFusionError"] {
+        assert!(
+            !err.message().contains(leaked),
+            "`{leaked}` survived into the message: {}",
+            err.message()
+        );
+    }
+
+    // The over-reach probe. A single fraction still answers as a scalar rather than as a
+    // one-element array, and one outside 0..1 still reports the argument error.
+    for function in ["percentile_cont", "percentile_disc"] {
+        assert_eq!(
+            scalar(
+                &client,
+                &format!("SELECT {function}(0.5) WITHIN GROUP (ORDER BY n) FROM {tbl}")
+            )
+            .await,
+            if function == "percentile_cont" {
+                "5.5"
+            } else {
+                "5"
+            },
+            "{function}(0.5) over 1..10"
+        );
+        assert_sqlstate(
+            &client,
+            &format!("SELECT {function}(1.5) WITHIN GROUP (ORDER BY n) FROM {tbl}"),
+            SQLSTATE_INVALID_PARAMETER_VALUE,
+        )
+        .await;
+    }
+
+    drop_table(&client, &tbl).await;
+}
+
+// DISTRIBUTED. The rest of PostgreSQL's `WITHIN GROUP` family, § 2.3: `mode()` and the four
+// hypothetical-set aggregates. DataFusion has none of them as an aggregate at all — every
+// one was `Invalid function` — so each is a UDAF, registered on the coordinator and on every
+// executor because the name is all that crosses the wire.
+//
+// `mode()` returns the most frequent input, and the four hypothetical-set functions answer
+// where a value *would* rank if it were inserted into the group: over 1..10 with 5 as the
+// hypothetical row, `rank` counts the four values sorting ahead of it and answers 5,
+// `dense_rank` counts distinct ones and answers the same, `percent_rank` is 4/10 and
+// `cume_dist` is (4 + 1 peer + 1)/11.
+#[tokio::test]
+async fn test_the_within_group_family_answers() {
+    let client = ready_client().await;
+    let tbl = setup_percentile_table(&client, "expr_wg").await;
+
+    for (sql, want) in [
+        // Each value in 1..10 occurs once, so the most frequent is decided by the clause's
+        // own sort order — ascending gives 1 and descending gives 10.
+        (
+            format!("SELECT mode() WITHIN GROUP (ORDER BY n) FROM {tbl}"),
+            "1",
+        ),
+        (
+            format!("SELECT mode() WITHIN GROUP (ORDER BY n DESC) FROM {tbl}"),
+            "10",
+        ),
+        // A value that actually repeats wins regardless of order.
+        (
+            format!("SELECT mode() WITHIN GROUP (ORDER BY n % 3) FROM {tbl}"),
+            "1",
+        ),
+        (
+            format!("SELECT rank(5) WITHIN GROUP (ORDER BY n) FROM {tbl}"),
+            "5",
+        ),
+        (
+            format!("SELECT dense_rank(5) WITHIN GROUP (ORDER BY n) FROM {tbl}"),
+            "5",
+        ),
+        (
+            format!("SELECT percent_rank(5) WITHIN GROUP (ORDER BY n) FROM {tbl}"),
+            "0.4",
+        ),
+        (
+            format!("SELECT cume_dist(5) WITHIN GROUP (ORDER BY n) FROM {tbl}"),
+            "0.5454545454545454",
+        ),
+        // A value not in the group at all, and a descending clause: 5.5 has five values
+        // ahead of it descending (10, 9, 8, 7, 6), so it ranks sixth.
+        (
+            format!("SELECT rank(5.5) WITHIN GROUP (ORDER BY n DESC) FROM {tbl}"),
+            "6",
+        ),
+        // Past the end of the group, where `rank` is one more than the row count.
+        (
+            format!("SELECT rank(99) WITHIN GROUP (ORDER BY n) FROM {tbl}"),
+            "11",
+        ),
+    ] {
+        assert_eq!(scalar(&client, &sql).await, want, "`{sql}`");
+    }
+
+    // Grouped, so each group's answer is merged from partial aggregates on the shards that
+    // hold it. Odd values are 1, 3, 5, 7, 9 and even ones 2, 4, 6, 8, 10, so 5 ranks third
+    // among the odd values and third among the even ones too.
+    let rows = simple_query_rows(
+        &client,
+        &format!(
+            "SELECT n % 2 AS parity, mode() WITHIN GROUP (ORDER BY n), \
+             rank(5) WITHIN GROUP (ORDER BY n) FROM {tbl} GROUP BY n % 2 ORDER BY 1"
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|r| (r[0].as_deref(), r[1].as_deref(), r[2].as_deref()))
+            .collect::<Vec<_>>(),
+        vec![
+            (Some("0"), Some("2"), Some("3")),
+            (Some("1"), Some("1"), Some("3")),
+        ]
+    );
+
+    // The over-reach probe, and the reason four of the five are registered under an internal
+    // name: `rank`, `dense_rank`, `percent_rank` and `cume_dist` are also *window* functions,
+    // and datafusion-sql resolves a window call against the aggregate registry first. An
+    // aggregate under PostgreSQL's own name would have hijacked every one of these.
+    let rows = simple_query_rows(
+        &client,
+        &format!(
+            "SELECT rank() OVER (ORDER BY n), dense_rank() OVER (ORDER BY n), \
+             percent_rank() OVER (ORDER BY n), cume_dist() OVER (ORDER BY n) \
+             FROM {tbl} ORDER BY n LIMIT 2"
+        ),
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        rows.iter()
+            .map(|r| (
+                r[0].as_deref(),
+                r[1].as_deref(),
+                r[2].as_deref(),
+                r[3].as_deref()
+            ))
+            .collect::<Vec<_>>(),
+        vec![
+            (Some("1"), Some("1"), Some("0"), Some("0.1")),
+            (
+                Some("2"),
+                Some("2"),
+                Some("0.1111111111111111"),
+                Some("0.2")
+            ),
+        ],
+        "the window functions of those names are still the window functions"
+    );
+
+    // The label a client reads columns by is its own spelling, not the internal name the
+    // aggregate is planned as.
+    assert_eq!(
+        describe_result_labels(
+            &client,
+            &format!(
+                "SELECT mode() WITHIN GROUP (ORDER BY n), rank(5) WITHIN GROUP (ORDER BY n) \
+                 FROM {tbl}"
+            )
+        )
+        .await,
+        vec!["mode", "rank"]
+    );
+
+    // A `WITHIN GROUP` clause is what makes these aggregates, so leaving it off is refused
+    // rather than answered over an unordered group — and in PostgreSQL's own class and
+    // wording, because the planner's version of this message advertises an internal arity
+    // (`mode(Any)`) that PostgreSQL's `mode` does not have.
+    let err = assert_sqlstate(
+        &client,
+        &format!("SELECT mode() FROM {tbl}"),
+        SQLSTATE_WRONG_OBJECT_TYPE,
+    )
+    .await;
+    assert!(
+        err.message().to_uppercase().contains("WITHIN GROUP"),
+        "the refusal names the clause: {}",
+        err.message()
+    );
+
+    // The hypothetical value is evaluated once for the whole group, so it has to be a
+    // constant — a column there is refused rather than silently read from one row.
+    assert_sqlstate(
+        &client,
+        &format!("SELECT rank(n) WITHIN GROUP (ORDER BY n) FROM {tbl}"),
+        SQLSTATE_FEATURE_NOT_SUPPORTED,
+    )
+    .await;
+
+    drop_table(&client, &tbl).await;
+}
+
+// REFUSAL, DISTRIBUTED. A failure raised on an *executor* keeps a class that says something
+// about the statement, rather than the `XX000` every one of them used to land — because the
+// variant DataFusion raised it as survives in the text the scheduler renders.
+//
+// The narrow case that used to open this test was `count(DISTINCT a, b)`, described here as a
+// form "PostgreSQL implements" — which was wrong: PostgreSQL has no multi-argument `count`
+// and refuses the call as `42883`. VaireDB now refuses it on the coordinator for the same
+// reason, so it never reaches an executor and is pinned with the rest of § 2.3 further down.
+// What is left here is the property itself, over the two classes that bracket it: a *data*
+// error raised on an executor and a *name* error raised on the coordinator.
+#[tokio::test]
+async fn test_a_failure_raised_on_an_executor_keeps_its_own_class() {
+    let client = ready_client().await;
+    let tbl = setup_window_table(&client, "expr_transported").await;
+
+    // A division by zero, raised where the projection runs and recovered out of the text the
+    // scheduler renders: still the data error it was, and never a feature refusal. Its message
+    // is PostgreSQL's wording rather than Arrow's Rust variant name, which is the only thing a
+    // payload-less `ArrowError` leaves behind.
+    let err = assert_sqlstate(
+        &client,
+        &format!("SELECT n / (n - n) FROM {tbl}"),
+        SQLSTATE_DIVISION_BY_ZERO,
+    )
+    .await;
+    assert!(
+        err.message().ends_with("division by zero"),
+        "PostgreSQL's wording, not Arrow's `DivideByZero`: {}",
+        err.message()
+    );
+    // And nothing of the trip survives into it. These three strings are the scheduler's own
+    // framing, and a client that reads one of them is reading VaireDB's internals instead of
+    // an answer about their statement.
+    for leaked in ["Job ", "stage", "DataFusionError"] {
+        assert!(
+            !err.message().contains(leaked),
+            "`{leaked}` survived into the message: {}",
+            err.message()
+        );
+    }
+
+    // And a statement that is simply wrong about a name keeps its own class: recovery only
+    // runs where classification gave up.
+    assert_sqlstate(
+        &client,
+        &format!("SELECT nope FROM {tbl}"),
+        SQLSTATE_UNDEFINED_COLUMN,
+    )
+    .await;
+
+    drop_table(&client, &tbl).await;
+}
+
+// ============================================================================
+// 17. The variance and standard deviation family answers in numeric, exactly
+// ============================================================================
+
+/// Ten rows over every shard, in the shapes this family has to keep apart: `n` counts
+/// 1..10, `d` repeats each of 1..5 twice so `DISTINCT` changes the answer, `g` splits the
+/// ten into two groups of five, `big` is `n` offset past the float mantissa, `amt` is `n`
+/// at a declared scale of 2 and `f` is `n` as a double.
+async fn setup_statistics_table(client: &Client, prefix: &str) -> String {
+    let tbl = create_table(
+        client,
+        prefix,
+        &format!(
+            "(id INTEGER NOT NULL, n INTEGER NOT NULL, d INTEGER NOT NULL, g INTEGER NOT NULL, \
+             big BIGINT NOT NULL, amt NUMERIC(12,2) NOT NULL, f DOUBLE PRECISION NOT NULL) \
+             {CREATE_OPTS}"
+        ),
+    )
+    .await;
+    // The ids are chosen per shard bucket, so a statistic is gathered from all three
+    // shards rather than answered from one.
+    let ids: Vec<i64> = (0..SHARD_COUNT as u64)
+        .flat_map(|b| ids_in_bucket(b, 4, 1))
+        .take(10)
+        .collect();
+    assert_eq!(ids.len(), 10, "the statistics fixture needs ten rows");
+    for (n, id) in (1..=10i64).zip(&ids) {
+        let d = (n + 1) / 2;
+        let g = if n <= 5 { 1 } else { 2 };
+        // 2^62 + change: ten consecutive values whose *doubles* are all the same number,
+        // because the gap between representable doubles there is 1024.
+        let big = 6148914691236517204i64 + n - 1;
+        execute(
+            client,
+            &format!(
+                "INSERT INTO {tbl} (id, n, d, g, big, amt, f) \
+                 VALUES ({id}, {n}, {d}, {g}, {big}, {n}.00, {n}.0)"
+            ),
+        )
+        .await
+        .unwrap();
+    }
+    tbl
+}
+
+/// A statistic as PostgreSQL would print it: the result carries sixteen decimal places,
+/// so `8.25` arrives as `8.2500000000000000` and the zeros the scale added are trimmed back
+/// off.
+/// `None` for the NULL an under-sized group answers.
+async fn maybe_statistic(client: &Client, sql: &str) -> Option<String> {
+    let rows = simple_query_rows(client, sql)
+        .await
+        .unwrap_or_else(|e| panic!("`{sql}` should be answerable: {e}"));
+    assert_eq!(rows.len(), 1, "`{sql}` returns one row");
+    rows[0][0].clone().map(|text| match text.split_once('.') {
+        Some((whole, frac)) => match frac.trim_end_matches('0') {
+            "" => whole.to_string(),
+            kept => format!("{whole}.{kept}"),
+        },
+        None => text,
+    })
+}
+
+/// The same, for the statistics that have a value.
+async fn statistic(client: &Client, sql: &str) -> String {
+    maybe_statistic(client, sql)
+        .await
+        .unwrap_or_else(|| panic!("`{sql}` returned NULL"))
+}
+
+// PostgreSQL answers `var_pop`, `var_samp`, `variance`, `stddev`, `stddev_pop` and
+// `stddev_samp` in `numeric` over every exact input — `smallint` through `numeric` — and
+// answers them exactly. DataFusion computes all six in `f64` behind a signature that
+// accepts nothing else, so the coordinator advertised `double precision` and lost the low
+// digits of anything past the 53-bit mantissa. VaireDB replaces the family with an
+// accumulator that keeps `n`, `Σx` and `Σx²` as wide integers, so the answer is the one
+// PostgreSQL prints, to the sixteen decimal places `avg` reports too.
+#[tokio::test]
+async fn test_the_statistics_family_is_exact_numeric() {
+    let client = ready_client().await;
+    let tbl = setup_statistics_table(&client, "expr_stats").await;
+
+    // The six spellings over 1..10, measured against PostgreSQL 17. `variance` and
+    // `stddev` are PostgreSQL's historical names for the sample forms, and the
+    // coordinator's rewrite has to land them on the same accumulator as the others.
+    for (expr, expected) in [
+        ("var_pop(n)", "8.25"),
+        ("var_samp(n)", "9.1666666666666667"),
+        ("variance(n)", "9.1666666666666667"),
+        ("stddev_pop(n)", "2.8722813232690143"),
+        ("stddev_samp(n)", "3.0276503540974917"),
+        ("stddev(n)", "3.0276503540974917"),
+    ] {
+        let sql = format!("SELECT {expr} FROM {tbl}");
+        assert_eq!(statistic(&client, &sql).await, expected, "{expr} of 1..10");
+        assert_eq!(
+            describe_result_types(&client, &sql).await,
+            vec![Type::NUMERIC],
+            "{expr} of an integer is numeric, not double precision"
+        );
+    }
+
+    // `bigint`, where the float accumulator was not merely imprecise but blind: these ten
+    // values are one apart and their doubles are all the same number, so a float variance
+    // of them is 0 and the exact one is the variance of 1..10.
+    let sql = format!("SELECT var_samp(big), stddev_samp(big) FROM {tbl}");
+    assert_eq!(
+        simple_query_rows(&client, &sql)
+            .await
+            .unwrap()
+            .swap_remove(0)
+            .into_iter()
+            .map(Option::unwrap)
+            .collect::<Vec<String>>(),
+        vec!["9.1666666666666667", "3.0276503540974917"],
+        "the spread of ten bigints a double cannot tell apart"
+    );
+    assert_eq!(
+        describe_result_types(&client, &sql).await,
+        vec![Type::NUMERIC, Type::NUMERIC],
+    );
+
+    // `numeric` input, read at its own declared scale: `amt` is `n` with two decimal
+    // places, so a scale the accumulator mis-read would answer 82500 or 0.000825 rather
+    // than the 8.25 that `n` itself answers.
+    assert_eq!(
+        statistic(&client, &format!("SELECT var_pop(amt) FROM {tbl}")).await,
+        "8.25",
+    );
+    assert_eq!(
+        describe_result_types(&client, &format!("SELECT var_pop(amt) FROM {tbl}")).await,
+        vec![Type::NUMERIC],
+    );
+
+    // `double precision` is where PostgreSQL answers in `double precision` too, so the
+    // family must *not* move there: this arm still delegates to DataFusion.
+    for expr in ["var_pop(f)", "stddev_samp(f)", "variance(f)"] {
+        assert_eq!(
+            describe_result_types(&client, &format!("SELECT {expr} FROM {tbl}")).await,
+            vec![Type::FLOAT8],
+            "{expr} of a double is double precision, as PostgreSQL answers it"
+        );
+    }
+    assert!(
+        (scalar_number(&client, &format!("SELECT var_samp(f) FROM {tbl}")).await - 9.166_666_666)
+            .abs()
+            < 1e-6,
+        "and it still answers the variance"
+    );
+
+    drop_table(&client, &tbl).await;
+}
+
+// DISTRIBUTED. The same family through the four forms that change *which* rows reach the
+// accumulator, each of which reaches it by a different path: a window frame retracts, a
+// `FILTER` narrows, `DISTINCT` de-duplicates and `GROUP BY` merges one partial total per
+// shard. A replacement aggregate that only handled the plain grouped case would fail here
+// after the query had been accepted, so each form is pinned separately.
+#[tokio::test]
+async fn test_the_statistic_forms_that_reshape_the_group() {
+    let client = ready_client().await;
+    let tbl = setup_statistics_table(&client, "expr_statsform").await;
+
+    // The window spelling has to report the type the grouped one reports, or a client gets
+    // `numeric` and `double precision` for one variance depending on how it was written.
+    assert_eq!(
+        statistic(
+            &client,
+            &format!("SELECT var_samp(n) OVER () FROM {tbl} LIMIT 1")
+        )
+        .await,
+        "9.1666666666666667",
+    );
+    assert_eq!(
+        describe_result_types(&client, &format!("SELECT var_samp(n) OVER () FROM {tbl}")).await,
+        vec![Type::NUMERIC],
+    );
+
+    // A moving frame, which is the form that retracts: each row's frame holds it and its
+    // predecessor, so every variance after the first is that of two values one apart, and
+    // the first row's frame is too small for a *sample* variance to exist.
+    let moving = format!(
+        "SELECT var_samp(n) OVER (ORDER BY n ROWS BETWEEN 1 PRECEDING AND CURRENT ROW) \
+         FROM {tbl} ORDER BY n"
+    );
+    let frames: Vec<Option<String>> = simple_query_rows(&client, &moving)
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r[0].clone())
+        .collect();
+    assert_eq!(frames[0], None, "one row has no sample variance");
+    assert!(
+        frames[1..]
+            .iter()
+            .all(|v| v.as_deref().map(|t| t.starts_with("0.5")) == Some(true)),
+        "every two-row frame spans 1, so its sample variance is 0.5: {frames:?}"
+    );
+
+    // FILTER, which narrows the group to three rows — and to one, where PostgreSQL's two
+    // arms differ: a population variance of a single value is 0 and a sample variance of it
+    // is NULL, because the divisor is n − 1.
+    assert_eq!(
+        statistic(
+            &client,
+            &format!("SELECT var_samp(n) FILTER (WHERE n <= 3) FROM {tbl}")
+        )
+        .await,
+        "1",
+        "the sample variance of 1, 2, 3"
+    );
+    assert_eq!(
+        statistic(
+            &client,
+            &format!("SELECT var_pop(n) FILTER (WHERE n = 1) FROM {tbl}")
+        )
+        .await,
+        "0",
+        "a population variance of one value is 0",
+    );
+    assert_eq!(
+        maybe_statistic(
+            &client,
+            &format!("SELECT var_samp(n) FILTER (WHERE n = 1) FROM {tbl}")
+        )
+        .await,
+        None,
+        "and its sample variance is NULL",
+    );
+    assert_eq!(
+        maybe_statistic(
+            &client,
+            &format!("SELECT var_pop(n) FILTER (WHERE n = 99) FROM {tbl}")
+        )
+        .await,
+        None,
+        "an empty group has no statistic at all",
+    );
+
+    // DISTINCT. `d` holds each of 1..5 twice: the *population* variance is the same either
+    // way, and the sample variance is not, because de-duplicating changes n.
+    assert_eq!(
+        statistic(&client, &format!("SELECT var_samp(d) FROM {tbl}")).await,
+        "2.2222222222222222",
+        "ten values, five of them repeats"
+    );
+    assert_eq!(
+        statistic(&client, &format!("SELECT var_samp(DISTINCT d) FROM {tbl}")).await,
+        "2.5",
+        "the five distinct values, counted once each"
+    );
+    // Mixed with a non-distinct aggregate, which is the form the optimizer cannot rewrite
+    // into a GROUP BY and so hands to the accumulator with its own de-duplication.
+    assert_eq!(
+        simple_query_rows(
+            &client,
+            &format!("SELECT var_samp(DISTINCT d), sum(n) FROM {tbl}")
+        )
+        .await
+        .unwrap()
+        .swap_remove(0)
+        .into_iter()
+        .map(Option::unwrap)
+        .collect::<Vec<String>>(),
+        vec!["2.5000000000000000", "55"],
+    );
+
+    // GROUP BY over a column that is not the shard key, so each group's totals are
+    // accumulated per shard and merged — the path where a partial state that did not
+    // round-trip would answer something else entirely.
+    assert_eq!(
+        simple_query_rows(
+            &client,
+            &format!("SELECT g, var_samp(n), var_pop(n) FROM {tbl} GROUP BY g ORDER BY g")
+        )
+        .await
+        .unwrap()
+        .iter()
+        .map(|r| r
+            .iter()
+            .map(|c| c.clone().unwrap())
+            .collect::<Vec<String>>())
+        .collect::<Vec<Vec<String>>>(),
+        vec![
+            vec![
+                "1".to_string(),
+                "2.5000000000000000".into(),
+                "2.0000000000000000".into()
+            ],
+            vec![
+                "2".to_string(),
+                "2.5000000000000000".into(),
+                "2.0000000000000000".into()
+            ],
+        ],
+        "five consecutive values per group, twice"
+    );
+
+    drop_table(&client, &tbl).await;
+}
+
+// The ceiling the exact path carries, and the one thing worse than it would be silence.
+// The result is a `numeric` of 38 digits with sixteen of them after the point, so a variance
+// past 10^22 cannot be represented — and a variance is a *square*, so the input only has
+// to reach 10^11 to get there. PostgreSQL has no such limit; VaireDB says so with the
+// class PostgreSQL uses for the same condition rather than answering a wrapped number,
+// and the standard deviation of the very same rows still answers, because a root reaches
+// further than the square it came from.
+#[tokio::test]
+async fn test_a_variance_past_the_numeric_ceiling_is_refused() {
+    let client = ready_client().await;
+    let tbl = create_table(
+        &client,
+        "expr_statsceil",
+        &format!("(id INTEGER NOT NULL, huge NUMERIC(38,0) NOT NULL) {CREATE_OPTS}"),
+    )
+    .await;
+    execute(
+        &client,
+        &format!("INSERT INTO {tbl} (id, huge) VALUES (1, 0), (2, 1000000000000000)"),
+    )
+    .await
+    .unwrap();
+
+    let err = assert_sqlstate(
+        &client,
+        &format!("SELECT var_pop(huge) FROM {tbl}"),
+        SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+    )
+    .await;
+    // And the message names the ceiling that was hit, rather than the Rust of the
+    // accumulator that hit it: this is a limit a client can write its query around.
+    assert!(
+        err.message().ends_with("does not fit numeric(38, 16)"),
+        "the message names the type the value did not fit: {}",
+        err.message()
+    );
+
+    // The root of that same refused variance is 5 × 10^14, which fits — so the refusal is
+    // the result's, not the input's.
+    assert_eq!(
+        statistic(&client, &format!("SELECT stddev_pop(huge) FROM {tbl}")).await,
+        "500000000000000",
+    );
+
+    drop_table(&client, &tbl).await;
+}
+
+// ============================================================================
+// 18. The json and uuid casts, and the operator surface behind them
+// ============================================================================
+//
+// One planner gap held more feature surface than any other row of the analysis: JSON,
+// JSONB and UUID all work as *column* types and none of them worked as a **cast
+// target**, and with the cast unreachable so was the whole `json` operator family and
+// both json aggregates. All three types are stored as Arrow text — a client is told
+// `text` for a JSONB column, which is its own separately recorded gap — so the cast is a
+// validation rather than a change of representation, and Arrow has no cast that
+// validates. Each is a UDF the coordinator rewrites the cast into and every executor
+// resolves by name.
+//
+// What is deliberately *not* closed is recorded beside the tests that pin it: `::jsonb`
+// does not normalize, `@?` is refused because a jsonpath needs a parser VaireDB does not
+// have, and `json_agg` of a bare JSONB column quotes where PostgreSQL embeds.
+
+/// Four rows over every shard, with JSON documents as text: `doc` is an object per row,
+/// `arr` an array, and both are NULL on one row so the three-valued cases have a row to
+/// stand on.
+async fn setup_json_table(client: &Client, prefix: &str) -> String {
+    let tbl = create_table(
+        client,
+        prefix,
+        &format!("(id INTEGER NOT NULL, doc VARCHAR, arr VARCHAR, u VARCHAR) {CREATE_OPTS}"),
+    )
+    .await;
+    execute(
+        client,
+        &format!(
+            "INSERT INTO {tbl} (id, doc, arr, u) VALUES \
+             (1, '{{\"a\": 1, \"b\": {{\"c\": \"deep\"}}, \"n\": null}}', '[10, 20, 30]', \
+                 'A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11'), \
+             (2, '{{\"a\": 2, \"b\": {{\"c\": \"also\"}}}}', '[\"x\", \"y\"]', \
+                 'a0eebc999c0b4ef8bb6d6bb9bd380a11'), \
+             (3, '{{\"a\": 3}}', '[]', '{{11111111-2222-3333-4444-555555555555}}'), \
+             (4, NULL, NULL, NULL)"
+        ),
+    )
+    .await
+    .unwrap();
+    tbl
+}
+
+/// One column of a query, with NULL spelled as the four characters `NULL` so it cannot be
+/// mistaken for the empty string — a distinction both the JSON accessors and the format
+/// family below depend on, since `''` and NULL are different answers for both.
+async fn rendered_column(client: &Client, sql: &str) -> Vec<String> {
+    simple_query_rows(client, sql)
+        .await
+        .unwrap_or_else(|e| panic!("`{sql}` should be answerable: {e}"))
+        .into_iter()
+        .map(|row| row[0].clone().unwrap_or_else(|| "NULL".to_string()))
+        .collect()
+}
+
+/// The single value a one-row query returns, NULL included.
+async fn rendered_scalar(client: &Client, sql: &str) -> String {
+    let values = rendered_column(client, sql).await;
+    assert_eq!(values.len(), 1, "`{sql}` returns one row");
+    values.into_iter().next().unwrap()
+}
+
+// REWRITE, DISTRIBUTED. The row itself: all three casts, over a literal and over a
+// sharded column. A cast that validates has to run where the projection runs, so the
+// column forms are what prove the function exists on the executors and not only in the
+// planner that accepted the statement.
+#[tokio::test]
+async fn test_the_json_and_uuid_casts_are_planned() {
+    let client = ready_client().await;
+    let tbl = setup_json_table(&client, "expr_jsoncast").await;
+
+    // Literals, in both spellings of a cast. A JSON document of any shape is a document:
+    // an object, an array, and each of the three scalar forms.
+    for (expr, expected) in [
+        (r#"'{"a": 1}'::json"#, r#"{"a": 1}"#),
+        (r#"'{"a": 1}'::jsonb"#, r#"{"a": 1}"#),
+        (r#"CAST('[1, 2]' AS JSON)"#, "[1, 2]"),
+        (r#"CAST('[1, 2]' AS JSONB)"#, "[1, 2]"),
+        ("'42'::json", "42"),
+        ("'true'::json", "true"),
+        ("'null'::json", "null"),
+        (r#"'"text"'::json"#, r#""text""#),
+        // Leading and trailing whitespace is part of what PostgreSQL accepts.
+        (r#"'  {"a": 1}  '::json"#, r#"  {"a": 1}  "#),
+    ] {
+        assert_eq!(
+            rendered_scalar(&client, &format!("SELECT {expr}")).await,
+            expected,
+            "`{expr}`"
+        );
+    }
+
+    // And over the sharded column, where every row is validated on the node holding it.
+    assert_eq!(
+        rendered_column(
+            &client,
+            &format!("SELECT doc::jsonb FROM {tbl} WHERE id IN (1, 3, 4) ORDER BY id")
+        )
+        .await,
+        vec![
+            r#"{"a": 1, "b": {"c": "deep"}, "n": null}"#,
+            r#"{"a": 3}"#,
+            // A NULL is not a document and is not validated — it stays NULL.
+            "NULL",
+        ]
+    );
+
+    // `::uuid` validates *and* canonicalizes, which is the part that makes it more than a
+    // check: three spellings of the same value in the column, one answer.
+    assert_eq!(
+        rendered_column(
+            &client,
+            &format!("SELECT u::uuid FROM {tbl} WHERE id IN (1, 2) ORDER BY id")
+        )
+        .await,
+        vec![
+            "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
+            "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
+        ]
+    );
+    // So the two rows compare equal after the cast, where the raw text does not. This is
+    // the whole reason a client writes `::uuid` rather than comparing strings.
+    assert_eq!(
+        rendered_scalar(
+            &client,
+            &format!(
+                "SELECT count(*) FROM {tbl} a JOIN {tbl} b ON a.u::uuid = b.u::uuid \
+                 WHERE a.id = 1 AND b.id = 2"
+            )
+        )
+        .await,
+        "1"
+    );
+    // The braced spelling PostgreSQL's own `uuid_in` accepts, canonicalized like the rest.
+    assert_eq!(
+        rendered_scalar(&client, &format!("SELECT u::uuid FROM {tbl} WHERE id = 3")).await,
+        "11111111-2222-3333-4444-555555555555"
+    );
+    assert_eq!(
+        rendered_scalar(
+            &client,
+            "SELECT CAST('A0EEBC99-9C0B-4EF8-BB6D-6BB9BD380A11' AS UUID)"
+        )
+        .await,
+        "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11"
+    );
+
+    drop_table(&client, &tbl).await;
+}
+
+// REFUSAL, DISTRIBUTED. The casts validate, so text that is not a document or not a UUID
+// is `22P02` — PostgreSQL's `invalid_text_representation` — and not a plausible value the
+// client would then store or compare. The SQLSTATE has to survive the executor boundary,
+// which is why the column forms are here beside the literals.
+#[tokio::test]
+async fn test_the_json_and_uuid_casts_refuse_what_is_not_one() {
+    let client = ready_client().await;
+    let tbl = create_table(
+        &client,
+        "expr_jsonbad",
+        &format!("(id INTEGER NOT NULL, t VARCHAR NOT NULL) {CREATE_OPTS}"),
+    )
+    .await;
+    execute(
+        &client,
+        &format!("INSERT INTO {tbl} (id, t) VALUES (1, '{{oops'), (2, 'notauuid')"),
+    )
+    .await
+    .unwrap();
+
+    for expr in [
+        "'{oops'::json",
+        "'{oops'::jsonb",
+        "'{\"a\": }'::json",
+        "''::json",
+        // A document followed by anything else is not one document.
+        "'{} {}'::json",
+        "'1 2'::json",
+    ] {
+        let err = assert_sqlstate(
+            &client,
+            &format!("SELECT {expr}"),
+            SQLSTATE_INVALID_TEXT_REPRESENTATION,
+        )
+        .await;
+        assert!(
+            err.message().contains("invalid input syntax for type json"),
+            "`{expr}` must name the type: {}",
+            err.message()
+        );
+    }
+
+    for expr in [
+        "'notauuid'::uuid",
+        // One digit short, and a hyphen in a position PostgreSQL does not allow.
+        "'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a1'::uuid",
+        "'a0e-ebc999c0b4ef8bb6d6bb9bd380a11'::uuid",
+    ] {
+        let err = assert_sqlstate(
+            &client,
+            &format!("SELECT {expr}"),
+            SQLSTATE_INVALID_TEXT_REPRESENTATION,
+        )
+        .await;
+        assert!(
+            err.message().contains("invalid input syntax for type uuid"),
+            "`{expr}` must name the type: {}",
+            err.message()
+        );
+    }
+
+    // The same over a column, so the failure is raised on the node running the projection
+    // and the SQLSTATE is what arrives rather than the `XX000` an untagged executor error
+    // would become.
+    let err = assert_sqlstate(
+        &client,
+        &format!("SELECT t::json FROM {tbl} WHERE id = 1"),
+        SQLSTATE_INVALID_TEXT_REPRESENTATION,
+    )
+    .await;
+    assert!(
+        err.message().contains("invalid input syntax for type json"),
+        "the distributed failure must name the type: {}",
+        err.message()
+    );
+    let err = assert_sqlstate(
+        &client,
+        &format!("SELECT t::uuid FROM {tbl} WHERE id = 2"),
+        SQLSTATE_INVALID_TEXT_REPRESENTATION,
+    )
+    .await;
+    // PostgreSQL prints the offending value for `uuid`, and a UUID is an identifier rather
+    // than a secret, so the message carries it.
+    assert!(
+        err.message().contains("\"notauuid\""),
+        "the message must carry the value: {}",
+        err.message()
+    );
+
+    // Nothing but a string casts to either type — an integer has no such conversion in
+    // PostgreSQL, and answering one would be worse than refusing.
+    for sql in ["SELECT 1::json", "SELECT 1::uuid"] {
+        assert!(
+            execute(&client, sql).await.is_err(),
+            "`{sql}` must not be answered"
+        );
+    }
+
+    drop_table(&client, &tbl).await;
+}
+
+// REWRITE, DISTRIBUTED. The operator family the cast was blocking. Each of the four is
+// its own function rather than a wrapper over one, because `->` and `#>` return the
+// extracted value as **json** where `->>` and `#>>` return it as **text**, and for a JSON
+// string those differ: `'"x"'` against `x`.
+#[tokio::test]
+async fn test_the_json_accessors_answer() {
+    let client = ready_client().await;
+    let tbl = setup_json_table(&client, "expr_jsonget").await;
+
+    // `->` by key, over the sharded column: the answer is json, so a string keeps quotes.
+    assert_eq!(
+        rendered_column(
+            &client,
+            &format!("SELECT doc::jsonb -> 'a' FROM {tbl} ORDER BY id")
+        )
+        .await,
+        vec!["1", "2", "3", "NULL"]
+    );
+    assert_eq!(
+        rendered_scalar(
+            &client,
+            &format!("SELECT doc::jsonb -> 'b' FROM {tbl} WHERE id = 1")
+        )
+        .await,
+        r#"{"c": "deep"}"#,
+        "an object comes back as the client's own bytes"
+    );
+    // `->>` by key: the same extraction, as text, so the quotes come off a string and a
+    // JSON `null` becomes a SQL NULL.
+    assert_eq!(
+        rendered_column(
+            &client,
+            &format!("SELECT doc::jsonb -> 'b' ->> 'c' FROM {tbl} WHERE id IN (1, 2) ORDER BY id")
+        )
+        .await,
+        vec!["deep", "also"],
+        "chained accessors reach into a nested document"
+    );
+    assert_eq!(
+        rendered_scalar(
+            &client,
+            &format!("SELECT doc::jsonb -> 'n' FROM {tbl} WHERE id = 1")
+        )
+        .await,
+        "null",
+        "-> keeps a JSON null as the JSON null it is"
+    );
+    assert_eq!(
+        rendered_scalar(
+            &client,
+            &format!("SELECT doc::jsonb ->> 'n' FROM {tbl} WHERE id = 1")
+        )
+        .await,
+        "NULL",
+        "->> reads a JSON null as a SQL NULL"
+    );
+
+    // An integer key is an array index, and PostgreSQL counts a negative one from the end.
+    assert_eq!(
+        rendered_column(
+            &client,
+            &format!("SELECT arr::jsonb -> 0 FROM {tbl} WHERE id IN (1, 2) ORDER BY id")
+        )
+        .await,
+        vec!["10", r#""x""#]
+    );
+    assert_eq!(
+        rendered_scalar(
+            &client,
+            &format!("SELECT arr::jsonb -> -1 FROM {tbl} WHERE id = 1")
+        )
+        .await,
+        "30"
+    );
+    assert_eq!(
+        rendered_scalar(
+            &client,
+            &format!("SELECT arr::jsonb ->> -1 FROM {tbl} WHERE id = 2")
+        )
+        .await,
+        "y"
+    );
+
+    // `#>` and `#>>` walk a path, given in PostgreSQL's own array input syntax or as an
+    // array. A path step over an array is read as an index.
+    for path in ["'{b,c}'", "ARRAY['b', 'c']"] {
+        assert_eq!(
+            rendered_scalar(
+                &client,
+                &format!("SELECT doc::jsonb #> {path} FROM {tbl} WHERE id = 1")
+            )
+            .await,
+            r#""deep""#,
+            "`#> {path}`"
+        );
+        assert_eq!(
+            rendered_scalar(
+                &client,
+                &format!("SELECT doc::jsonb #>> {path} FROM {tbl} WHERE id = 1")
+            )
+            .await,
+            "deep",
+            "`#>> {path}`"
+        );
+    }
+    assert_eq!(
+        rendered_scalar(
+            &client,
+            &format!("SELECT arr::jsonb #>> '{{1}}' FROM {tbl} WHERE id = 1")
+        )
+        .await,
+        "20",
+        "a path step over an array is an index"
+    );
+    // An empty path is the document itself, which is PostgreSQL's answer too.
+    assert_eq!(
+        rendered_scalar(
+            &client,
+            &format!("SELECT doc::jsonb #>> '{{}}' FROM {tbl} WHERE id = 3")
+        )
+        .await,
+        r#"{"a": 3}"#
+    );
+
+    // In a predicate rather than the select list, so the accessor is pushed through
+    // whatever the planner does with a filter.
+    assert_eq!(
+        rendered_column(
+            &client,
+            &format!("SELECT id FROM {tbl} WHERE doc::jsonb ->> 'a' = '2' ORDER BY id")
+        )
+        .await,
+        vec!["2"]
+    );
+    // And in a GROUP BY key, which makes the extracted value cross the wire as a group.
+    assert_eq!(
+        rendered_column(
+            &client,
+            &format!(
+                "SELECT count(*) FROM {tbl} GROUP BY doc::jsonb -> 'b' \
+                 ORDER BY count(*) DESC, 1"
+            )
+        )
+        .await,
+        vec!["2", "1", "1"],
+        "two rows share a NULL `b`, and the other two differ"
+    );
+
+    drop_table(&client, &tbl).await;
+}
+
+// THREE-VALUED. A key that is not there, an index past the end, and a path that asks an
+// object for an element are all **NULL** rather than an error: this is `jsonb`'s reading,
+// which is the safe one of the two, because PostgreSQL's `json` raises for some of these
+// and answering NULL where an error was due is visible while the reverse loses the row.
+// The residue is recorded in `docs/specs/gap-analysis.md`.
+#[tokio::test]
+async fn test_a_missing_json_key_is_null_rather_than_an_error() {
+    let client = ready_client().await;
+    let tbl = setup_json_table(&client, "expr_jsonmiss").await;
+
+    for expr in [
+        // A key no row has.
+        "doc::jsonb -> 'nope'",
+        "doc::jsonb ->> 'nope'",
+        // An index past either end of a three-element array.
+        "arr::jsonb -> 3",
+        "arr::jsonb -> -4",
+        // A shape that cannot answer: an object has no element 0, an array has no key.
+        "doc::jsonb -> 0",
+        "arr::jsonb -> 'a'",
+        // A path whose first step exists and whose second does not.
+        "doc::jsonb #> '{b,nope}'",
+        "doc::jsonb #>> '{nope,c}'",
+    ] {
+        assert_eq!(
+            rendered_scalar(&client, &format!("SELECT {expr} FROM {tbl} WHERE id = 1")).await,
+            "NULL",
+            "`{expr}`"
+        );
+    }
+
+    // A NULL document propagates rather than raising, and a NULL step makes the whole
+    // path miss — both are PostgreSQL's answers.
+    assert_eq!(
+        rendered_scalar(
+            &client,
+            &format!("SELECT doc::jsonb -> 'a' FROM {tbl} WHERE id = 4")
+        )
+        .await,
+        "NULL"
+    );
+    assert_eq!(
+        rendered_scalar(
+            &client,
+            &format!("SELECT doc::jsonb #> ARRAY['b', NULL] FROM {tbl} WHERE id = 1")
+        )
+        .await,
+        "NULL"
+    );
+
+    // The accessors validate too, so a document that is not one is `22P02` and not a
+    // silent NULL — the distinction between "no such key" and "not a document" is kept.
+    let err = assert_sqlstate(
+        &client,
+        "SELECT '{oops' -> 'a'",
+        SQLSTATE_INVALID_TEXT_REPRESENTATION,
+    )
+    .await;
+    assert!(
+        err.message().contains("invalid input syntax for type json"),
+        "got: {}",
+        err.message()
+    );
+
+    drop_table(&client, &tbl).await;
+}
+
+// REWRITE, DISTRIBUTED. `json_agg` and `jsonb_agg`, the two aggregates the cast gap was
+// holding. They are composed over DataFusion's `array_agg` rather than implemented as an
+// aggregate of their own, which is what makes the in-aggregate `ORDER BY` PostgreSQL
+// allows survive a partial aggregate on each shard and a final aggregate that merges them
+// — the case a hand-written accumulator would get wrong only when sharded.
+#[tokio::test]
+async fn test_the_json_aggregates_answer() {
+    let client = ready_client().await;
+    let tbl = setup_json_table(&client, "expr_jsonagg").await;
+
+    // The whole table as one array, ordered — over three shards, so the ordering is the
+    // distributed claim and not just the aggregate's.
+    assert_eq!(
+        rendered_scalar(
+            &client,
+            &format!("SELECT json_agg(id ORDER BY id) FROM {tbl}")
+        )
+        .await,
+        "[1, 2, 3, 4]"
+    );
+    assert_eq!(
+        rendered_scalar(
+            &client,
+            &format!("SELECT jsonb_agg(id ORDER BY id DESC) FROM {tbl}")
+        )
+        .await,
+        "[4, 3, 2, 1]"
+    );
+    // A NULL row is the JSON `null`, not a dropped element — the difference between
+    // `json_agg` and an aggregate that ignores nulls, and the reason the composition has
+    // to keep them. `doc` is a *text* column, so what surrounds that `null` is a JSON
+    // string: quoted and escaped, which is what PostgreSQL does with `json_agg(text)`.
+    assert_eq!(
+        rendered_scalar(
+            &client,
+            &format!("SELECT json_agg(doc ORDER BY id) FROM {tbl} WHERE id IN (3, 4)")
+        )
+        .await,
+        r#"["{\"a\": 3}", null]"#,
+        "an uncast text column is aggregated as JSON strings"
+    );
+    // Casting it is what makes it a document, and a document is spliced rather than
+    // quoted — the same rows, one nesting level less, and the NULL still a JSON `null`.
+    assert_eq!(
+        rendered_scalar(
+            &client,
+            &format!("SELECT json_agg(doc::jsonb ORDER BY id) FROM {tbl} WHERE id IN (3, 4)")
+        )
+        .await,
+        r#"[{"a": 3}, null]"#
+    );
+    // The same pair without a table behind it, so the two renderings sit side by side.
+    assert_eq!(
+        rendered_scalar(
+            &client,
+            r#"SELECT json_agg(x) FROM (VALUES ('{"a": 1}')) t(x)"#
+        )
+        .await,
+        r#"["{\"a\": 1}"]"#,
+        "an uncast document is a JSON string"
+    );
+    assert_eq!(
+        rendered_scalar(
+            &client,
+            r#"SELECT json_agg(x::jsonb) FROM (VALUES ('{"a": 1}')) t(x)"#
+        )
+        .await,
+        r#"[{"a": 1}]"#,
+        "a cast one is embedded"
+    );
+
+    // Grouped, which is the ordinary use: one array per group.
+    assert_eq!(
+        rendered_column(
+            &client,
+            &format!(
+                "SELECT json_agg(id ORDER BY id) FROM {tbl} \
+                 GROUP BY (id % 2) ORDER BY min(id)"
+            )
+        )
+        .await,
+        vec!["[1, 3]", "[2, 4]"]
+    );
+
+    // Text is quoted and escaped, numbers and booleans are not.
+    assert_eq!(
+        rendered_scalar(
+            &client,
+            "SELECT json_agg(x) FROM (VALUES ('a'), ('b')) t(x)"
+        )
+        .await,
+        r#"["a", "b"]"#
+    );
+    assert_eq!(
+        rendered_scalar(
+            &client,
+            "SELECT json_agg(x) FROM (VALUES (true), (false)) t(x)"
+        )
+        .await,
+        "[true, false]"
+    );
+
+    // `DISTINCT` and `FILTER` ride along on the inner aggregate untouched.
+    assert_eq!(
+        rendered_scalar(
+            &client,
+            &format!("SELECT json_agg(DISTINCT id % 2 ORDER BY id % 2) FROM {tbl}")
+        )
+        .await,
+        "[0, 1]"
+    );
+    assert_eq!(
+        rendered_scalar(
+            &client,
+            &format!("SELECT json_agg(id ORDER BY id) FILTER (WHERE id > 2) FROM {tbl}")
+        )
+        .await,
+        "[3, 4]"
+    );
+
+    // A group with no rows at all is NULL, not `[]` — PostgreSQL's answer, and the one
+    // place `json_agg` and a naive "render the list" disagree.
+    assert_eq!(
+        rendered_scalar(
+            &client,
+            &format!("SELECT json_agg(id) FROM {tbl} WHERE id > 99")
+        )
+        .await,
+        "NULL"
+    );
+
+    // The extracted values of the family above, aggregated — the two halves of this row
+    // meeting, and the shape a client actually writes.
+    assert_eq!(
+        rendered_scalar(
+            &client,
+            &format!(
+                "SELECT json_agg(doc::jsonb ->> 'a' ORDER BY id) FROM {tbl} \
+                 WHERE doc IS NOT NULL"
+            )
+        )
+        .await,
+        r#"["1", "2", "3"]"#
+    );
+    assert_eq!(
+        rendered_scalar(
+            &client,
+            &format!(
+                "SELECT json_agg(doc::jsonb -> 'a' ORDER BY id) FROM {tbl} \
+                 WHERE doc IS NOT NULL"
+            )
+        )
+        .await,
+        "[1, 2, 3]",
+        "-> returns json, so its values are embedded rather than quoted"
+    );
+
+    // The label is the client's own aggregate name, not the composition's.
+    assert_eq!(
+        describe_result_labels(&client, &format!("SELECT json_agg(id) FROM {tbl}")).await,
+        vec!["json_agg"]
+    );
+
+    drop_table(&client, &tbl).await;
+}
+
+// REFUSAL. `@?` is the one member of the operator family that is refused rather than
+// rewritten: it takes a jsonpath, a language with its own grammar that VaireDB has no
+// parser for, and there is no rewrite that approximates it. Refusing by name is what
+// makes the boundary legible — the alternative is an unsupported-operator failure that
+// names an internal enum variant and no alternative.
+#[tokio::test]
+async fn test_the_jsonpath_operator_is_refused() {
+    let client = ready_client().await;
+    let tbl = setup_json_table(&client, "expr_jsonpath").await;
+
+    for sql in [
+        format!("SELECT doc::jsonb @? '$.a' FROM {tbl}"),
+        format!("SELECT id FROM {tbl} WHERE doc::jsonb @? '$.a'"),
+        format!("SELECT count(*) FROM {tbl} WHERE (doc::jsonb @? '$.a') IS TRUE"),
+    ] {
+        let err = assert_sqlstate(&client, &sql, SQLSTATE_FEATURE_NOT_SUPPORTED).await;
+        assert!(
+            err.message().contains("@?") && err.message().contains("jsonpath"),
+            "the refusal must name the operator and the reason: {}",
+            err.message()
+        );
+        // And the alternative, because the common uses of `@?` have one.
+        assert!(
+            err.message().contains("->>"),
+            "the refusal must name what to write instead: {}",
+            err.message()
+        );
+    }
+
+    // Over-reach probe: the four accessors that *are* implemented must keep working, and
+    // an `IS NOT NULL` over one of them is the spelling `@? '$.a'` is usually written for.
+    assert_eq!(
+        rendered_column(
+            &client,
+            &format!("SELECT id FROM {tbl} WHERE doc::jsonb -> 'b' IS NOT NULL ORDER BY id")
+        )
+        .await,
+        vec!["1", "2"]
+    );
+
+    drop_table(&client, &tbl).await;
+}
+
+// DISTRIBUTED. JSON, JSONB and UUID as *column* types, which the analysis records as
+// already working — pinned here because the casts above now sit beside them, and a
+// declared JSONB column meeting `::jsonb` is the shape most likely to disagree.
+//
+// Two residues are pinned rather than fixed, both because the alternative would answer a
+// different question than the column does:
+//
+//   * `::jsonb` does **not** normalize. A JSONB column keeps text as written — that is
+//     what a client reads back from it — so a cast that reordered keys or dropped
+//     duplicates would disagree with the column it is written beside.
+//   * `json_agg` of a bare JSONB column quotes rather than embeds. Which rendering
+//     applies is read off the *expression*, and by planning time a column is text with no
+//     type attached; `json_agg(payload::jsonb)` is the spelling that embeds.
+#[tokio::test]
+async fn test_the_declared_json_and_uuid_columns_meet_their_casts() {
+    let client = ready_client().await;
+    let tbl = create_table(
+        &client,
+        "expr_jsoncol",
+        &format!("(id INTEGER NOT NULL, payload JSONB, u UUID) {CREATE_OPTS}"),
+    )
+    .await;
+    execute(
+        &client,
+        &format!(
+            "INSERT INTO {tbl} (id, payload, u) VALUES \
+             (1, '{{\"b\": 2, \"a\": 1}}', 'a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11'), \
+             (2, '{{\"a\": 9}}', '11111111-2222-3333-4444-555555555555')"
+        ),
+    )
+    .await
+    .unwrap();
+
+    // The accessors read a declared JSONB column with no cast written at all, because the
+    // column is already text and the accessor validates what it is given.
+    assert_eq!(
+        rendered_column(
+            &client,
+            &format!("SELECT payload ->> 'a' FROM {tbl} ORDER BY id")
+        )
+        .await,
+        vec!["1", "9"]
+    );
+    // And with the cast written, which must not change the answer.
+    assert_eq!(
+        rendered_column(
+            &client,
+            &format!("SELECT payload::jsonb ->> 'a' FROM {tbl} ORDER BY id")
+        )
+        .await,
+        vec!["1", "9"]
+    );
+    assert_eq!(
+        rendered_column(&client, &format!("SELECT u::uuid FROM {tbl} ORDER BY id")).await,
+        vec![
+            "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11",
+            "11111111-2222-3333-4444-555555555555",
+        ]
+    );
+
+    // RESIDUE. PostgreSQL's `jsonb` sorts keys and would answer `{"a": 1, "b": 2}`. Here
+    // the cast validates without normalizing, so the value is the text the column holds —
+    // which is what a plain `SELECT payload` returns, so the two agree with each other.
+    let stored = rendered_scalar(&client, &format!("SELECT payload FROM {tbl} WHERE id = 1")).await;
+    assert_eq!(
+        rendered_scalar(
+            &client,
+            &format!("SELECT payload::jsonb FROM {tbl} WHERE id = 1")
+        )
+        .await,
+        stored,
+        "the cast agrees with the column rather than reordering behind it"
+    );
+
+    // RESIDUE. Embedded when the cast is written, quoted when it is not.
+    assert_eq!(
+        rendered_scalar(
+            &client,
+            &format!("SELECT json_agg(payload::jsonb ORDER BY id) FROM {tbl}")
+        )
+        .await,
+        format!("[{stored}, {{\"a\": 9}}]")
+    );
+    assert!(
+        rendered_scalar(
+            &client,
+            &format!("SELECT json_agg(payload ORDER BY id) FROM {tbl}")
+        )
+        .await
+        .starts_with(r#"["#),
+        "a bare JSONB column is aggregated as text; see the comment above"
+    );
+
+    drop_table(&client, &tbl).await;
+}
+
+// ============================================================================
+// 19. The two analytical spellings the planner reads as something other than PostgreSQL
+// ============================================================================
+//
+// Both forms in this section parse on the coordinator, plan on DataFusion, and are then
+// answered by something that is not PostgreSQL's answer — which makes them the worst kind of
+// gap, the kind a client cannot see.
+//
+// `count(DISTINCT a, b)` is PostgreSQL's spelling for "distinct pairs". DataFusion's `count`
+// takes one argument, so the second is read as a second aggregate argument and silently
+// ignored: the client is told how many distinct `a` there are and has no way to know it asked
+// a different question. There is nothing to rewrite it into — a `count` over a row value is
+// not the same aggregate — so it is refused, with PostgreSQL's own `42883`, because
+// PostgreSQL has no `count(integer, integer)` either and the fix is always to edit the call.
+//
+// `GROUPING SETS (())` is the grand total: one row, no grouping column. Single-process
+// DataFusion answers it correctly, and the *distributed* plan answers **no rows at all** —
+// the group has no grouping key to hash on, so no stage claims it. A query grouped by nothing
+// *is* a plain aggregate, so the empty set is deleted from the AST before planning and the
+// statement becomes the one DataFusion already distributes correctly.
+
+/// Every row of a two-column grouping query, with NULL spelled as `NULL` so the grand-total
+/// row — whose grouping column is NULL by definition — is visible rather than indistinguishable
+/// from a missing one.
+async fn grouped_rows(client: &Client, sql: &str) -> Vec<(String, String)> {
+    simple_query_rows(client, sql)
+        .await
+        .unwrap_or_else(|e| panic!("`{sql}` should be answerable: {e}"))
+        .into_iter()
+        .map(|row| {
+            (
+                row[0].clone().unwrap_or_else(|| "NULL".to_string()),
+                row[1].clone().unwrap_or_else(|| "NULL".to_string()),
+            )
+        })
+        .collect()
+}
+
+// REWRITE, DISTRIBUTED. The empty grouping set, in every position a client writes it. The
+// distributed forms are the whole point of the test: each of these answered zero rows before
+// the rewrite, and zero rows from a grand total is a wrong answer that reads as an empty
+// table.
+#[tokio::test]
+async fn test_an_empty_grouping_set_is_the_grand_total() {
+    let client = ready_client().await;
+    let tbl = setup_window_table(&client, "expr_empty_gs").await;
+
+    // Grouping by nothing is a plain aggregate: one row over all six.
+    for sql in [
+        format!("SELECT count(*) FROM {tbl} GROUP BY GROUPING SETS (())"),
+        format!("SELECT count(*) FROM {tbl} GROUP BY ()"),
+        format!("SELECT count(*) FROM {tbl} GROUP BY (), ()"),
+    ] {
+        assert_eq!(scalar(&client, &sql).await, "6", "`{sql}`");
+    }
+
+    // RESIDUE. PostgreSQL answers `GROUPING SETS ((), ())` with the grand total **twice** — the
+    // list is a list of sets and duplicates are not folded. A plain aggregate, which is what a
+    // query grouped by nothing becomes, cannot emit a row twice, so this one shape is refused
+    // by name rather than answered as the single row it would collapse to. Before the rewrite
+    // it answered zero rows, and a refusal a client can read beats a wrong count it cannot.
+    let err = assert_sqlstate(
+        &client,
+        &format!("SELECT count(*) FROM {tbl} GROUP BY GROUPING SETS ((), ())"),
+        SQLSTATE_FEATURE_NOT_SUPPORTED,
+    )
+    .await;
+    assert!(
+        err.message().contains("empty grouping set"),
+        "the message names what is repeated, got: {}",
+        err.message()
+    );
+
+    // Beside a grouping column the empty set adds nothing, exactly as in PostgreSQL: the
+    // cross product of "every group" with "one group" is every group.
+    for sql in [
+        format!("SELECT g, count(*) FROM {tbl} GROUP BY g, GROUPING SETS (()) ORDER BY g"),
+        format!("SELECT g, count(*) FROM {tbl} GROUP BY g, () ORDER BY g"),
+    ] {
+        assert_eq!(
+            grouped_rows(&client, &sql).await,
+            vec![("1".into(), "3".into()), ("2".into(), "3".into())],
+            "`{sql}`"
+        );
+    }
+
+    // The mixed list — the form that makes the rewrite non-trivial, because the empty set
+    // has to survive as a *set* while the grouping column keeps its own rows.
+    assert_eq!(
+        grouped_rows(
+            &client,
+            &format!("SELECT g, count(*) FROM {tbl} GROUP BY GROUPING SETS ((), (g)) ORDER BY g")
+        )
+        .await,
+        vec![
+            ("1".into(), "3".into()),
+            ("2".into(), "3".into()),
+            ("NULL".into(), "6".into()),
+        ]
+    );
+
+    // OVER-REACH. Ordinary grouping, and a repeated *non-empty* set, both untouched.
+    assert_eq!(
+        grouped_rows(
+            &client,
+            &format!("SELECT g, count(*) FROM {tbl} GROUP BY g ORDER BY g")
+        )
+        .await,
+        vec![("1".into(), "3".into()), ("2".into(), "3".into())]
+    );
+    assert_eq!(
+        grouped_rows(
+            &client,
+            &format!("SELECT g, count(*) FROM {tbl} GROUP BY GROUPING SETS ((g), (g)) ORDER BY g")
+        )
+        .await,
+        vec![
+            ("1".into(), "3".into()),
+            ("1".into(), "3".into()),
+            ("2".into(), "3".into()),
+            ("2".into(), "3".into()),
+        ]
+    );
+
+    drop_table(&client, &tbl).await;
+}
+
+// REFUSAL. `count` with two arguments. PostgreSQL has `count(*)` and `count(any)` and nothing
+// else, so `42883` is not a VaireDB limitation being reported — it is the same answer
+// PostgreSQL gives, and the message names the row-valued form that does work.
+#[tokio::test]
+async fn test_the_comma_form_of_count_is_an_undefined_function() {
+    let client = ready_client().await;
+    let tbl = setup_window_table(&client, "expr_count_arity").await;
+
+    for sql in [
+        format!("SELECT count(DISTINCT n, g) FROM {tbl}"),
+        format!("SELECT count(n, g) FROM {tbl}"),
+        format!("SELECT g, count(DISTINCT n, g) FROM {tbl} GROUP BY g"),
+    ] {
+        let err = assert_sqlstate(&client, &sql, SQLSTATE_UNDEFINED_FUNCTION).await;
+        assert!(
+            err.message().contains("count(integer, integer)"),
+            "the message names the call PostgreSQL does not have, got: {}",
+            err.message()
+        );
+    }
+
+    // OVER-REACH. Every `count` PostgreSQL does have still answers, including the row-valued
+    // form the refusal points at.
+    assert_eq!(
+        scalar(&client, &format!("SELECT count(*) FROM {tbl}")).await,
+        "6"
+    );
+    assert_eq!(
+        scalar(&client, &format!("SELECT count(n) FROM {tbl}")).await,
+        "4"
+    );
+    assert_eq!(
+        scalar(&client, &format!("SELECT count(DISTINCT n) FROM {tbl}")).await,
+        "4"
+    );
+    // The row-valued form the message points at, which counts distinct *pairs* — including the
+    // two whose `n` is NULL, because a row containing a NULL is not itself NULL.
+    assert_eq!(
+        scalar(
+            &client,
+            &format!("SELECT count(DISTINCT (n, g)) FROM {tbl}")
+        )
+        .await,
+        "6"
+    );
+    // And a two-argument aggregate that is not `count` is not caught by the refusal.
+    assert!(
+        (scalar_number(&client, &format!("SELECT covar_pop(n, g) FROM {tbl}")).await - 6.25).abs()
+            < 1e-9
+    );
+
+    drop_table(&client, &tbl).await;
+}
+
+// ============================================================================
+// 20. Function-level coverage: pg_typeof, the format family and the datetime family
+// ============================================================================
+//
+// Three families a client reaches for constantly and which resolved to nothing at all, so the
+// statement failed with `Invalid function` — a message that reads as "no such function
+// anywhere" about functions PostgreSQL has had for twenty years.
+//
+// `pg_typeof` is first because it is how a client *asks* what a type is rather than inferring
+// it from the row description, and because its answer has to be PostgreSQL's SQL spelling
+// (`integer`, `double precision`) and not Arrow's or pgwire's catalog spelling (`Int32`,
+// `float8`) — a client comparing `pg_typeof(x) = 'integer'`, which is the form PostgreSQL's
+// own documentation uses, gets no rows from the wrong spelling.
+//
+// The format family is what every migration tool builds dynamic SQL with, and what it builds
+// has to be text PostgreSQL would read back as the same value: hence `%I`'s quoting of
+// anything that would fold, and `%L`'s four-character `NULL` rather than `''`.
+//
+// The datetime family is where the two engines disagree most about spelling rather than
+// meaning: `statement_timestamp()` and `transaction_timestamp()` are `now()` under
+// PostgreSQL's own definition, and one-argument `age(x)` is `age(current_date, x)`, so those
+// three are rewritten rather than implemented twice.
+
+// DISTRIBUTED. `pg_typeof` over literals and over a sharded column. The column form is what
+// proves the name resolves on the executors: a function only the coordinator knows plans fine
+// and then fails after the client was told the statement was accepted.
+#[tokio::test]
+async fn test_pg_typeof_answers_postgresqls_spelling_of_the_type() {
+    let client = ready_client().await;
+    let tbl = setup_window_table(&client, "expr_typeof").await;
+
+    for (expr, expected) in [
+        ("CAST(1 AS INTEGER)", "integer"),
+        ("CAST(1 AS BIGINT)", "bigint"),
+        ("CAST(1.5 AS DOUBLE PRECISION)", "double precision"),
+        ("CAST('a' AS TEXT)", "text"),
+        ("true", "boolean"),
+        ("DATE '2024-01-01'", "date"),
+        (
+            "TIMESTAMP '2024-01-01 00:00:00'",
+            "timestamp without time zone",
+        ),
+        // An unresolved literal has no type yet, and `unknown` is the name PostgreSQL gives
+        // that state — including in the `42883` messages elsewhere in this file.
+        ("NULL", "unknown"),
+    ] {
+        let sql = format!("SELECT pg_typeof({expr})");
+        assert_eq!(scalar(&client, &sql).await, expected, "`{sql}`");
+    }
+
+    assert_eq!(
+        rendered_column(
+            &client,
+            &format!("SELECT pg_typeof(n) FROM {tbl} WHERE id = 1")
+        )
+        .await,
+        vec!["integer"]
+    );
+
+    // RESIDUE, and the reason the cases above are written with an explicit cast. An unadorned
+    // integer literal is `bigint` here and `integer` in PostgreSQL, and a decimal literal is
+    // `numeric` in both. That is not `pg_typeof` being wrong — it reports the type the
+    // expression actually has, and the row description of `SELECT 1` says `bigint` too — so the
+    // divergence belongs to literal typing, not to this function, and pinning it here is what
+    // keeps the two answers from drifting apart.
+    assert_eq!(scalar(&client, "SELECT pg_typeof(1)").await, "bigint");
+    assert_eq!(scalar(&client, "SELECT pg_typeof(1.5)").await, "numeric");
+
+    // RESIDUE. PostgreSQL's `now()` is a `timestamptz`; VaireDB's carries no zone, so the type
+    // it reports is the zoneless one. The *value* is UTC either way.
+    assert_eq!(
+        scalar(&client, "SELECT pg_typeof(now())").await,
+        "timestamp without time zone"
+    );
+
+    drop_table(&client, &tbl).await;
+}
+
+// DISTRIBUTED. The format family. Every answer here is text a client pastes back into SQL, so
+// what is pinned is not just the value but its quoting.
+#[tokio::test]
+async fn test_the_format_family_builds_the_sql_postgresql_builds() {
+    let client = ready_client().await;
+    let tbl = setup_probe_table(&client, "expr_format").await;
+
+    assert_eq!(
+        scalar(&client, "SELECT format('%s-%s', 1, 'a')").await,
+        "1-a"
+    );
+    assert_eq!(scalar(&client, "SELECT format('%%s')").await, "%s");
+    // `%1$s` reads the first argument again, and moves the implicit cursor with it.
+    assert_eq!(
+        scalar(&client, "SELECT format('%1$s %1$s', 'x')").await,
+        "x x"
+    );
+    assert_eq!(
+        scalar(&client, "SELECT format('%-5s|', 'ab')").await,
+        "ab   |"
+    );
+
+    // `%I` quotes whatever would not read back as itself: a reserved word, and anything
+    // whose unquoted spelling would fold to a different identifier.
+    assert_eq!(
+        scalar(&client, "SELECT format('%I', 'plain')").await,
+        "plain"
+    );
+    assert_eq!(
+        scalar(&client, "SELECT format('%I', 'Mixed')").await,
+        "\"Mixed\""
+    );
+    assert_eq!(
+        scalar(&client, "SELECT format('%I', 'select')").await,
+        "\"select\""
+    );
+
+    // `%L` is `quote_nullable`: a quoted literal, or the four characters `NULL` — never `''`,
+    // which would read back as the empty string and is a different value.
+    assert_eq!(
+        scalar(&client, "SELECT format('%L', 'O''Reilly')").await,
+        "'O''Reilly'"
+    );
+    assert_eq!(scalar(&client, "SELECT format('%L', NULL)").await, "NULL");
+    assert_eq!(
+        scalar(&client, "SELECT quote_literal('a''b')").await,
+        "'a''b'"
+    );
+    assert_eq!(scalar(&client, "SELECT quote_nullable(NULL)").await, "NULL");
+    // `quote_literal` is strict where `quote_nullable` is not: PostgreSQL's own split.
+    assert_eq!(
+        rendered_scalar(&client, "SELECT quote_literal(NULL)").await,
+        "NULL",
+        "strict, so the *result* is NULL rather than the text NULL"
+    );
+    // `%s` of a NULL is the empty string, which is the one place `''` is the right answer.
+    assert_eq!(
+        rendered_scalar(&client, "SELECT format('[%s]', NULL)").await,
+        "[]"
+    );
+
+    // REFUSAL. An identifier has no null spelling, so PostgreSQL raises rather than writing
+    // `""` — which a client would paste back as a real, differently-named column.
+    let err = assert_sqlstate(
+        &client,
+        "SELECT format('%I', NULL)",
+        SQLSTATE_NULL_VALUE_NOT_ALLOWED,
+    )
+    .await;
+    assert!(
+        err.message().to_lowercase().contains("identifier"),
+        "the message says which conversion refused, got: {}",
+        err.message()
+    );
+
+    // DISTRIBUTED, over a sharded column of each kind the family renders.
+    assert_eq!(
+        rendered_column(
+            &client,
+            &format!("SELECT format('%I = %L', name, val) FROM {tbl} ORDER BY id")
+        )
+        .await,
+        vec!["\"Alice\" = '1.5'", "alpha = '-2.5'", "\"Bob\" = '3.5'"]
+    );
+
+    drop_table(&client, &tbl).await;
+}
+
+// DISTRIBUTED. The datetime family. The deterministic members are pinned by value; the clock
+// members can only be pinned by shape, so what is asserted there is that the name resolves
+// everywhere and answers a timestamp — which is the gap that was open.
+#[tokio::test]
+async fn test_the_datetime_family_answers_over_the_cluster() {
+    let client = ready_client().await;
+    let tbl = setup_window_table(&client, "expr_datetime").await;
+
+    // `age` of two moments is PostgreSQL's calendar difference: months, not 60 days.
+    assert_eq!(
+        scalar(
+            &client,
+            "SELECT age(TIMESTAMP '2024-03-01 00:00:00', TIMESTAMP '2024-01-01 00:00:00')"
+        )
+        .await,
+        "2 mons"
+    );
+    assert_eq!(
+        scalar(&client, "SELECT age(DATE '2024-01-01', DATE '2024-03-01')").await,
+        "-2 mons"
+    );
+    // One argument means "from today", which is PostgreSQL's own definition of the form and
+    // the reason it is a rewrite rather than a second implementation.
+    let since = scalar(&client, "SELECT age(DATE '2000-01-01')").await;
+    assert!(
+        since.contains("years"),
+        "age of a date a quarter-century back is measured in years, got {since:?}"
+    );
+
+    assert_eq!(
+        scalar(&client, "SELECT make_timestamp(2024, 1, 2, 3, 4, 5)").await,
+        "2024-01-02 03:04:05"
+    );
+    assert_eq!(
+        scalar(&client, "SELECT isfinite(DATE '2024-01-01')").await,
+        "t"
+    );
+    assert_eq!(
+        scalar(&client, "SELECT justify_days(INTERVAL '35 days')").await,
+        "1 mon 5 days"
+    );
+    assert_eq!(
+        scalar(&client, "SELECT justify_hours(INTERVAL '27 hours')").await,
+        "1 day 03:00:00"
+    );
+
+    // The clock family: `now()` and its two PostgreSQL synonyms, plus the two that are
+    // deliberately *not* synonyms of it.
+    for expr in [
+        "now()",
+        "statement_timestamp()",
+        "transaction_timestamp()",
+        "clock_timestamp()",
+    ] {
+        let sql = format!("SELECT {expr}");
+        let answer = scalar(&client, &sql).await;
+        assert!(
+            answer.starts_with("20"),
+            "`{sql}` should answer a timestamp in this century, got {answer:?}"
+        );
+    }
+    // `timeofday()` is the one that is not a timestamp at all: PostgreSQL returns `ctime`'s text
+    // with microseconds and a zone appended, `Fri Sep 18 08:30:04.863739 2026 UTC`, and a client
+    // reading it expects that shape and not an ISO one.
+    let clock = scalar(&client, "SELECT timeofday()").await;
+    let fields: Vec<&str> = clock.split_whitespace().collect();
+    assert_eq!(
+        fields.len(),
+        6,
+        "`timeofday()` should answer PostgreSQL's six fields, got {clock:?}"
+    );
+    assert!(
+        fields[4].starts_with("20") && fields[5] == "UTC",
+        "the year and the zone are the last two fields, got {clock:?}"
+    );
+
+    // DISTRIBUTED. The same functions inside a projection over a sharded table, which is
+    // where a name known only to the coordinator would fail.
+    assert_eq!(
+        rendered_column(
+            &client,
+            &format!(
+                "SELECT age(TIMESTAMP '2024-03-01 00:00:00', TIMESTAMP '2024-01-01 00:00:00') \
+                 FROM {tbl} WHERE id = 1"
+            )
+        )
+        .await,
+        vec!["2 mons"]
+    );
+    assert_eq!(
+        rendered_column(
+            &client,
+            &format!("SELECT isfinite(DATE '2024-01-01') FROM {tbl} WHERE id = 1")
+        )
+        .await,
+        vec!["t"]
+    );
+
+    // REFUSAL. A non-temporal argument is not a VaireDB limitation: PostgreSQL has no
+    // `age(integer, integer)` either.
+    let err = assert_sqlstate(&client, "SELECT age(1, 2)", SQLSTATE_UNDEFINED_FUNCTION).await;
+    assert!(
+        err.message().contains("age("),
+        "the message names the call, got: {}",
+        err.message()
     );
 
     drop_table(&client, &tbl).await;

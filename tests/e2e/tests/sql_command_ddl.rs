@@ -202,6 +202,84 @@ async fn test_create_table_as_select_shards_the_result() {
     drop_table(&client, &src).await;
 }
 
+// A column-level `COLLATE` is the last place a collation could reach a shard unlooked-at:
+// broadcast DDL is the client's own statement re-rendered, and the refusal that guards the
+// write path walks expressions only. Byte order is the one ordering every layer of VaireDB
+// agrees on — the coordinator's, and the shard's, which pins `default_collation` when it
+// opens its database — so a column asking for a different one is refused, and one asking
+// for the ordering that is already in force is accepted and changes nothing.
+#[tokio::test]
+async fn test_a_column_collation_that_is_not_byte_order_is_refused() {
+    let client = ready_client().await;
+
+    for collation in ["nocase", "\"en_US\"", "\"de\""] {
+        let tbl = unique_table_name("ddl_coll_bad");
+        let sql = format!(
+            "CREATE TABLE {tbl} (id INTEGER NOT NULL, s VARCHAR COLLATE {collation}) {CREATE_OPTS}"
+        );
+        let err = assert_sqlstate(&client, &sql, SQLSTATE_FEATURE_NOT_SUPPORTED).await;
+        assert!(
+            err.message().contains("\"s\""),
+            "the refusal must name the column: {}",
+            err.message()
+        );
+        // Refused before the catalog was touched, so the name is free for the retry.
+        execute(&client, &format!("DROP TABLE IF EXISTS {tbl}"))
+            .await
+            .expect("a refused CREATE TABLE must leave no table behind");
+    }
+
+    // And the same rule on the way in through ALTER TABLE, which broadcasts to the same
+    // shards.
+    let tbl = create_table(
+        &client,
+        "ddl_coll_alter",
+        &format!("(id INTEGER NOT NULL, s VARCHAR) {CREATE_OPTS}"),
+    )
+    .await;
+    assert_sqlstate(
+        &client,
+        &format!("ALTER TABLE {tbl} ADD COLUMN t VARCHAR COLLATE nocase"),
+        SQLSTATE_FEATURE_NOT_SUPPORTED,
+    )
+    .await;
+    execute(
+        &client,
+        &format!("ALTER TABLE {tbl} ADD COLUMN t VARCHAR COLLATE \"C\""),
+    )
+    .await
+    .expect("byte order is the collation the column would have had anyway");
+    drop_table(&client, &tbl).await;
+
+    // A table whose columns name byte order builds, stores and orders like any other: the
+    // clause is accepted because it is a no-op, not because it is ignored.
+    let tbl = create_table(
+        &client,
+        "ddl_coll_ok",
+        &format!(
+            "(id INTEGER NOT NULL, s VARCHAR COLLATE \"C\", t VARCHAR COLLATE ucs_basic) \
+             {CREATE_OPTS}"
+        ),
+    )
+    .await;
+    execute(
+        &client,
+        &format!("INSERT INTO {tbl} (id, s, t) VALUES (1, 'B', 'b'), (2, 'a', 'A')"),
+    )
+    .await
+    .unwrap();
+    let rows = simple_query_rows(&client, &format!("SELECT s FROM {tbl} ORDER BY s"))
+        .await
+        .unwrap();
+    let got: Vec<&str> = rows.iter().map(|r| r[0].as_deref().unwrap()).collect();
+    assert_eq!(
+        got,
+        vec!["B", "a"],
+        "byte order sorts every capital before every lowercase letter"
+    );
+    drop_table(&client, &tbl).await;
+}
+
 // ============================================================================
 // ALTER TABLE — row 6 (🟡 column ops + RENAME TO)
 // ============================================================================
@@ -388,6 +466,98 @@ async fn test_alter_table_add_unique_constraint_on_the_shard_key() {
         .unwrap_or_else(|e| panic!("the duplicate on the shard of id {id} must be accepted: {e}"));
     }
     assert_eq!(row_count(&client, &tbl).await, 2 * ids.len() as i64);
+
+    drop_table(&client, &tbl).await;
+}
+
+// An index used to freeze a table's columns: the shards' engine treats one as a
+// dependency on the whole table and refuses to alter a column no index even covers.
+// The column change is shipped around it instead — every index off, the change, the
+// surviving indexes back on, as one transaction per shard — so a table that has been
+// indexed can still evolve. What that rebuild cannot carry is refused by name in
+// `sql_command_unsupported.rs`: a retype of an indexed column, and a unique index.
+#[tokio::test]
+async fn test_a_column_change_is_shipped_around_an_index() {
+    let client = ready_client().await;
+    let tbl = create_table(
+        &client,
+        "ddl_index_rebuild",
+        &format!("(id INTEGER NOT NULL, v VARCHAR, extra INTEGER) {CREATE_OPTS}"),
+    )
+    .await;
+
+    let ids = ids_across_shards(1);
+    for id in &ids {
+        execute(
+            &client,
+            &format!("INSERT INTO {tbl} (id, v, extra) VALUES ({id}, 'v{id}', 1)"),
+        )
+        .await
+        .unwrap();
+    }
+
+    let idx = unique_table_name("ddl_index_rebuild_i");
+    execute(&client, &format!("CREATE INDEX {idx} ON {tbl} (v)"))
+        .await
+        .unwrap();
+
+    // A column the index does not cover: retyped, made NOT NULL and back, renamed,
+    // dropped. Every one of these used to come back naming the index.
+    for sql in [
+        format!("ALTER TABLE {tbl} ALTER COLUMN extra TYPE BIGINT"),
+        format!("ALTER TABLE {tbl} ALTER COLUMN extra SET NOT NULL"),
+        format!("ALTER TABLE {tbl} ALTER COLUMN extra DROP NOT NULL"),
+        format!("ALTER TABLE {tbl} RENAME COLUMN extra TO extra2"),
+        format!("ALTER TABLE {tbl} DROP COLUMN extra2"),
+    ] {
+        execute(&client, &sql)
+            .await
+            .unwrap_or_else(|e| panic!("`{sql}` must be shipped around the index: {e}"));
+    }
+    assert_eq!(row_count(&client, &tbl).await, ids.len() as i64);
+
+    // The indexed column itself renames, and the index follows it to the new name.
+    // The *next* column change is what proves it: the rebuild names the index's
+    // columns as the catalog records them, so a stale record would build an index on
+    // a column the shards no longer have.
+    execute(&client, &format!("ALTER TABLE {tbl} RENAME COLUMN v TO w"))
+        .await
+        .expect("an indexed column must be renameable");
+    execute(
+        &client,
+        &format!("ALTER TABLE {tbl} ADD COLUMN tag VARCHAR"),
+    )
+    .await
+    .unwrap();
+    execute(&client, &format!("ALTER TABLE {tbl} DROP COLUMN tag"))
+        .await
+        .expect("the index must be rebuildable from what the rename recorded");
+
+    // The rows read back under the new name, so nothing was rewritten on the way.
+    let rows = simple_query_rows(&client, &format!("SELECT w FROM {tbl} ORDER BY w"))
+        .await
+        .unwrap();
+    let expected: Vec<String> = {
+        let mut names: Vec<String> = ids.iter().map(|id| format!("v{id}")).collect();
+        names.sort();
+        names
+    };
+    assert_eq!(
+        rows.iter()
+            .map(|r| r[0].clone().unwrap())
+            .collect::<Vec<_>>(),
+        expected
+    );
+
+    // Dropping the index leaves nothing to rebuild, and the change is sent on its
+    // own again — including the two the rebuild could not carry.
+    execute(&client, &format!("DROP INDEX {idx}"))
+        .await
+        .unwrap();
+    execute(&client, &format!("ALTER TABLE {tbl} DROP COLUMN w"))
+        .await
+        .unwrap();
+    assert_eq!(row_count(&client, &tbl).await, ids.len() as i64);
 
     drop_table(&client, &tbl).await;
 }
@@ -579,6 +749,210 @@ async fn test_alter_table_rename_to_moves_the_table() {
     );
 
     drop_table(&client, &renamed).await;
+}
+
+// `ALTER TABLE … SET SCHEMA` is the table half of row 19. A relation's schema is
+// part of its catalog key *and* of every `{schema}_{table}_shard{n}` physical name,
+// so moving it between namespaces is the same work `RENAME TO` does — and it has to
+// pass the same test: every shard follows, the layout still routes, and the old key
+// stops resolving.
+#[tokio::test]
+async fn test_alter_table_set_schema_moves_the_table() {
+    let client = ready_client().await;
+    let (tbl, ids) = table_with_a_row_per_shard(&client, "ddl_setschema").await;
+    let schema = unique_table_name("ddl_setschema_ns");
+    let relation = tbl.rsplit('.').next().unwrap().to_string();
+    let moved = format!("{schema}.{relation}");
+
+    // The destination namespace has to exist, the rule `CREATE TABLE` follows: a
+    // table under a key no `search_path` resolves would be unreachable.
+    assert_sqlstate(
+        &client,
+        &format!("ALTER TABLE {tbl} SET SCHEMA {schema}"),
+        SQLSTATE_SCHEMA_NOT_FOUND,
+    )
+    .await;
+    execute(&client, &format!("CREATE SCHEMA {schema}"))
+        .await
+        .unwrap();
+
+    execute(&client, &format!("ALTER TABLE {tbl} SET SCHEMA {schema}"))
+        .await
+        .unwrap();
+
+    // Every shard's row is readable under the new key. The read is unfiltered because
+    // a qualified relation plus any `WHERE` or `ORDER BY` is a gap of its own — see
+    // `test_a_filtered_read_of_a_qualified_relation` — but the assertion is no weaker
+    // for it: one row per shard is named `v{id}`, so the set of values names the set of
+    // shards that followed the move.
+    let mut moved_rows = simple_query_rows(&client, &format!("SELECT v FROM {moved}"))
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| row[0].clone().unwrap())
+        .collect::<Vec<_>>();
+    moved_rows.sort();
+    let mut want = ids.iter().map(|id| format!("v{id}")).collect::<Vec<_>>();
+    want.sort();
+    assert_eq!(
+        moved_rows,
+        want,
+        "the move must take every shard with it, missing buckets: {:?}",
+        ids.iter()
+            .filter(|id| !moved_rows.contains(&format!("v{id}")))
+            .map(|id| bucket_of(*id))
+            .collect::<Vec<_>>()
+    );
+
+    // ...the shard layout still routes, so the moved table takes writes...
+    execute(
+        &client,
+        &format!("INSERT INTO {moved} (id, v) VALUES ({}, 'after')", ids[0]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(row_count(&client, &moved).await, ids.len() as i64 + 1);
+
+    // ...and the unqualified name no longer resolves.
+    assert!(
+        simple_query_rows(&client, &format!("SELECT v FROM {tbl}"))
+            .await
+            .is_err(),
+        "the pre-move name must stop resolving"
+    );
+
+    // Moving it where it already is changes nothing and says so, rather than
+    // renaming the shards onto themselves.
+    let err = assert_rejected(&client, &format!("ALTER TABLE {moved} SET SCHEMA {schema}")).await;
+    assert_eq!(
+        err.code().code(),
+        SQLSTATE_DUPLICATE_TABLE,
+        "got {}",
+        err.message()
+    );
+    assert!(
+        err.message().contains(&schema),
+        "the refusal must name the schema the table is already in, got: {}",
+        err.message()
+    );
+
+    // And back again: `public` is the default namespace, so the move home is a move
+    // to an unqualified key.
+    execute(&client, &format!("ALTER TABLE {moved} SET SCHEMA public"))
+        .await
+        .unwrap();
+    assert_eq!(row_count(&client, &tbl).await, ids.len() as i64 + 1);
+
+    drop_table(&client, &tbl).await;
+    execute(&client, &format!("DROP SCHEMA {schema}"))
+        .await
+        .unwrap();
+}
+
+// A move onto a relation name the destination namespace already uses is the same
+// duplicate-relation refusal a rename gets, and for the same reason: the occupant's
+// shards would be orphaned.
+#[tokio::test]
+async fn test_alter_table_set_schema_onto_an_existing_relation_is_refused() {
+    let client = ready_client().await;
+    let schema = unique_table_name("ddl_setschema_dup_ns");
+    execute(&client, &format!("CREATE SCHEMA {schema}"))
+        .await
+        .unwrap();
+
+    let src = create_table(
+        &client,
+        "ddl_setschema_dup",
+        &format!("(id INTEGER NOT NULL, v VARCHAR) {CREATE_OPTS}"),
+    )
+    .await;
+    let relation = src.rsplit('.').next().unwrap().to_string();
+    execute(
+        &client,
+        &format!("CREATE TABLE {schema}.{relation} (id INTEGER NOT NULL, v VARCHAR) {CREATE_OPTS}"),
+    )
+    .await
+    .unwrap();
+    execute(
+        &client,
+        &format!("INSERT INTO {schema}.{relation} (id, v) VALUES (1, 'kept')"),
+    )
+    .await
+    .unwrap();
+
+    let err = assert_rejected(&client, &format!("ALTER TABLE {src} SET SCHEMA {schema}")).await;
+    assert_eq!(
+        err.code().code(),
+        SQLSTATE_DUPLICATE_TABLE,
+        "got {}: {}",
+        err.code().code(),
+        err.message()
+    );
+
+    // Both relations survive with their own rows.
+    assert_eq!(row_count(&client, &src).await, 0);
+    let rows = simple_query_rows(&client, &format!("SELECT v FROM {schema}.{relation}"))
+        .await
+        .unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0][0].as_deref(), Some("kept"));
+
+    drop_table(&client, &src).await;
+    drop_table(&client, &format!("{schema}.{relation}")).await;
+    execute(&client, &format!("DROP SCHEMA {schema}"))
+        .await
+        .unwrap();
+}
+
+// Moving a relation and renaming it are two catalog re-keys, and PostgreSQL has no
+// statement that does both. A schema-qualified `RENAME TO` destination is therefore
+// read as the move it describes only when it keeps the relation name; one that also
+// renames is a syntax error rather than a half-honored guess.
+#[tokio::test]
+async fn test_a_qualified_rename_destination_that_also_renames_is_refused() {
+    let client = ready_client().await;
+    let tbl = create_table(
+        &client,
+        "ddl_qualified_rename",
+        &format!("(id INTEGER NOT NULL, v VARCHAR) {CREATE_OPTS}"),
+    )
+    .await;
+    let schema = unique_table_name("ddl_qualified_rename_ns");
+    execute(&client, &format!("CREATE SCHEMA {schema}"))
+        .await
+        .unwrap();
+
+    let err = assert_rejected(
+        &client,
+        &format!("ALTER TABLE {tbl} RENAME TO {schema}.something_else"),
+    )
+    .await;
+    assert_eq!(
+        err.code().code(),
+        SQLSTATE_SYNTAX_ERROR,
+        "got {}: {}",
+        err.code().code(),
+        err.message()
+    );
+    assert!(
+        err.message().contains("SET SCHEMA"),
+        "the refusal must name the statement that does the move, got: {}",
+        err.message()
+    );
+
+    // Nothing happened under either name.
+    assert_eq!(row_count(&client, &tbl).await, 0);
+    assert!(
+        simple_query_rows(&client, &format!("SELECT 1 FROM {schema}.something_else"))
+            .await
+            .is_err(),
+        "a refused statement must not create the destination"
+    );
+
+    drop_table(&client, &tbl).await;
+    execute(&client, &format!("DROP SCHEMA {schema}"))
+        .await
+        .unwrap();
 }
 
 // Renaming onto a name that is already taken must fail as a duplicate relation

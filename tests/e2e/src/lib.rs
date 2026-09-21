@@ -230,6 +230,10 @@ pub const SQLSTATE_DIVISION_BY_ZERO: &str = "22012";
 /// alternative to raising is wrapping, which a client cannot detect.
 pub const SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE: &str = "22003";
 
+/// `StringDataRightTruncation` — a value longer than the declared length of the
+/// character column it is being stored in.
+pub const SQLSTATE_STRING_DATA_RIGHT_TRUNCATION: &str = "22001";
+
 /// `InvalidParameterValue` — a syntactically valid argument the function refuses
 /// (`ntile(0)`, a negative `LIMIT`, an unrecognized `SET` value).
 pub const SQLSTATE_INVALID_PARAMETER_VALUE: &str = "22023";
@@ -254,6 +258,33 @@ pub const SQLSTATE_CANT_CHANGE_RUNTIME_PARAM: &str = "55P02";
 /// whole SQLSTATE on. Pinned rather than folded into `22023` because the alternative to
 /// raising is a column of NULLs a client reads as "the window had no such row".
 pub const SQLSTATE_INVALID_ARGUMENT_FOR_NTH_VALUE: &str = "22016";
+
+/// `GroupingError` — an aggregate somewhere aggregates are not evaluated: inside another
+/// aggregate, in `WHERE`, in `GROUP BY`. The statement is wrong and no retry will fix it,
+/// which is the whole difference from `XX000`.
+pub const SQLSTATE_GROUPING_ERROR: &str = "42803";
+
+/// `WindowingError` — a window function somewhere windows are not evaluated: nested in
+/// another window function, in `WHERE`, in `GROUP BY`, in `HAVING`. PostgreSQL's own class
+/// for the position, and the counterpart to [`SQLSTATE_GROUPING_ERROR`].
+pub const SQLSTATE_WINDOWING_ERROR: &str = "42P20";
+
+/// `UndefinedColumn` — the statement named a column the relation does not have. Pinned
+/// beside the two above as an over-reach probe: an error whose class was already right must
+/// keep it when a *transported* error's class is recovered.
+pub const SQLSTATE_UNDEFINED_COLUMN: &str = "42703";
+
+/// `UndefinedFunction` — **PostgreSQL has no such function either**, so the only fix is to
+/// edit the call. The one distinction a client acts on differently from
+/// [`SQLSTATE_FEATURE_NOT_SUPPORTED`]: `0A000` says a later VaireDB release will answer this
+/// statement, and `42883` says no release ever will because PostgreSQL does not answer it.
+pub const SQLSTATE_UNDEFINED_FUNCTION: &str = "42883";
+
+/// `NullValueNotAllowed` — a NULL reached an argument that has no NULL answer. PostgreSQL
+/// spends this class on exactly one thing in the format family, `format('%I', NULL)`, because
+/// an identifier has no null spelling: raising is the only alternative to writing `""`, which
+/// a client would paste back into SQL as a real, differently-named column.
+pub const SQLSTATE_NULL_VALUE_NOT_ALLOWED: &str = "22004";
 
 /// Assert `sql` fails with exactly `sqlstate`, and return the error. Stronger than
 /// [`assert_rejected`]: use it where the SQLSTATE is the contract, so a client can

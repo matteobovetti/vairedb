@@ -5,11 +5,11 @@
 | Strategy | Description |
 |----------|-------------|
 | **Hash sharding** | Rows assigned to shards via `hash(shard_key) % S` where `S` is the shard count. This is the only sharding strategy currently implemented. |
-| **Range sharding** *(planned)* | Rows assigned based on key ranges; better for range scans. Not yet implemented (see [Roadmap](roadmap.md)). |
+| **Range sharding** *(planned)* | Rows assigned based on key ranges; better for range scans. Not yet implemented (see [Roadmap](intenal-roadmap.md)). |
 
 **Shard granularity**
 
-Shard count and assignment are fixed at table creation time. The number of shards is determined by the initial configuration and does not change automatically. Online resharding (splitting or merging shards when they grow or shrink) is deferred to a future version (see [Roadmap](roadmap.md)).
+Shard count and assignment are fixed at table creation time. The number of shards is determined by the initial configuration and does not change automatically. Online resharding (splitting or merging shards when they grow or shrink) is deferred to a future version (see [Roadmap](intenal-roadmap.md)).
 
 **Integration with query routing**
 
@@ -25,7 +25,7 @@ The coordinator translates logical table references into shard-local DuckDB tabl
 | Parameter | Description |
 |-----------|-------------|
 | **Replication factor** | Number of copies of each shard. Defaults to a cluster-wide configured value, overridable per table at creation. `N` refers to the replication factor throughout this section. |
-| **Replica placement** | Primaries and replicas are distributed round-robin across the alive nodes. Rack/zone-aware placement to survive correlated failures is *planned* (see [Roadmap](roadmap.md)). |
+| **Replica placement** | Primaries and replicas are distributed round-robin across the alive nodes. Rack/zone-aware placement to survive correlated failures is *planned* (see [Roadmap](intenal-roadmap.md)). |
 
 DuckDB does not provide built-in WAL replication. All replication in VaireDB is handled at the application level.
 

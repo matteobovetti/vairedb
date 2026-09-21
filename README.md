@@ -8,7 +8,7 @@ Read the [When use VaireDB](#when-use-vairedb) section for understanding where
 VaireDB is best suited for your use cases.
 
 > [!IMPORTANT]  
-> VaireDB is currently in v0.1 and under active development. Breaking changes 
+> VaireDB is currently under active development. Breaking changes 
 > may occur and major features may be added.
 > Consider this a work in progress and not yet ready for production use.
 > Any contributions are welcome for targeting the production-ready v1.0 release.
@@ -105,17 +105,19 @@ All documentation lives under `docs/`, split into architecture references, featu
 |----------|-------------|
 | [Architecture Index](docs/specs/ARCHITECTURE.md) | Top-level index with references to all architecture sections |
 | [Overview](docs/specs/overview.md) | What VaireDB is and its high-level value proposition |
-| [Design Goals](docs/specs/design-goals.md) | Goals and non-goals for v0.1 |
+| [Design Goals](docs/specs/design-goals.md) | Goals and non-goals for the current version |
 | [System Architecture](docs/specs/system-architecture.md) | High-level topology and node types |
-| [Core Node](docs/specs/core-node.md) | Embedded DuckDB engine, storage, and query execution |
+| [Core Node (DuckDB)](docs/specs/core-node.md) | Embedded DuckDB engine, storage, and query execution |
 | [Coordinator Node](docs/specs/coordinator-node.md) | Query routing, distributed planning, and metadata catalog |
 | [Data Distribution](docs/specs/data-distribution.md) | Sharding strategy and replication |
-| [Cluster Coordination](docs/specs/cluster-coordination.md) | Node discovery, leader election, and failure detection |
-| [Communication Layer](docs/specs/communication-layer.md) | Protocols, wire formats, and client interface |
+| [Cluster Coordination](docs/specs/cluster-coordination.md) | Node discovery, leader election, failure detection |
+| [Communication Layer](docs/specs/communication-layer.md) | Protocols, wire formats, client interface |
 | [Distributed Query Processing](docs/specs/distributed-query-processing.md) | Query lifecycle and optimization |
-| [Transactions & Consistency](docs/specs/transactions-consistency.md) | Consistency model and distributed transactions |
-| [Fault Tolerance](docs/specs/fault-tolerance.md) | WAL, snapshotting, node recovery, and quorum |
-| [Roadmap](docs/specs/roadmap.md) | Roadmap to reach v1.0 |
+| [Transactions and Consistency](docs/specs/transactions-consistency.md) | Consistency model and distributed transactions |
+| [Fault Tolerance and Recovery](docs/specs/fault-tolerance.md) | WAL, snapshotting, node recovery, quorum |
+| [SQL Compatibility Status](docs/specs/sql-compatibility-status.md) | The per-axis status of PostgreSQL compatibility, summarized from the gap census |
+| [SQL Gap Analysis](docs/specs/gap-analysis.md) | What a PostgreSQL client cannot fully do against VaireDB today |
+| [Roadmap](docs/specs/internal-roadmap.md) | Roadmap for next releases |
 | [Glossary](docs/specs/glossary.md) | Term definitions |
 | [Links](docs/specs/links.md) | External references |
 
@@ -146,7 +148,7 @@ make build-release
 make check
 ```
 
-### Running Locally
+### Running Locally - Binary
 
 Start the coordinator:
 
@@ -164,6 +166,18 @@ Connect with any PostgreSQL client:
 
 ```bash
 psql -h localhost -p 5432
+```
+
+### Running Locally - Docker Compose
+
+Start a small VaireDB cluster (1 coordinator + 5 core node):
+```bash
+make e2e-up
+```
+
+Stop the small VaireDB cluster:
+```bash
+make e2e-down
 ```
 
 ### Configuration
@@ -239,6 +253,7 @@ make coverage
 | `anonymization` | Column pseudonymization: HMAC-SHA256 hashing and in-statement rewriting of declared columns before writes leave the coordinator |
 | `catalog` | Persistent metadata catalog (tables, shards, nodes, anonymization secrets) exposed as a store and as queryable virtual tables |
 | `channel_pool` | Connection pool for gRPC channels to core nodes |
+| `column_types` | Read-path mapping from a catalog-declared column type to the Arrow type (and PostgreSQL OID) the coordinator advertises for it |
 | `config` | YAML configuration loading |
 | `error` | Coordinator error types and their mapping to wire error codes |
 | `node_service` | gRPC `NodeService` (register/heartbeat/report) and the heartbeat-based failure detector |
@@ -261,6 +276,37 @@ make coverage
 | `table_provider` | Custom DataFusion ExecutionPlan that runs shard-local SQL against DuckDB shards |
 | `write_queue` | Bounded channel serializing writes to DuckDB |
 | `write_service` | gRPC service receiving DML from coordinator, with dedup cache and param conversion |
+
+**Shared** (`crates/vairedb-common/src/`):
+
+Code that must be identical on both sides of the wire. A distributed stage crosses the
+wire naming its functions, and the executor resolves those names in its own registry, so
+every function whose PostgreSQL semantics differ from the engine default is implemented
+once here and registered on every node that plans or executes a read.
+
+| Module | Responsibility |
+|--------|---------------|
+| `avg_udaf` | PostgreSQL-exact `avg` over integer columns: `numeric` at PostgreSQL's per-value division scale |
+| `bytea_in` | `bytea` text input conversion (`'\xDEADBEEF'::bytea` as four bytes, not ten) |
+| `config` | YAML configuration loading |
+| `error` | Error types, SQLSTATE mapping, message sanitization, and error codes carried across the Ballista scheduler boundary |
+| `float_div` | PostgreSQL floating-point division: `22012` for a zero divisor where IEEE 754 answers an infinity |
+| `json_agg` | `json_agg` and `jsonb_agg`, including their `ORDER BY` form |
+| `json_pg` | `json` / `jsonb` input conversion and the `->`, `->>`, `#>`, `#>>` accessors |
+| `not_in` | PostgreSQL three-valued `NOT IN` over a candidate list |
+| `nth_value` | `nth_value`, which rejects an offset of zero instead of answering NULL |
+| `ntile` | `ntile`, typed `integer` rather than DataFusion's `UInt64` |
+| `pg_datetime` | Datetime family: `age`, `make_timestamp`, `make_interval`, `isfinite`, `justify_*`, `clock_timestamp`, `timeofday` |
+| `pg_format` | String-building family: `format()`, `quote_literal()`, `quote_nullable()` |
+| `pg_format_type` | `format_type(oid, typemod)` with the argument spellings PostgreSQL accepts |
+| `pg_typeof` | `pg_typeof()` and the Arrow → PostgreSQL type-name table it needs |
+| `pg_udf` | `pg_catalog` scalar functions beyond what `datafusion-pg-catalog` registers |
+| `proto` | Protobuf-generated gRPC types, compiled from `proto/vairedb/v1/` by `build.rs` |
+| `scan_plan` | Cross-node scan-plan payload |
+| `stats_udaf` | Variance and standard deviation family, exact over an exact input |
+| `udaf` | Ordered-set aggregates `percentile_cont` and `percentile_disc` |
+| `uuid_in` | `uuid` input conversion, accepting PostgreSQL's alternative spellings |
+| `within_group` | Remaining `WITHIN GROUP` aggregates: `mode()` and the hypothetical-set family |
 
 ### Protobuf Definitions
 

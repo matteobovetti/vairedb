@@ -15,7 +15,7 @@ Registration is part of **establishing** the connection to the coordinator, not 
 ## Leader Election
 
 - Leader election applies only to **shard primary assignment** — selecting which core node is the primary for a given shard. Since the architecture uses a single coordinator, the coordinator assigns primaries directly and persists the assignment in the local metadata catalog (see [Metadata Catalog](coordinator-node.md#metadata-catalog-database-catalog)). No distributed consensus protocol is required.
-- Coordinator failover (and the consensus protocol it would require) is a future concern (see [Roadmap](roadmap.md)).
+- Coordinator failover (and the consensus protocol it would require) is a future concern (see [Roadmap](intenal-roadmap.md)).
 
 ## Failure Detection
 
@@ -37,4 +37,4 @@ The Ballista scheduler (on the coordinator) monitors executor health through its
 
 **Recovery scope**
 
-Recovery is limited to a **reconnect strategy** — VaireDB nodes attempt to re-establish lost gRPC connections (coordinator-to-core, scheduler-to-executor). Data-level recovery strategies (e.g. shard rebuild from replicas, automatic failover) are deferred to a future version (see [Roadmap](roadmap.md)).
+Recovery is limited to a **reconnect strategy** — VaireDB nodes attempt to re-establish lost gRPC connections (coordinator-to-core, scheduler-to-executor). Data-level recovery strategies (e.g. shard rebuild from replicas, automatic failover) are deferred to a future version (see [Roadmap](intenal-roadmap.md)).

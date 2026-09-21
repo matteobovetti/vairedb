@@ -69,6 +69,21 @@ enum VdbErrorCode {
   // column of NULLs that reads as "no such row" for every row (see § 2.7 of the
   // gap analysis).
   VDB_ERROR_CODE_INVALID_ARGUMENT_FOR_NTH_VALUE = 1024;
+  // A function name that exists with other argument types but not with the ones
+  // written, such as `count(a, b)`. Distinct from FEATURE_NOT_SUPPORTED (0A000):
+  // 0A000 says VaireDB has not implemented a form PostgreSQL has, 42883 says
+  // PostgreSQL does not have the form either, so a client that sees it should fix
+  // the call rather than wait for a release.
+  VDB_ERROR_CODE_UNDEFINED_FUNCTION = 1025;
+  // A NULL reached an argument that cannot represent one, such as the `%I`
+  // conversion of `format()`, which has no spelling for a null identifier. Its own
+  // code because the query is fine and one row's data was not.
+  VDB_ERROR_CODE_NULL_VALUE_NOT_ALLOWED = 1026;
+  // A date or time field outside the range a calendar has, such as
+  // `make_timestamp(2024, 2, 30, …)`. PostgreSQL refuses rather than rolling over into
+  // March, because a caller that computed the 30th of February has a bug the rollover
+  // would hide.
+  VDB_ERROR_CODE_DATETIME_FIELD_OVERFLOW = 1027;
 
   // Storage errors (2000-2999)
   VDB_ERROR_CODE_SHARD_NOT_FOUND = 2000;

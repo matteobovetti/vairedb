@@ -7,9 +7,11 @@
 //! partial broadcast failure; DROP and ALTER broadcast best-effort first and
 //! mutate the catalog only once every node was reached, so a failed command
 //! leaves the catalog unchanged. TRUNCATE changes no metadata at all.
-//! `ALTER TABLE ... RENAME TO` is the one ALTER that moves metadata rather than
-//! reshaping it, so it claims the destination name up front like CREATE TABLE
-//! does and undoes the renames it managed to apply if the broadcast fell short.
+//! `ALTER TABLE ... RENAME TO` and `ALTER TABLE ... SET SCHEMA` are the two ALTERs
+//! that move metadata rather than reshaping it — and they are the same move, because
+//! the schema qualifier folds into the physical per-shard name — so each claims the
+//! destination name up front like CREATE TABLE does and undoes the renames it
+//! managed to apply if the broadcast fell short.
 //! After any DDL that altered the catalog, the local and distributed DataFusion
 //! catalog views are refreshed.
 
@@ -32,6 +34,7 @@ use crate::pgwire_handler::error_enrichment::{
     ErrorContext, enrich_coordinator_error, make_vdb_error,
 };
 use crate::pgwire_handler::handler::VaireDbQueryHandler;
+use crate::pgwire_handler::indexes;
 use crate::pgwire_handler::query_router;
 use crate::pgwire_handler::schemas;
 use crate::pgwire_handler::session::SessionState;
@@ -225,14 +228,19 @@ impl VaireDbQueryHandler {
                                 format!("connection to node {} failed", node_id),
                             )
                         })?;
-                        send_ddl_to_node(channel, &write_id, &shard_sql, &shard_id)
-                            .await
-                            .map_err(|_| {
-                                make_vdb_error(
-                                    VdbErrorCode::NodeCommunicationError,
-                                    format!("DDL broadcast to node {} failed", node_id),
-                                )
-                            })?;
+                        send_ddl_to_node(
+                            channel,
+                            &write_id,
+                            std::slice::from_ref(&shard_sql),
+                            &shard_id,
+                        )
+                        .await
+                        .map_err(|_| {
+                            make_vdb_error(
+                                VdbErrorCode::NodeCommunicationError,
+                                format!("DDL broadcast to node {} failed", node_id),
+                            )
+                        })?;
                         successful_sends.push((
                             address.clone(),
                             drop_sql.clone(),
@@ -492,7 +500,9 @@ impl VaireDbQueryHandler {
                     continue;
                 }
             };
-            if let Err(re) = send_ddl_to_node(channel, &write_id, undo_sql, shard_id).await {
+            if let Err(re) =
+                send_ddl_to_node(channel, &write_id, std::slice::from_ref(undo_sql), shard_id).await
+            {
                 tracing::error!(
                     address = %address,
                     shard_id = %shard_id,
@@ -658,7 +668,7 @@ impl VaireDbQueryHandler {
         // Decided from the statement alone, before the catalog is read: a
         // malformed rename is a syntax error whether or not the table exists,
         // exactly as PostgreSQL reports it.
-        let plan = plan_alter(operations)?;
+        let plan = plan_alter(operations, &table_name)?;
 
         let alter_ctx = ErrorContext::for_table(&table_name);
 
@@ -677,11 +687,27 @@ impl VaireDbQueryHandler {
         };
 
         match plan {
-            // The destination is unqualified (a qualified one is refused in
-            // `plan_alter`), so it lands in the schema the table is already in: a
-            // rename renames, it does not move the table to another namespace.
-            AlterPlan::Rename(new_name) => {
-                let new_name = schemas::rename_within_schema(&table_name, &new_name);
+            // The destination is unqualified, so it lands in the schema the table is
+            // already in: a rename renames, it does not move the table to another
+            // namespace.
+            AlterPlan::Rename(new_relation) => {
+                let new_name = schemas::rename_within_schema(&table_name, &new_relation);
+                return self.rename_table(table_meta, &new_name).await;
+            }
+            // `SET SCHEMA`: the same relation name under another qualifier, which is
+            // the same catalog re-key and the same per-shard rename — the physical
+            // name folds the qualifier in, so moving a table between schemas *is*
+            // renaming its per-shard tables.
+            AlterPlan::SetSchema(new_name) => {
+                if new_name == table_name {
+                    return Err(make_vdb_error(
+                        VdbErrorCode::TableAlreadyExists,
+                        format!(
+                            "relation \"{table_name}\" is already in schema \"{}\"",
+                            query_router::schema_of(&table_name)
+                        ),
+                    ));
+                }
                 return self.rename_table(table_meta, &new_name).await;
             }
             AlterPlan::AddConstraint {
@@ -698,6 +724,13 @@ impl VaireDbQueryHandler {
             AlterPlan::ColumnOps => {}
         }
 
+        // The indexes as they stand before the change, which is what has to come off
+        // the shards for the engine to accept it. `apply_alter_operation` then edits
+        // the list — a dropped column takes its indexes with it, a renamed one carries
+        // them to its new name — so `table_meta.indexes` afterwards is what goes back
+        // on.
+        let indexes_before = table_meta.indexes.clone();
+
         for op in operations {
             apply_alter_operation(&mut table_meta, op)?;
         }
@@ -712,13 +745,25 @@ impl VaireDbQueryHandler {
             .get_node_address_map()
             .map_err(|e| enrich_coordinator_error(&e, &alter_ctx, &self.catalog))?;
 
+        // An index is a dependency on the whole table for the shards' engine, so a
+        // column change on an indexed table is shipped as drop-alter-recreate in one
+        // transaction per shard rather than as the bare ALTER. Whatever cannot be
+        // carried that way was already refused by `apply_alter_operation`.
         let failed = self
-            .broadcast_ddl_best_effort(
+            .broadcast_ddl_batch_best_effort(
                 &shards,
                 &node_addresses,
                 "ALTER TABLE",
                 &table_name,
-                |shard| shard_local_ddl_sql(stmt, shard),
+                |shard| {
+                    indexes::shard_local_alter_with_index_rebuild(
+                        &indexes_before,
+                        &table_meta.indexes,
+                        shard_local_ddl_sql(stmt, shard),
+                        &table_name,
+                        shard.hash_bucket,
+                    )
+                },
             )
             .await;
         fail_if_unreachable("ALTER TABLE", failed)?;
@@ -761,8 +806,11 @@ impl VaireDbQueryHandler {
         // The shards' engine treats an index as a dependency on the table and
         // refuses to rename one that has any, so the broadcast would fail on every
         // node after the destination name was already claimed. Refused up front
-        // instead, naming what to drop — the same rule the column changes follow
-        // (`reject_if_indexed`). A constraint VaireDB enforces with a per-shard
+        // instead, naming what to drop. A column change ships around its indexes by
+        // rebuilding them in the same transaction, which a rename cannot borrow: the
+        // physical index name folds the table name in, so the rebuild would have to
+        // rename the indexes too, inside a broadcast that is already not atomic and
+        // has an undo path of its own. A constraint VaireDB enforces with a per-shard
         // index counts, and is removed by a statement of its own.
         let blocking: Vec<String> = table_meta
             .indexes
@@ -793,6 +841,12 @@ impl VaireDbQueryHandler {
                 ),
             ));
         }
+
+        // The destination's namespace has to exist, the same rule `CREATE TABLE`
+        // follows: a `SET SCHEMA` naming a schema nobody created would otherwise
+        // leave the table under a key no `search_path` resolves. A rename inside the
+        // table's own schema passes trivially.
+        self.require_schema_exists(new_name, &rename_ctx)?;
 
         // The destination's physical name has to be free too — it is the name the
         // per-shard tables are renamed to, and a rename inside a schema can collide
@@ -900,7 +954,10 @@ impl VaireDbQueryHandler {
                         continue;
                     }
                 };
-                if let Err(e) = send_ddl_to_node(channel, &write_id, &rename_sql, &from).await {
+                if let Err(e) =
+                    send_ddl_to_node(channel, &write_id, std::slice::from_ref(&rename_sql), &from)
+                        .await
+                {
                     tracing::error!("RENAME TO broadcast to node {node_id} failed: {e}");
                     failed_nodes.push(node_id.clone());
                     continue;
@@ -940,6 +997,33 @@ impl VaireDbQueryHandler {
         table_name: &str,
         make_shard_sql: impl Fn(&ShardMeta) -> String,
     ) -> Vec<String> {
+        self.broadcast_ddl_batch_best_effort(
+            shards,
+            node_addresses,
+            op_label,
+            table_name,
+            |shard| vec![make_shard_sql(shard)],
+        )
+        .await
+    }
+
+    /// Broadcast a per-shard *sequence* of DDL statements to every replica of every
+    /// shard, best-effort, applying the sequence as **one transaction per node**.
+    ///
+    /// The sequence is what lets a statement the shards' engine refuses on its own
+    /// terms be shipped as the steps that are equivalent to it — an index taken off,
+    /// a column changed, the index put back — without any node ever being left in an
+    /// intermediate state: either every statement of the node's sequence took effect
+    /// or none did. Across shards it is still best-effort, like every other
+    /// broadcast, and the returned node IDs are what the caller decides on.
+    pub(super) async fn broadcast_ddl_batch_best_effort(
+        &self,
+        shards: &[ShardMeta],
+        node_addresses: &HashMap<String, String>,
+        op_label: &str,
+        table_name: &str,
+        make_shard_sql: impl Fn(&ShardMeta) -> Vec<String>,
+    ) -> Vec<String> {
         let mut failed_nodes: Vec<String> = Vec::new();
         for shard in shards {
             let shard_sql = make_shard_sql(shard);
@@ -978,7 +1062,9 @@ impl VaireDbQueryHandler {
             ("distributed", &self.session_ctx),
             ("local", &self.local_ctx),
         ] {
-            let table_ref = datafusion::common::TableReference::bare(table_name.to_string());
+            // The same reference `refresh_catalog_tables` registered, or the drop silently
+            // misses: a qualified relation lives under a two-part name.
+            let table_ref = query_router::table_reference(table_name);
             if let Err(e) = ctx.deregister_table(table_ref) {
                 tracing::warn!(
                     "failed to deregister table '{}' from the {} DataFusion session: {}",
@@ -1019,8 +1105,14 @@ struct RenameBroadcast {
 /// [`VaireDbQueryHandler::handle_alter_table`] to do.
 #[derive(Debug, PartialEq)]
 enum AlterPlan {
-    /// `RENAME TO`: move the table to this canonical name, changing no schema.
+    /// `RENAME TO`: give the table this relation name, inside the schema it is
+    /// already in.
     Rename(String),
+    /// `SET SCHEMA`: keep the relation name and move it to this canonical key in
+    /// another schema. Reached as a schema-qualified `RENAME TO` destination, which
+    /// is how [`crate::pgwire_handler::schemas::parse_alter_table_set_schema`]
+    /// respells the statement.
+    SetSchema(String),
     /// `ADD CONSTRAINT`: give the table a constraint, enforced by an object of its
     /// own on every shard — see [`crate::pgwire_handler::constraints`].
     AddConstraint {
@@ -1057,14 +1149,19 @@ fn standalone_label(op: &AlterTableOperation) -> Option<&'static str> {
 /// statement either — `RENAME` is its own `ALTER TABLE` form, so a list mixing it
 /// with other actions is a syntax error there and here; a constraint change is
 /// refused in a mixed list for the stronger reason that the parts would be applied
-/// by different broadcasts, with no way to undo the first if the second failed. A
-/// rename's destination may not be schema-qualified: as in PostgreSQL, a rename stays
-/// inside the table's existing schema, so a qualifier could only agree with that
-/// schema or contradict it.
+/// by different broadcasts, with no way to undo the first if the second failed.
 ///
-/// Pure, so the rules that decide whether a statement re-keys a table are testable
-/// without a catalog.
-fn plan_alter(operations: &[AlterTableOperation]) -> PgWireResult<AlterPlan> {
+/// A schema-qualified destination is read as `ALTER TABLE ... SET SCHEMA`, which is
+/// the statement [`crate::pgwire_handler::schemas::parse_alter_table_set_schema`]
+/// respells into exactly this shape — so the qualifier is honored only when it
+/// changes nothing but the namespace. A qualified destination that *also* changes the
+/// relation name is refused (`42601`) rather than read as a move plus a rename:
+/// PostgreSQL has no such statement, and the two halves are two statements there.
+///
+/// `table_name` is the canonical key of the table being altered, needed for exactly
+/// that comparison. Pure, so the rules that decide whether a statement re-keys a
+/// table are testable without a catalog.
+fn plan_alter(operations: &[AlterTableOperation], table_name: &str) -> PgWireResult<AlterPlan> {
     // Operations that name a constraint by kind rather than by name reach the
     // shards' engine as something it rejects, so they are named here instead.
     if let Some(err) = operations
@@ -1091,23 +1188,31 @@ fn plan_alter(operations: &[AlterTableOperation]) -> PgWireResult<AlterPlan> {
 
     match op {
         // `AS` is MySQL's spelling of the same operation; both name the destination.
-        AlterTableOperation::RenameTable { table_name } => {
-            let new_name = match table_name {
+        AlterTableOperation::RenameTable {
+            table_name: destination,
+        } => {
+            let destination = match destination {
                 RenameTableNameKind::To(name) | RenameTableNameKind::As(name) => name,
             };
-            if new_name.0.len() > 1 {
-                return Err(make_vdb_error(
-                    VdbErrorCode::SqlSyntaxError,
-                    "the new name in ALTER TABLE ... RENAME TO may not be schema-qualified",
-                ));
-            }
-            let new_name = query_router::canonical_table_name(new_name).ok_or_else(|| {
+            let qualified = destination.0.len() > 1;
+            let destination = query_router::canonical_table_name(destination).ok_or_else(|| {
                 make_vdb_error(
                     VdbErrorCode::SqlSyntaxError,
                     "could not determine the new table name",
                 )
             })?;
-            Ok(AlterPlan::Rename(new_name))
+            if !qualified {
+                return Ok(AlterPlan::Rename(destination));
+            }
+            if query_router::relation_of(&destination) != query_router::relation_of(table_name) {
+                return Err(make_vdb_error(
+                    VdbErrorCode::SqlSyntaxError,
+                    "the new name in ALTER TABLE ... RENAME TO may not be schema-qualified unless \
+                     it keeps the relation name, which is what ALTER TABLE ... SET SCHEMA does; \
+                     move the relation and rename it with two statements",
+                ));
+            }
+            Ok(AlterPlan::SetSchema(destination))
         }
         AlterTableOperation::AddConstraint {
             constraint,
@@ -1356,14 +1461,17 @@ fn shard_local_ddl_sql(stmt: &Statement, shard: &ShardMeta) -> String {
     write_sql_cl::statement_to_sql(&ddl_stmt)
 }
 
-/// Send a single shard-local DDL statement to one node over its `WriteService`
-/// gRPC channel. `write_id` lets the node dedup retries. Returns `Err` with a
-/// formatted message on transport failure or if the node reports the write
-/// failed.
+/// Send one shard's DDL sequence to one node over its `WriteService` gRPC channel.
+/// `write_id` lets the node dedup retries. Returns `Err` with a formatted message
+/// on transport failure or if the node reports any statement failed.
+///
+/// A sequence of more than one statement is sent `atomic`, so the node applies it
+/// inside a transaction and a failure part-way leaves the shard untouched; a single
+/// statement is sent on its own, which is the same request every other DDL makes.
 async fn send_ddl_to_node(
     channel: Channel,
     write_id: &str,
-    sql: &str,
+    sql: &[String],
     shard_id: &str,
 ) -> Result<(), String> {
     use vairedb_common::proto::vairedb::v1::{
@@ -1375,13 +1483,16 @@ async fn send_ddl_to_node(
 
     let request = tonic::Request::new(ExecuteWriteRequest {
         write_id: write_id.to_string(),
-        statements: vec![WriteStatement {
-            sql: sql.to_string(),
-            shard_id: shard_id.to_string(),
-            operation: WriteOperation::Unspecified.into(),
-            params: vec![],
-        }],
-        atomic: false,
+        statements: sql
+            .iter()
+            .map(|one| WriteStatement {
+                sql: one.clone(),
+                shard_id: shard_id.to_string(),
+                operation: WriteOperation::Unspecified.into(),
+                params: vec![],
+            })
+            .collect(),
+        atomic: sql.len() > 1,
     });
 
     let response = client
@@ -1390,9 +1501,9 @@ async fn send_ddl_to_node(
         .map_err(|e| format!("[{}] {}", e.code(), e.message()))?;
     let resp = response.into_inner();
 
-    if let Some(result) = resp.results.first()
-        && !result.success
-    {
+    // Every result, not just the first: an atomic batch reports the statement that
+    // aborted it, and that is not necessarily the one at the front.
+    if let Some(result) = resp.results.iter().find(|result| !result.success) {
         let msg = result
             .error
             .as_ref()
@@ -1615,14 +1726,29 @@ mod tests {
 
     // --- ALTER TABLE: rename vs. reshape ---
 
+    /// The canonical target name and operation list of a parsed `ALTER TABLE`. The
+    /// name is needed because a schema-qualified `RENAME TO` destination is read
+    /// against it.
+    fn parse_alter(sql: &str) -> (String, Vec<AlterTableOperation>) {
+        match parse_one(sql) {
+            Statement::AlterTable(alter) => (
+                query_router::canonical_table_name(&alter.name).expect("a plain table name"),
+                alter.operations,
+            ),
+            other => panic!("expected ALTER TABLE, got {other:?}"),
+        }
+    }
+
     /// The plan a `ALTER TABLE` operation list produces.
     fn alter_plan(sql: &str) -> AlterPlan {
-        plan_alter(&parse_alter_ops(sql)).unwrap_or_else(|e| panic!("`{sql}` must plan: {e}"))
+        let (name, ops) = parse_alter(sql);
+        plan_alter(&ops, &name).unwrap_or_else(|e| panic!("`{sql}` must plan: {e}"))
     }
 
     /// The SQLSTATE and message a rejected `ALTER TABLE` plan reports.
     fn alter_rejection(sql: &str) -> (String, String) {
-        user_error(plan_alter(&parse_alter_ops(sql)).expect_err("`{sql}` must be rejected"))
+        let (name, ops) = parse_alter(sql);
+        user_error(plan_alter(&ops, &name).expect_err("`{sql}` must be rejected"))
     }
 
     #[test]
@@ -1672,19 +1798,37 @@ mod tests {
             parse_alter_ops("ALTER TABLE orders RENAME TO archived_orders").remove(0),
             parse_alter_ops("ALTER TABLE orders ADD COLUMN status VARCHAR").remove(0),
         ];
-        let (code, msg) = user_error(plan_alter(&ops).expect_err("mixed actions must be rejected"));
+        let (code, msg) =
+            user_error(plan_alter(&ops, "orders").expect_err("mixed actions must be rejected"));
         assert_eq!(code, "42601");
         assert!(msg.contains("RENAME TO"), "{msg}");
     }
 
-    // A rename stays in the table's schema, so a qualifier is either redundant or a
-    // request to move the table — and honoring it as the former silently would rename
-    // the table to something the client did not ask for.
+    // A qualified destination that keeps the relation name is what
+    // `schemas::parse_alter_table_set_schema` respells `SET SCHEMA` into, and is read
+    // as the move it is. `public` carries no qualifier in a catalog key, so a move
+    // *into* the default schema is a plain key.
     #[test]
-    fn a_schema_qualified_rename_destination_is_a_syntax_error() {
-        let (code, msg) = alter_rejection("ALTER TABLE orders RENAME TO myschema.orders");
+    fn a_qualified_rename_destination_is_a_schema_move() {
+        assert_eq!(
+            alter_plan("ALTER TABLE orders RENAME TO sales.orders"),
+            AlterPlan::SetSchema("sales.orders".to_string())
+        );
+        assert_eq!(
+            alter_plan("ALTER TABLE sales.orders RENAME TO public.orders"),
+            AlterPlan::SetSchema("orders".to_string())
+        );
+    }
+
+    // A qualifier that also changes the relation name is two statements in
+    // PostgreSQL and two here: moving and renaming are two catalog re-keys, and
+    // reading one statement as both would rename the table to something the client
+    // did not ask for if only half of it were honored.
+    #[test]
+    fn a_qualified_rename_that_also_renames_is_a_syntax_error() {
+        let (code, msg) = alter_rejection("ALTER TABLE orders RENAME TO myschema.invoices");
         assert_eq!(code, "42601");
-        assert!(msg.contains("schema-qualified"), "{msg}");
+        assert!(msg.contains("SET SCHEMA"), "{msg}");
     }
 
     // A constraint change builds or drops one object per shard, so it cannot ride
@@ -1750,7 +1894,7 @@ mod tests {
                 parse_alter_ops("ALTER TABLE orders ADD COLUMN status VARCHAR").remove(0),
             ];
             let (code, msg) =
-                user_error(plan_alter(&ops).expect_err("mixed actions must be rejected"));
+                user_error(plan_alter(&ops, "orders").expect_err("mixed actions must be rejected"));
             assert_eq!(code, "42601", "`{first}`");
             assert!(msg.contains(expected), "`{first}`: {msg}");
         }

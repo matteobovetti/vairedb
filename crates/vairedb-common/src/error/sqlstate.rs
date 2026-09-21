@@ -32,6 +32,9 @@ pub fn sqlstate_for_code(code: VdbErrorCode) -> &'static str {
         VdbErrorCode::GroupingError => "42803",
         VdbErrorCode::WindowingError => "42P20",
         VdbErrorCode::InvalidArgumentForNthValue => "22016",
+        VdbErrorCode::UndefinedFunction => "42883",
+        VdbErrorCode::NullValueNotAllowed => "22004",
+        VdbErrorCode::DatetimeFieldOverflow => "22008",
         VdbErrorCode::ShardNotFound => "42P01",
         VdbErrorCode::WriteConflict => "40001",
         VdbErrorCode::EngineError => "XX000",
@@ -167,6 +170,42 @@ mod tests {
         );
     }
 
+    // The distinction a client acts on differently: `0A000` means "PostgreSQL has this
+    // form and VaireDB does not yet", so waiting for a release is rational; `42883` means
+    // "PostgreSQL does not have it either", so only editing the call helps. `count(a, b)`
+    // is the second, and reporting it as the first sends the client to the wrong place.
+    #[test]
+    fn maps_a_call_postgresql_does_not_have_to_the_undefined_function_sqlstate() {
+        assert_eq!(sqlstate_for_code(VdbErrorCode::UndefinedFunction), "42883");
+        assert_ne!(
+            sqlstate_for_code(VdbErrorCode::UndefinedFunction),
+            sqlstate_for_code(VdbErrorCode::FeatureNotSupported)
+        );
+    }
+
+    // A NULL where the value has to be rendered as an identifier has no spelling at all,
+    // so PostgreSQL refuses rather than emitting something. `22004` says one row's data
+    // was null; `22023` would say the argument was the wrong *kind* of value, which is a
+    // different fix.
+    #[test]
+    fn maps_a_null_that_cannot_be_rendered_to_its_own_data_error() {
+        assert_eq!(
+            sqlstate_for_code(VdbErrorCode::NullValueNotAllowed),
+            "22004"
+        );
+    }
+
+    // The 30th of February is a caller's arithmetic bug, and `22008` is what tells them so.
+    // `22003` would say the number was too large for its type, which is a different
+    // investigation: every field of `make_timestamp(2024, 2, 30, …)` fits in an `integer`.
+    #[test]
+    fn maps_an_impossible_calendar_field_to_the_datetime_overflow_sqlstate() {
+        assert_eq!(
+            sqlstate_for_code(VdbErrorCode::DatetimeFieldOverflow),
+            "22008"
+        );
+    }
+
     // A guard on the map itself rather than on any one code: `sqlstate_for_code`
     // matches exhaustively, so a new proto variant cannot be forgotten here — but it
     // *can* be mapped to `XX000` by copying a neighbouring arm, which is the mistake
@@ -187,6 +226,9 @@ mod tests {
             VdbErrorCode::GroupingError,
             VdbErrorCode::WindowingError,
             VdbErrorCode::InvalidArgumentForNthValue,
+            VdbErrorCode::UndefinedFunction,
+            VdbErrorCode::NullValueNotAllowed,
+            VdbErrorCode::DatetimeFieldOverflow,
         ] {
             assert!(!internal.contains(&code));
             assert_ne!(

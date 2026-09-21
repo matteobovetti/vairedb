@@ -37,6 +37,10 @@ tokio-stream = "0.1"
 # The copy sub-protocol's payload type: pgwire takes `CopyData::new(Bytes)` but does
 # not re-export `bytes`, so the COPY path needs it by name.
 bytes = "1"
+# `ToSql`, for the cells VaireDB writes to the wire itself rather than through arrow-pg —
+# see `pgwire_handler::wire_types`. pgwire takes the trait but does not re-export the crate
+# that defines it, and there is one version of it in the tree, so this is pgwire's own.
+postgres-types = "0.2"
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread", "net", "time"] }

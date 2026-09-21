@@ -10,9 +10,9 @@ use crate::pgwire_handler::pg_operators::{is_byte_order_collation, similar_to_re
 use crate::pgwire_handler::pg_subscripts::clamp_to_pg_semantics;
 use crate::sqlparser::ast::{
     AlterColumnOperation, AlterTableOperation, ArrayElemTypeDef, BinaryOperator, CaseWhen,
-    CastKind, CreateTableOptions, DataType, Expr, Function, FunctionArg, FunctionArgExpr,
-    FunctionArgumentList, FunctionArguments, Ident, MergeClauseKind, ObjectName, ObjectNamePart,
-    OrderByOptions, Statement, UnaryOperator, Value, ValueWithSpan,
+    CastKind, ColumnDef, ColumnOption, CreateTableOptions, DataType, Expr, Function, FunctionArg,
+    FunctionArgExpr, FunctionArgumentList, FunctionArguments, Ident, MergeClauseKind, ObjectName,
+    ObjectNamePart, OrderByOptions, Statement, UnaryOperator, Value, ValueWithSpan,
     helpers::attached_token::AttachedToken, visit_expressions_mut,
 };
 
@@ -22,6 +22,7 @@ pub fn transform_to_duckdb(stmt: &mut Statement) {
         Statement::CreateTable(create) => {
             for col in &mut create.columns {
                 transform_data_type(&mut col.data_type);
+                strip_column_collation(col);
             }
             create.table_options = CreateTableOptions::None;
         }
@@ -51,6 +52,7 @@ pub fn transform_to_duckdb(stmt: &mut Statement) {
                 match op {
                     AlterTableOperation::AddColumn { column_def, .. } => {
                         transform_data_type(&mut column_def.data_type);
+                        strip_column_collation(column_def);
                     }
                     AlterTableOperation::AlterColumn {
                         op: AlterColumnOperation::SetDataType { data_type, .. },
@@ -101,6 +103,21 @@ pub fn transform_to_duckdb(stmt: &mut Statement) {
         }
         _ => {}
     }
+}
+
+/// Drop a column's `COLLATE` clause, for the same reason the expression-level one is
+/// dropped: it names byte order, which is the comparison the shard already performs,
+/// and DuckDB has no collation by any of PostgreSQL's names for it.
+///
+/// Anything other than byte order is refused when the DDL is planned
+/// ([`crate::pgwire_handler::table_meta_ops`]), so by the time a statement reaches here
+/// the clause is either absent or a no-op — this never discards an ordering a client
+/// would have got. The guard is kept anyway so the two rules cannot drift apart.
+fn strip_column_collation(col: &mut ColumnDef) {
+    col.options.retain(|option| match &option.option {
+        ColumnOption::Collation(collation) => !is_byte_order_collation(collation),
+        _ => true,
+    });
 }
 
 /// Rewrite the expressions DuckDB reads differently from PostgreSQL into DuckDB

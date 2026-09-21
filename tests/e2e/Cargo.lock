@@ -758,6 +758,7 @@ dependencies = [
  "chrono",
  "fallible-iterator",
  "postgres-protocol",
+ "uuid",
 ]
 
 [[package]]
@@ -1307,6 +1308,7 @@ dependencies = [
  "sha2 0.10.9",
  "tokio",
  "tokio-postgres",
+ "uuid",
  "xxhash-rust",
 ]
 
