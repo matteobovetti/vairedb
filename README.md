@@ -1,8 +1,9 @@
 # VaireDB
 
-VaireDB is a cloud native, distributed SQL database that combines PostgreSQL 
-wire compatibility, with DuckDB's columnar vectorized execution engine for 
-high-throughput analytical workloads across a horizontally scalable cluster.
+VaireDB is a multi-instance DuckDB coordinator with builtin distributed query engine provided 
+by Datafusion & Balista. Also combile PostgreSQL wire compatibility, with 
+DuckDB's columnar vectorized execution engine for high-throughput analytical 
+workloads across a horizontally scalable cluster.
 
 Read the [When use VaireDB](#when-use-vairedb) section for understanding where 
 VaireDB is best suited for your use cases.
