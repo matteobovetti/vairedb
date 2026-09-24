@@ -675,7 +675,7 @@ fn rename_hypothetical_set_aggregate(func: &mut Function) {
 
 /// Refuse a percentile whose fraction is a literal outside 0..1, here rather than there.
 ///
-/// The UDAFs check the fraction themselves ([`vairedb_common::udaf`]) and have to — it
+/// The UDAFs check the fraction themselves ([`vairedb_common::within_group`]) and have to — it
 /// need not be a literal the coordinator can see. But that check runs where the
 /// aggregate runs, on an executor, so what reaches the client is a *job* failure that
 /// wraps the reason in a stage number and a `DataFusionError(Execution(...))` debug

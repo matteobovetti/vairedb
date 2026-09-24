@@ -113,6 +113,7 @@ use datafusion::common::ScalarValue;
 use datafusion::common::tree_node::{TreeNodeRecursion, TreeNodeVisitor};
 use datafusion::logical_expr::{Expr, Join, JoinType, LogicalPlan};
 use pgwire::error::{PgWireError, PgWireResult};
+use vairedb_common::pg_typeof::pg_type_name;
 use vairedb_common::proto::vairedb::v1::VdbErrorCode;
 
 use crate::pgwire_handler::error_enrichment::make_vdb_error;
@@ -295,6 +296,12 @@ fn check_branches(operator: &str, branches: &[&LogicalPlan], names: &[&str]) -> 
 /// `42804`, naming the operator and both types the way PostgreSQL's own message does, and the
 /// column whose branches disagree — which PostgreSQL's message leaves out and a wide set
 /// operation needs.
+///
+/// The types are named by [`pg_type_name`], the same table `pg_typeof` and `format_type`
+/// answer from, because "the way PostgreSQL's own message does" is `integer` and not the
+/// catalog spelling `int4`. Deriving the name here from the pgwire `Type` instead — which is
+/// what this did — put the catalog name in the sentence, and a client comparing it against
+/// PostgreSQL's finds a type name PostgreSQL never prints in an error.
 fn mismatch(operator: &str, column: &str, left: &DataType, right: &DataType) -> PgWireError {
     make_vdb_error(
         VdbErrorCode::TypeMismatch,
@@ -307,14 +314,6 @@ fn mismatch(operator: &str, column: &str, left: &DataType, right: &DataType) -> 
             pg_type_name(right),
         ),
     )
-}
-
-/// The PostgreSQL name for an Arrow type, for an error message only. Falls back to Arrow's
-/// own spelling for a type `arrow-pg` has no OID for, which is better than saying nothing.
-fn pg_type_name(dt: &DataType) -> String {
-    arrow_pg::datatypes::into_pg_type(dt)
-        .map(|t| t.name().to_string())
-        .unwrap_or_else(|_| dt.to_string())
 }
 
 /// Whether `plan`'s output column `position` is PostgreSQL's `UNKNOWN` — a bare string
@@ -477,12 +476,50 @@ mod tests {
     #[tokio::test]
     async fn the_refusal_names_both_types_and_the_column() {
         let message = refusal("SELECT id FROM l UNION ALL SELECT w FROM r").await;
-        assert!(message.contains("int4"), "should name int4: {message}");
+        assert!(
+            message.contains("integer"),
+            "should name the type the way PostgreSQL does: {message}"
+        );
         assert!(message.contains("text"), "should name text: {message}");
         assert!(
             message.contains("\"id\""),
             "should name the column: {message}"
         );
+    }
+
+    // The spelling, which is the part a client can compare against PostgreSQL's own message:
+    // `UNION types integer and text cannot be matched`. The catalog names — `int4`, `float8`,
+    // `bool` — are what the pgwire `Type` table answers and what this message used to carry,
+    // and PostgreSQL prints none of them in an error.
+    #[tokio::test]
+    async fn the_refusal_spells_the_types_as_sql_and_not_as_the_catalog() {
+        for (sql, expected, never) in [
+            (
+                "SELECT id FROM l UNION ALL SELECT w FROM r",
+                "integer",
+                "int4",
+            ),
+            (
+                "SELECT d FROM wide UNION ALL SELECT w FROM r",
+                "double precision",
+                "float8",
+            ),
+            (
+                "SELECT big FROM wide UNION ALL SELECT w FROM r",
+                "bigint",
+                "int8",
+            ),
+        ] {
+            let message = refusal(sql).await;
+            assert!(
+                message.contains(expected),
+                "`{sql}` should say {expected}, got: {message}"
+            );
+            assert!(
+                !message.contains(never),
+                "`{sql}` must not say {never}, got: {message}"
+            );
+        }
     }
 
     // Every width of number meets every other, which is the case the check must not
@@ -627,7 +664,10 @@ mod tests {
                 message.contains(operator) && message.contains("cannot be matched"),
                 "`{sql}` should name {operator}, got: {message}"
             );
-            assert!(message.contains("int4"), "should name int4: {message}");
+            assert!(
+                message.contains("integer"),
+                "should name the type the way PostgreSQL does: {message}"
+            );
             assert!(message.contains("text"), "should name text: {message}");
         }
     }

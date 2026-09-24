@@ -22,7 +22,7 @@
 use std::sync::{Arc, OnceLock};
 
 use arrow::datatypes::{DataType, IntervalUnit};
-use datafusion::common::Result;
+use datafusion::common::{Result, exec_err};
 use datafusion::execution::FunctionRegistry;
 use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
@@ -38,8 +38,8 @@ pub fn register_pg_typeof(registry: &mut dyn FunctionRegistry) -> Result<()> {
     Ok(())
 }
 
-/// The shared `pg_typeof` instance.
-pub fn pg_typeof_udf() -> Arc<ScalarUDF> {
+/// The shared `pg_typeof` instance, built once and handed to every registry that asks.
+fn pg_typeof_udf() -> Arc<ScalarUDF> {
     static UDF: OnceLock<Arc<ScalarUDF>> = OnceLock::new();
     UDF.get_or_init(|| Arc::new(ScalarUDF::from(PgTypeof::default())))
         .clone()
@@ -83,8 +83,16 @@ pub fn pg_type_name(data_type: &DataType) -> String {
             IntervalUnit::YearMonth | IntervalUnit::DayTime | IntervalUnit::MonthDayNano,
         )
         | DataType::Duration(_) => "interval".to_string(),
-        // PostgreSQL spells an array type as its element type followed by `[]`, however
-        // many dimensions it has — `integer[]`, never `integer[][]`.
+        // PostgreSQL spells an array type as its element type followed by `[]`.
+        //
+        // The nesting is where the two disagree. PostgreSQL has exactly one array type per
+        // element type and carries the dimension count beside the value, so
+        // `pg_typeof(ARRAY[ARRAY[1,2]])` answers `integer[]` there. Arrow makes a list of
+        // lists a *distinct* type, and the recursion below names it as one — `integer[][]`,
+        // a spelling PostgreSQL never prints. Flattening it to one `[]` is the name a client
+        // comparing against PostgreSQL expects, and it is deliberately not done here: it is
+        // a change to an answer clients already read, not a refactoring, so it belongs to
+        // whoever owns the array-type contract rather than to this table.
         DataType::List(field)
         | DataType::LargeList(field)
         | DataType::ListView(field)
@@ -144,14 +152,22 @@ impl ScalarUDFImpl for PgTypeof {
         // The *declared* type of the argument, not the type of the values that arrived:
         // a scalar NULL folded out of a wider expression still has to report that
         // expression's type.
-        let name = args
-            .arg_fields
-            .first()
-            .map(|field| pg_type_name(field.data_type()))
-            .unwrap_or_else(|| "text".to_string());
+        //
+        // The signature admits exactly one argument, so the planner refuses any other arity
+        // before this runs and the `else` is unreachable. It refuses rather than naming a
+        // plausible type anyway, because the one thing this function must never do is answer
+        // a type name that is not the argument's — a wrong answer here is one a client
+        // cannot detect, while a missing one it can.
+        let [field] = args.arg_fields.as_slice() else {
+            return exec_err!(
+                "{PG_TYPEOF_UDF_NAME} takes one argument, got {}",
+                args.arg_fields.len()
+            );
+        };
 
         // The answer is the same for every row, so it stays a scalar — a NULL argument
         // included, since a type is a property of the expression and not of its value.
+        let name = pg_type_name(field.data_type());
         Ok(ColumnarValue::Scalar(ScalarValue::Utf8(Some(name))))
     }
 }
@@ -160,79 +176,171 @@ impl ScalarUDFImpl for PgTypeof {
 mod tests {
     use super::*;
     use arrow::array::Int32Array;
-    use arrow::datatypes::{Field, TimeUnit};
+    use arrow::datatypes::{Field, FieldRef, Fields, TimeUnit, UnionFields, UnionMode};
     use datafusion::execution::context::SessionContext;
 
-    fn invoke(data_type: DataType) -> String {
-        let args = ScalarFunctionArgs {
-            args: vec![ColumnarValue::Array(Arc::new(Int32Array::from(vec![1])))],
-            arg_fields: vec![Arc::new(Field::new("x", data_type, true))],
-            number_rows: 1,
+    fn field(data_type: DataType) -> FieldRef {
+        Arc::new(Field::new("item", data_type, true))
+    }
+
+    /// Invoke the function the way a physical expression does: the values are `Int32`
+    /// whatever `declared_as` says, because the declared type is the only thing the answer
+    /// may come from.
+    fn invoke(declared_as: Vec<FieldRef>) -> Result<ColumnarValue> {
+        PgTypeof::default().invoke_with_args(ScalarFunctionArgs {
+            args: vec![ColumnarValue::Array(Arc::new(Int32Array::from(vec![1, 2])))],
+            arg_fields: declared_as,
+            number_rows: 2,
             return_field: Arc::new(Field::new("t", DataType::Utf8, true)),
             config_options: Arc::new(datafusion::config::ConfigOptions::default()),
-        };
-        match PgTypeof::default().invoke_with_args(args).expect("invoked") {
-            ColumnarValue::Scalar(ScalarValue::Utf8(Some(s))) => s,
-            other => panic!("expected a Utf8 scalar, got {other:?}"),
+        })
+    }
+
+    /// Every arm of the table, because the table *is* the contract: a client reads these
+    /// names and compares them against the ones PostgreSQL's documentation prints, so an arm
+    /// nobody checked is a wrong answer waiting for the type that reaches it.
+    ///
+    /// The whole reason it is hand-written rather than taken from pgwire's `Type::name()`:
+    /// every name below has a *catalog* spelling (`int4`, `float8`, `varchar`, `timestamp`)
+    /// that a client comparing against PostgreSQL's documented answer would not match.
+    #[test]
+    fn names_every_arrow_type_the_way_postgres_names_it() {
+        let int_list = field(DataType::Int32);
+        let cases: Vec<(DataType, &str)> = vec![
+            (DataType::Boolean, "boolean"),
+            // Nothing in PostgreSQL is one byte wide, so a `TINYINT` reports as the type it
+            // is widened into, and an unsigned width reports as the signed one that holds it.
+            (DataType::Int8, "smallint"),
+            (DataType::Int16, "smallint"),
+            (DataType::UInt8, "smallint"),
+            (DataType::Int32, "integer"),
+            (DataType::UInt16, "integer"),
+            (DataType::Int64, "bigint"),
+            (DataType::UInt32, "bigint"),
+            // `bigint` is signed, so the top half of a `UInt64` would not fit in it.
+            (DataType::UInt64, "numeric"),
+            (DataType::Float16, "real"),
+            (DataType::Float32, "real"),
+            (DataType::Float64, "double precision"),
+            // `numeric(10, 2)` is a `numeric`: this reports type names, and the modifiers are
+            // what `format_type` is for.
+            (DataType::Decimal32(9, 2), "numeric"),
+            (DataType::Decimal64(18, 4), "numeric"),
+            (DataType::Decimal128(10, 2), "numeric"),
+            (DataType::Decimal128(38, 16), "numeric"),
+            (DataType::Decimal256(50, 2), "numeric"),
+            (DataType::Utf8, "text"),
+            (DataType::LargeUtf8, "text"),
+            (DataType::Utf8View, "text"),
+            (DataType::Binary, "bytea"),
+            (DataType::LargeBinary, "bytea"),
+            (DataType::BinaryView, "bytea"),
+            (DataType::FixedSizeBinary(16), "bytea"),
+            (DataType::Date32, "date"),
+            (DataType::Date64, "date"),
+            (DataType::Time32(TimeUnit::Second), "time without time zone"),
+            (
+                DataType::Time64(TimeUnit::Microsecond),
+                "time without time zone",
+            ),
+            (
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+                "timestamp without time zone",
+            ),
+            (
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+                "timestamp without time zone",
+            ),
+            // A time zone is part of the type name in PostgreSQL, and the two types behave
+            // differently, so collapsing them would misreport the one a client cares about.
+            (
+                DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into())),
+                "timestamp with time zone",
+            ),
+            // One PostgreSQL type, four Arrow spellings of it.
+            (DataType::Interval(IntervalUnit::YearMonth), "interval"),
+            (DataType::Interval(IntervalUnit::DayTime), "interval"),
+            (DataType::Interval(IntervalUnit::MonthDayNano), "interval"),
+            (DataType::Duration(TimeUnit::Microsecond), "interval"),
+            // An array is its element type followed by `[]`, in every list layout.
+            (DataType::List(int_list.clone()), "integer[]"),
+            (DataType::LargeList(int_list.clone()), "integer[]"),
+            (DataType::ListView(int_list.clone()), "integer[]"),
+            (DataType::LargeListView(int_list.clone()), "integer[]"),
+            (DataType::FixedSizeList(int_list.clone(), 2), "integer[]"),
+            // The divergence the table's comment states: PostgreSQL answers `integer[]` for a
+            // nested array and this answers `integer[][]`, which is pinned here so the day it
+            // is corrected is a deliberate change to a client-visible answer.
+            (
+                DataType::List(field(DataType::List(int_list.clone()))),
+                "integer[][]",
+            ),
+            // An anonymous row type, whichever way Arrow spells it.
+            (
+                DataType::Struct(Fields::from(vec![Field::new("a", DataType::Int32, true)])),
+                "record",
+            ),
+            (
+                DataType::Map(
+                    field(DataType::Struct(Fields::from(vec![
+                        Field::new("key", DataType::Utf8, false),
+                        Field::new("value", DataType::Int32, true),
+                    ]))),
+                    false,
+                ),
+                "record",
+            ),
+            (
+                DataType::Union(
+                    UnionFields::try_new([0], [Field::new("a", DataType::Int32, true)])
+                        .expect("a one-variant union"),
+                    UnionMode::Sparse,
+                ),
+                "record",
+            ),
+            // An encoding is not a type: a dictionary is Arrow's storage choice for a `text`
+            // column, and a client that asked what type it has wants `text`.
+            (
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8)),
+                "text",
+            ),
+            (
+                DataType::RunEndEncoded(field(DataType::Int32), field(DataType::Utf8)),
+                "text",
+            ),
+            // An untyped NULL is `unknown`, as measured against PostgreSQL 16.15 — the one
+            // name here that is not also a type a client can declare a column as.
+            (DataType::Null, "unknown"),
+        ];
+
+        for (data_type, expected) in cases {
+            assert_eq!(pg_type_name(&data_type), expected, "for {data_type}");
         }
     }
 
-    /// The reason the table is hand-written: every one of these has a pgwire catalog name
-    /// (`int4`, `float8`, `varchar`, `timestamp`) that a client comparing against
-    /// PostgreSQL's documented answer would not match.
+    /// The shell around the table: the answer comes from the argument's *declared* type and
+    /// not from the values that arrived — a scalar NULL folded out of a wider expression
+    /// still reports that expression's type — and it is one scalar for the whole batch,
+    /// since a type is a property of the expression rather than of a row.
     #[test]
-    fn reports_the_sql_name_and_not_the_catalog_name() {
-        assert_eq!(invoke(DataType::Int32), "integer");
-        assert_eq!(invoke(DataType::Int64), "bigint");
-        assert_eq!(invoke(DataType::Float64), "double precision");
-        assert_eq!(invoke(DataType::Utf8), "text");
-        assert_eq!(
-            invoke(DataType::Timestamp(TimeUnit::Microsecond, None)),
-            "timestamp without time zone"
-        );
+    fn the_answer_is_the_declared_type_as_one_scalar_for_the_batch() {
+        for declared in [DataType::Utf8, DataType::Null, DataType::Float64] {
+            let expected = pg_type_name(&declared);
+            match invoke(vec![field(declared.clone())]).expect("invoked") {
+                ColumnarValue::Scalar(ScalarValue::Utf8(Some(name))) => {
+                    assert_eq!(name, expected, "for a column declared {declared}");
+                }
+                other => panic!("expected one Utf8 scalar for {declared}, got {other:?}"),
+            }
+        }
     }
 
-    /// A time zone is part of the type name in PostgreSQL, and the two types behave
-    /// differently, so collapsing them would misreport the one a client cares about.
+    /// The arity the signature already refuses, refused here too: naming a plausible type
+    /// for an argument that is not there would be a wrong answer no client could detect.
     #[test]
-    fn a_time_zone_changes_the_reported_type() {
-        assert_eq!(
-            invoke(DataType::Timestamp(
-                TimeUnit::Microsecond,
-                Some("UTC".into())
-            )),
-            "timestamp with time zone"
-        );
-    }
-
-    /// `numeric(10, 2)` is a `numeric`: `pg_typeof` reports type names, not type
-    /// modifiers, which is what `format_type` is for.
-    #[test]
-    fn a_precision_and_scale_do_not_reach_the_name() {
-        assert_eq!(invoke(DataType::Decimal128(10, 2)), "numeric");
-        assert_eq!(invoke(DataType::Decimal128(38, 16)), "numeric");
-    }
-
-    /// PostgreSQL spells an array as `element[]` at any dimension.
-    #[test]
-    fn an_array_is_its_element_type_followed_by_brackets() {
-        let inner = Arc::new(Field::new("item", DataType::Int32, true));
-        assert_eq!(invoke(DataType::List(inner.clone())), "integer[]");
-        let nested = Arc::new(Field::new("item", DataType::List(inner), true));
-        assert_eq!(invoke(DataType::List(nested)), "integer[][]");
-    }
-
-    /// A dictionary is Arrow's storage choice for a `text` column, and a client that asked
-    /// what type it has wants `text`.
-    #[test]
-    fn an_encoding_reports_the_type_it_encodes() {
-        assert_eq!(
-            invoke(DataType::Dictionary(
-                Box::new(DataType::Int32),
-                Box::new(DataType::Utf8)
-            )),
-            "text"
-        );
+    fn a_call_without_an_argument_is_refused_rather_than_named() {
+        let err = invoke(vec![]).expect_err("no argument is not a pg_typeof call");
+        assert!(err.to_string().contains("takes one argument"), "got: {err}");
     }
 
     /// The name has to resolve on every node that plans or executes, because the plan
@@ -257,13 +365,5 @@ mod tests {
             .expect("rendered")
             .to_string();
         assert!(rendered.contains("integer"), "got:\n{rendered}");
-    }
-
-    /// An untyped NULL is `unknown`, as measured against PostgreSQL 16.15 — the one type name
-    /// that is not also the name of a column type a client can declare.
-    #[test]
-    fn an_untyped_null_is_unknown() {
-        assert_eq!(invoke(DataType::Null), "unknown");
-        assert_eq!(pg_type_name(&DataType::Null), "unknown");
     }
 }

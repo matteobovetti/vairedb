@@ -14,15 +14,16 @@
 //!
 //! ## Why a shadowing window function
 //!
-//! The advertised type is read off the **one** logical plan
-//! [`crate::scan_plan`]'s caller builds — Describe and the row encoder both take it from
-//! there — so the type has to change in the plan, not after it. A plan rewrite cannot do
+//! The advertised type is read off the **one** logical plan the coordinator's pgwire query
+//! path builds for a statement: its schema is the Arrow field the column's type OID is
+//! derived from, and Describe and the row encoder both take it from there — so the type has
+//! to change in the plan, not after it. A plan rewrite cannot do
 //! it: a window function may only appear in a `Window` node's expression list, so wrapping
 //! the call in a `CAST` there would make the node malformed, and moving the cast up into
 //! the projection above means rewriting every reference to the window's output column.
 //!
 //! Registering a `WindowUDF` under DataFusion's own name (the same shadowing
-//! [`crate::nth_value`] does, and [`crate::udaf`] does for `percentile_cont`) changes the
+//! [`crate::nth_value`] does, and [`crate::within_group`] does for `percentile_cont`) changes the
 //! declared field in place, and the expression stays the `ntile(…)` a client wrote.
 //!
 //! Everything except the declared type is delegated to DataFusion's own `ntile`,
@@ -88,17 +89,14 @@ fn datafusion_ntile() -> &'static Arc<dyn WindowUDFImpl> {
 }
 
 /// `ntile(n)` — DataFusion's buckets, narrowed to the `integer` PostgreSQL returns.
+///
+/// Private, because the only thing outside this module that has any use for it is the
+/// registry, and [`pg_ntile_udwf`] is what hands it one.
 #[derive(Debug, PartialEq, Eq, Hash)]
-pub struct PgNtile;
-
-impl Default for PgNtile {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+struct PgNtile;
 
 impl PgNtile {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self
     }
 }
@@ -182,25 +180,6 @@ struct NarrowedNtile {
     inner: Box<dyn PartitionEvaluator>,
 }
 
-/// Narrow one bucket-number array to the declared type.
-///
-/// `safe: false` so a bucket number that does not fit is an error and not a NULL. It
-/// cannot happen for a query PostgreSQL could have written — its `ntile` argument is an
-/// `int4` — and a wrong answer is worse than a refusal for one that could not.
-fn narrow(values: ArrayRef) -> Result<ArrayRef> {
-    if values.data_type() == &NTILE_RESULT {
-        return Ok(values);
-    }
-    Ok(cast_with_options(
-        &values,
-        &NTILE_RESULT,
-        &CastOptions {
-            safe: false,
-            ..Default::default()
-        },
-    )?)
-}
-
 impl PartitionEvaluator for NarrowedNtile {
     fn memoize(
         &mut self,
@@ -226,6 +205,8 @@ impl PartitionEvaluator for NarrowedNtile {
         values: &[ArrayRef],
         range: &std::ops::Range<usize>,
     ) -> Result<ScalarValue> {
+        // `ScalarValue::cast_to` refuses an unrepresentable value rather than substituting a
+        // NULL, which is the same choice `narrow` makes explicitly for an array.
         self.inner.evaluate(values, range)?.cast_to(&NTILE_RESULT)
     }
 
@@ -253,6 +234,25 @@ impl PartitionEvaluator for NarrowedNtile {
     }
 }
 
+/// Narrow one bucket-number array to the declared type.
+///
+/// `safe: false` so a bucket number that does not fit is an error and not a NULL. It
+/// cannot happen for a query PostgreSQL could have written — its `ntile` argument is an
+/// `int4` — and a wrong answer is worse than a refusal for one that could not.
+fn narrow(values: ArrayRef) -> Result<ArrayRef> {
+    if values.data_type() == &NTILE_RESULT {
+        return Ok(values);
+    }
+    Ok(cast_with_options(
+        &values,
+        &NTILE_RESULT,
+        &CastOptions {
+            safe: false,
+            ..Default::default()
+        },
+    )?)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,24 +260,30 @@ mod tests {
     use datafusion::execution::context::SessionContext;
     use datafusion::physical_expr::expressions::Literal;
 
+    /// The field the bucket count arrives as.
+    fn input_field() -> FieldRef {
+        Arc::new(Field::new("n", DataType::Int64, false))
+    }
+
     /// Build the evaluator the way a `WindowAggExec` does, over `ntile(n)`.
-    fn evaluator(n: i64) -> Box<dyn PartitionEvaluator> {
+    fn evaluator(n: i64) -> Result<Box<dyn PartitionEvaluator>> {
         let input_exprs: Vec<Arc<dyn PhysicalExpr>> =
             vec![Arc::new(Literal::new(ScalarValue::Int64(Some(n))))];
-        let input_fields = vec![Arc::new(Field::new("n", DataType::Int64, false)) as FieldRef];
-        PgNtile::new()
-            .partition_evaluator(PartitionEvaluatorArgs::new(
-                &input_exprs,
-                &input_fields,
-                false,
-                false,
-            ))
-            .expect("ntile takes a positive literal")
+        let input_fields = vec![input_field()];
+        PgNtile::new().partition_evaluator(PartitionEvaluatorArgs::new(
+            &input_exprs,
+            &input_fields,
+            false,
+            false,
+        ))
     }
 
     /// The buckets `ntile(n)` assigns to `rows` rows.
     fn buckets(n: i64, rows: usize) -> Int32Array {
-        let values = evaluator(n).evaluate_all(&[], rows).expect("buckets");
+        let values = evaluator(n)
+            .expect("ntile takes a positive literal")
+            .evaluate_all(&[], rows)
+            .expect("buckets");
         values
             .as_any()
             .downcast_ref::<Int32Array>()
@@ -288,7 +294,7 @@ mod tests {
     /// The gap: the declared type is PostgreSQL's `int4` and not DataFusion's `UInt64`.
     #[test]
     fn the_declared_field_is_an_integer() {
-        let input_fields = vec![Arc::new(Field::new("n", DataType::Int64, false)) as FieldRef];
+        let input_fields = vec![input_field()];
         let ours = PgNtile::new()
             .field(WindowUDFFieldArgs::new(&input_fields, "ntile(3)"))
             .expect("field");
@@ -329,20 +335,7 @@ mod tests {
     /// Delegating means the argument checks are still DataFusion's.
     #[test]
     fn a_non_positive_bucket_count_is_still_refused() {
-        let input_exprs: Vec<Arc<dyn PhysicalExpr>> =
-            vec![Arc::new(Literal::new(ScalarValue::Int64(Some(0))))];
-        let input_fields = vec![Arc::new(Field::new("n", DataType::Int64, false)) as FieldRef];
-        assert!(
-            PgNtile::new()
-                .partition_evaluator(PartitionEvaluatorArgs::new(
-                    &input_exprs,
-                    &input_fields,
-                    false,
-                    false,
-                ))
-                .is_err(),
-            "ntile(0) names no bucket"
-        );
+        assert!(evaluator(0).is_err(), "ntile(0) names no bucket");
     }
 
     /// The narrowing is unsafe on purpose: an unrepresentable bucket number is an error
@@ -355,29 +348,17 @@ mod tests {
 
     /// The wire carries only the name, so the name has to resolve to *ours* after
     /// registration — a context that resolved DataFusion's would advertise `int8` again.
+    /// Twice, because a context reached by two registration paths registers twice.
     #[test]
     fn the_name_resolves_to_this_function_after_registration() {
         let mut ctx = SessionContext::new();
         let before = ctx.udwf(NTILE_UDWF_NAME).expect("datafusion registers one");
         assert!(!before.inner().is::<PgNtile>());
 
-        register_ntile(&mut ctx).expect("registration failed");
-        let after = ctx.udwf(NTILE_UDWF_NAME).expect("ours");
-        assert!(after.inner().is::<PgNtile>());
-    }
-
-    /// Registering twice is what a context reached by two registration paths does.
-    #[test]
-    fn registering_twice_is_idempotent() {
-        let mut ctx = SessionContext::new();
         register_ntile(&mut ctx).expect("first registration failed");
         register_ntile(&mut ctx).expect("second registration failed");
-        assert!(
-            ctx.udwf(NTILE_UDWF_NAME)
-                .expect("ours")
-                .inner()
-                .is::<PgNtile>()
-        );
+        let after = ctx.udwf(NTILE_UDWF_NAME).expect("ours");
+        assert!(after.inner().is::<PgNtile>());
     }
 
     /// The three ranking functions PostgreSQL *does* answer in `bigint` are untouched:

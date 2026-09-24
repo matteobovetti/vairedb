@@ -19,14 +19,13 @@ impl VaireDbError {
         }
     }
 
-    /// The error code's underlying numeric value.
-    fn numeric_code(&self) -> i32 {
-        self.code as i32
-    }
-
     /// The message prefixed with its `[VDB-<code>]` tag, as shown to clients.
+    ///
+    /// The numeric value of the code is what goes in, not its name: this is the one
+    /// `[VDB-…]` a client is meant to see, and it has to be the same spelling a support
+    /// question can be asked about and [`crate::error::code_of_tagged_message`] can read.
     pub fn formatted_message(&self) -> String {
-        format!("[VDB-{}] {}", self.numeric_code(), self.message)
+        format!("[VDB-{}] {}", self.code as i32, self.message)
     }
 }
 
@@ -42,15 +41,14 @@ impl std::error::Error for VaireDbError {}
 mod tests {
     use super::*;
 
+    /// The exact text a client reads, through both ways of asking for it: the coordinator
+    /// formats its reply with [`VaireDbError::formatted_message`], and anything that logs
+    /// or re-wraps the error gets there through `Display`. Both have to spell the tag the
+    /// same way, since the numeric code is what a client quotes back.
     #[test]
-    fn formatted_message_includes_numeric_code() {
+    fn both_renderings_prefix_the_message_with_the_numeric_code() {
         let err = VaireDbError::new(VdbErrorCode::TableNotFound, "no such table");
         assert_eq!(err.formatted_message(), "[VDB-1000] no such table");
-    }
-
-    #[test]
-    fn display_matches_formatted_message() {
-        let err = VaireDbError::new(VdbErrorCode::WriteConflict, "conflict");
-        assert_eq!(err.to_string(), err.formatted_message());
+        assert_eq!(err.to_string(), "[VDB-1000] no such table");
     }
 }

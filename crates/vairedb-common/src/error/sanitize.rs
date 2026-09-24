@@ -1,4 +1,14 @@
-use super::transported::strip_code_tags;
+//! Scrubbing an internal error message into something a client may see.
+//!
+//! Everything a failure picked up on its way here — the engine that raised it, the
+//! transport that carried it, the addresses of the nodes it passed through — is detail the
+//! client did not ask for and must not be told. What is left after
+//! [`sanitize_message`] should read as the sentence PostgreSQL would have written.
+
+use super::scan::{
+    BRACES, MAX_TRANSPORT_LAYERS, Quoting, end_of_nesting, string_literal_end, unescape,
+};
+use super::tag::strip_code_tags;
 
 /// Engine-specific error message prefixes stripped before surfacing to clients.
 ///
@@ -93,6 +103,9 @@ const SIGNATURE_MARKER: &str = "Signature {";
 /// function. An unbalanced dump (one truncated upstream before its closing brace)
 /// leaves the text alone: there is no end to splice to, and mangling it further would
 /// lose the little information it still carries.
+///
+/// The scan ignores quoting, which for this dump is a requirement rather than a
+/// simplification — see [`end_of_nesting`].
 fn elide_signature_dumps(msg: &str) -> String {
     let mut out = String::with_capacity(msg.len());
     let mut rest = msg;
@@ -100,38 +113,17 @@ fn elide_signature_dumps(msg: &str) -> String {
     while let Some(start) = rest.find(SIGNATURE_MARKER) {
         // The brace that opens the dump is the last byte of the marker.
         let brace = start + SIGNATURE_MARKER.len() - 1;
-        let Some(end) = matching_brace(&rest[brace..]) else {
+        let Some(end) = end_of_nesting(&rest[brace + 1..], BRACES, Quoting::Ignored) else {
             break;
         };
+        let close = brace + 1 + end;
         out.push_str(&rest[..start]);
         out.push_str(ELIDED_SIGNATURE);
-        rest = &rest[brace + end + 1..];
+        rest = &rest[close + 1..];
     }
 
     out.push_str(rest);
     out
-}
-
-/// Byte offset, within `s`, of the `}` closing the `{` at `s[0]` — `None` if unclosed.
-///
-/// Counts nesting only, and deliberately does not try to respect braces inside string
-/// literals: a `Signature` debug dump contains type and volatility names, never
-/// arbitrary user text, so there is nothing for a quoted brace to come from.
-fn matching_brace(s: &str) -> Option<usize> {
-    let mut depth = 0usize;
-    for (i, c) in s.char_indices() {
-        match c {
-            '{' => depth += 1,
-            '}' => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
 }
 
 /// What a tonic `Status` debug dump opens with.
@@ -160,101 +152,30 @@ const STATUS_MESSAGE_FIELD: &str = "message: \"";
 /// `message` field, or a message literal or brace that does not close. A dump truncated
 /// upstream still carries something, and mangling it further would lose that too.
 fn unwrap_grpc_status(msg: &str) -> String {
-    let Some(start) = msg.find(STATUS_MARKER) else {
-        return msg.to_string();
-    };
+    grpc_status_message(msg).unwrap_or_else(|| msg.to_string())
+}
+
+/// `msg` with the `Status { … }` dump it contains replaced by that dump's `message`
+/// field, or `None` if `msg` does not hold a complete one.
+///
+/// Every step is a shape the dump has to have, so a missing one answers `None` and
+/// [`unwrap_grpc_status`] keeps the text it was given.
+fn grpc_status_message(msg: &str) -> Option<String> {
+    let start = msg.find(STATUS_MARKER)?;
     // The brace that opens the dump is the last byte of the marker.
     let brace = start + STATUS_MARKER.len() - 1;
-    let Some(field) = msg[brace..].find(STATUS_MESSAGE_FIELD) else {
-        return msg.to_string();
-    };
-    let literal = brace + field + STATUS_MESSAGE_FIELD.len();
-    let Some(len) = string_literal_end(&msg[literal..]) else {
-        return msg.to_string();
-    };
-    let Some(end) = matching_brace_outside_strings(&msg[brace..]) else {
-        return msg.to_string();
-    };
-    format!(
+    let field = brace + msg[brace..].find(STATUS_MESSAGE_FIELD)? + STATUS_MESSAGE_FIELD.len();
+    let len = string_literal_end(&msg[field..])?;
+    // Quoting has to be respected here: the `message` field carries arbitrary text, so a
+    // brace in a client's own SQL would otherwise close the dump early and splice the
+    // transport's `metadata` back into the reply.
+    let close = brace + 1 + end_of_nesting(&msg[brace + 1..], BRACES, Quoting::Respected)?;
+    Some(format!(
         "{}{}{}",
         &msg[..start],
-        unescape(&msg[literal..literal + len]),
-        &msg[brace + end + 1..]
-    )
-}
-
-/// Byte offset, within `s`, of the `}` closing the `{` at `s[0]`, ignoring braces that
-/// fall inside a string literal — `None` if unclosed.
-///
-/// Unlike [`matching_brace`], this one has to respect quoting: a `Status` dump's `message`
-/// field carries arbitrary text, so a brace in a client's own SQL would otherwise close
-/// the dump early and splice the transport's `metadata` back into the reply.
-fn matching_brace_outside_strings(s: &str) -> Option<usize> {
-    let mut depth = 0usize;
-    let mut in_string = false;
-    let mut escaped = false;
-    for (i, c) in s.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match c {
-            '\\' if in_string => escaped = true,
-            '"' => in_string = !in_string,
-            '{' if !in_string => depth += 1,
-            '}' if !in_string => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
-}
-
-/// Byte offset, within `s`, of the `"` that closes a string literal starting at `s[0]` —
-/// `None` if it never closes. Counts backslash escapes, since the literal being scanned
-/// is a `Debug` rendering and its own quotes arrive as `\"`.
-pub(super) fn string_literal_end(s: &str) -> Option<usize> {
-    let mut escaped = false;
-    for (i, c) in s.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match c {
-            '\\' => escaped = true,
-            '"' => return Some(i),
-            _ => {}
-        }
-    }
-    None
-}
-
-/// Undo one level of Rust `Debug` string escaping.
-///
-/// A transported error can be nested several `Debug` renderings deep, so its innermost
-/// text arrives with `\\\"`-style escaping. One level per pass is right: the caller loops.
-pub(super) fn unescape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len());
-    let mut chars = s.chars();
-    while let Some(c) = chars.next() {
-        if c != '\\' {
-            out.push(c);
-            continue;
-        }
-        match chars.next() {
-            Some('n') => out.push('\n'),
-            Some('t') => out.push('\t'),
-            Some('r') => out.push('\r'),
-            // `\\`, `\"` and anything else stand for the character itself.
-            Some(other) => out.push(other),
-            None => out.push('\\'),
-        }
-    }
-    out
+        unescape(&msg[field..field + len]),
+        &msg[close + 1..]
+    ))
 }
 
 /// Unwrap a whole-message Rust `Debug` tuple-variant dump — `Plan("…")`,
@@ -286,26 +207,17 @@ fn unwrap_debug_wrapper(msg: &str) -> Option<String> {
 
 /// Strip every known engine prefix from the front of `msg`, repeatedly.
 fn strip_known_prefixes(msg: &str) -> String {
-    let mut msg = msg.to_string();
+    let mut rest = msg;
     loop {
-        let before = msg.len();
+        let before = rest.len();
         for prefix in PREFIXES_TO_STRIP {
-            if let Some(stripped) = msg.strip_prefix(prefix) {
-                msg = stripped.to_string();
-            }
+            rest = rest.strip_prefix(prefix).unwrap_or(rest);
         }
-        if msg.len() == before {
-            return msg;
+        if rest.len() == before {
+            return rest.to_string();
         }
     }
 }
-
-/// How many times [`sanitize_message`] will peel a layer off a transported error.
-///
-/// Bounded rather than run to a fixed point: the deepest shape measured is four layers
-/// (`Status` → prefixes → `Plan("…")` → prefixes → `NotImplemented("…")`), and a bound
-/// means a pass that does not shorten the message cannot loop.
-const MAX_UNWRAP_PASSES: usize = 8;
 
 /// Scrub an internal error message into a client-safe string.
 ///
@@ -321,32 +233,56 @@ const MAX_UNWRAP_PASSES: usize = 8;
 pub fn sanitize_message(raw: &str) -> String {
     let mut msg = raw.to_string();
 
-    for _ in 0..MAX_UNWRAP_PASSES {
-        let before = msg.clone();
-        msg = unwrap_grpc_status(&msg);
-        msg = elide_signature_dumps(&msg);
-        msg = strip_known_prefixes(&msg);
-        // A `[VDB-…]` tag is how an error raised on an executor carries its code across
-        // the scheduler (see `super::transported`). The code is read off the raw text
-        // before sanitizing; the tag itself is transport, and the coordinator attaches
-        // exactly one of its own when it formats the reply.
-        msg = strip_code_tags(&msg);
-        if let Some(inner) = unwrap_debug_wrapper(&msg) {
-            msg = inner;
-        }
-        if msg == before {
+    for _ in 0..MAX_TRANSPORT_LAYERS {
+        let unwrapped = unwrap_transport_layer(&msg);
+        if unwrapped == msg {
             break;
         }
+        msg = unwrapped;
     }
 
-    // Strip Ballista executor task failure patterns containing URLs
-    if let Some(idx) = msg.find("failed on executor")
-        && let Some(colon_idx) = msg[idx..].find(": ")
-    {
-        msg = msg[idx + colon_idx + 2..].to_string();
-    }
+    scrub_node_addresses(&strip_executor_wrapper(&msg))
+}
 
-    // Scrub any remaining http:// URLs (executor addresses, node endpoints)
+/// Take one layer of transport rendering off `msg`.
+///
+/// The order within a pass is the order the layers were applied in, outermost first: a
+/// `Status` dump wraps a prefixed message, which wraps a `Debug` variant dump.
+fn unwrap_transport_layer(msg: &str) -> String {
+    let msg = unwrap_grpc_status(msg);
+    let msg = elide_signature_dumps(&msg);
+    let msg = strip_known_prefixes(&msg);
+    // A `[VDB-…]` tag is how an error raised on an executor carries its code across the
+    // scheduler (see `super::tag`). The code is read off the raw text before sanitizing;
+    // the tag itself is transport, and the coordinator attaches exactly one of its own
+    // when it formats the reply.
+    let msg = strip_code_tags(&msg);
+    match unwrap_debug_wrapper(&msg) {
+        Some(inner) => inner,
+        None => msg,
+    }
+}
+
+/// Drop Ballista's "failed on executor <address>" framing, keeping the failure it frames.
+///
+/// The wrapper names the node the task ran on, which is cluster topology rather than
+/// anything a client can act on, and the statement failed for the reason that follows it.
+fn strip_executor_wrapper(msg: &str) -> String {
+    let Some(idx) = msg.find("failed on executor") else {
+        return msg.to_string();
+    };
+    let Some(colon_idx) = msg[idx..].find(": ") else {
+        return msg.to_string();
+    };
+    msg[idx + colon_idx + 2..].to_string()
+}
+
+/// Replace every `http://…` URL in `msg` with `[node]`.
+///
+/// The last line of defence for the one detail that is never a client's business however
+/// it got into the message: the address of an executor, a node endpoint, or the scheduler.
+fn scrub_node_addresses(msg: &str) -> String {
+    let mut msg = msg.to_string();
     while let Some(start) = msg.find("http://") {
         let end = msg[start..]
             .find(|c: char| c.is_whitespace())
@@ -354,63 +290,89 @@ pub fn sanitize_message(raw: &str) -> String {
             .unwrap_or(msg.len());
         msg = format!("{}[node]{}", &msg[..start], &msg[end..]);
     }
-
     msg
 }
 
 #[cfg(test)]
 mod tests {
-    use super::sanitize_message;
+    use super::*;
 
-    #[test]
-    fn test_sanitize_strips_core_error_prefixes() {
-        let msg =
-            "engine error: write execution failed: IO Error: /data/core.duckdb: Permission denied";
-        let result = sanitize_message(msg);
-        assert!(!result.contains("engine error"));
-        assert!(!result.contains("write execution failed"));
-        assert!(!result.contains("IO Error"));
-    }
+    /// The DataFusion block of [`PREFIXES_TO_STRIP`], transcribed a second time from
+    /// `DataFusionError::error_prefix` so the test is an independent statement of what
+    /// DataFusion emits rather than a reading of the list under test. The defect this
+    /// replaced was a list of prefixes that all looked plausible and several of which
+    /// matched nothing.
+    const DATAFUSION_PREFIXES: &[&str] = &[
+        "Arrow error: ",
+        "Parquet error: ",
+        "Object Store error: ",
+        "IO error: ",
+        "SQL error: ",
+        "This feature is not implemented: ",
+        "Internal error: ",
+        "Error during planning: ",
+        "Invalid or Unsupported Configuration: ",
+        "Schema error: ",
+        "Execution error: ",
+        "ExecutionJoin error: ",
+        "Resources exhausted: ",
+        "External error: ",
+        "Substrait error: ",
+        "FFI error: ",
+    ];
 
-    #[test]
-    fn test_sanitize_strips_ballista_executor_url() {
-        let msg = "Task 3 failed on executor http://192.168.1.5:50051: query failed on shard 'orders_shard0'";
-        let result = sanitize_message(msg);
-        assert!(!result.contains("192.168.1.5"));
-        assert!(!result.contains("http://"));
-        assert!(result.contains("query failed on shard"));
-    }
+    /// The Ballista block. `"Configuration error: "` is the interesting one: it was
+    /// deleted from the DataFusion block as dead and is live here.
+    const BALLISTA_PREFIXES: &[&str] = &[
+        "Not implemented: ",
+        "General error: ",
+        "DataFusion error: ",
+        "Tonic error: ",
+        "Grpc error: ",
+        "Grpc connection error: ",
+        "Grpc Execute Action error: ",
+        "Internal Ballista error: ",
+        "Tokio join error: ",
+        "Configuration error: ",
+        "Could not parse plan: ",
+    ];
 
-    #[test]
-    fn test_sanitize_strips_http_urls() {
-        let msg = "connection to http://10.0.0.1:50041 failed";
-        let result = sanitize_message(msg);
-        assert!(!result.contains("10.0.0.1"));
-        assert!(!result.contains("http://"));
-    }
+    /// The DuckDB block, from the exception names DuckDB renders. `"IO Error: "` is the
+    /// one to read twice: DataFusion's spelling of the same prefix differs only in one
+    /// letter's case, both are live, and each is tested against its own engine's list.
+    const DUCKDB_PREFIXES: &[&str] = &[
+        "DuckDB error: ",
+        "Catalog Error: ",
+        "Parser Error: ",
+        "Binder Error: ",
+        "Conversion Error: ",
+        "IO Error: ",
+        "Runtime Error: ",
+        "Invalid Input Error: ",
+        "Constraint Error: ",
+        "Out of Range Error: ",
+    ];
 
-    /// One case per DataFusion prefix, because the defect this replaced was a list of
-    /// prefixes that all looked plausible and several of which matched nothing.
+    /// VaireDB's own core-node prefixes, which `thiserror` writes from `CoreError`'s
+    /// `#[error("…")]` attributes and the write queue adds one more to.
+    const CORE_PREFIXES: &[&str] = &[
+        "engine error: ",
+        "shard not found: ",
+        "write conflict: ",
+        "type mismatch: ",
+        "write queue error: ",
+        "write execution failed: ",
+    ];
+
+    /// Every prefix, from every engine, leaves nothing of itself behind.
     #[test]
-    fn every_datafusion_prefix_is_the_one_datafusion_emits() {
-        for prefix in [
-            "Arrow error: ",
-            "Parquet error: ",
-            "Object Store error: ",
-            "IO error: ",
-            "SQL error: ",
-            "This feature is not implemented: ",
-            "Internal error: ",
-            "Error during planning: ",
-            "Invalid or Unsupported Configuration: ",
-            "Schema error: ",
-            "Execution error: ",
-            "ExecutionJoin error: ",
-            "Resources exhausted: ",
-            "External error: ",
-            "Substrait error: ",
-            "FFI error: ",
-        ] {
+    fn every_prefix_an_engine_emits_is_stripped() {
+        for prefix in DATAFUSION_PREFIXES
+            .iter()
+            .chain(BALLISTA_PREFIXES)
+            .chain(DUCKDB_PREFIXES)
+            .chain(CORE_PREFIXES)
+        {
             let result = sanitize_message(&format!("{prefix}the part a client should read"));
             assert_eq!(
                 result, "the part a client should read",
@@ -419,14 +381,64 @@ mod tests {
         }
     }
 
-    /// The two IO spellings differ only in one letter's case, and both are live.
+    /// The list under test and the transcriptions above must be the same set. A prefix in
+    /// production and not in a transcription is one nobody has checked against the engine
+    /// that supposedly emits it — which is exactly how the dead `"Plan error: "` survived.
+    /// A prefix in a transcription and not in production is one that reaches clients.
     #[test]
-    fn both_io_prefix_spellings_are_stripped() {
+    fn the_transcribed_prefixes_and_the_stripped_prefixes_are_the_same_set() {
+        let transcribed: Vec<&&str> = DATAFUSION_PREFIXES
+            .iter()
+            .chain(BALLISTA_PREFIXES)
+            .chain(DUCKDB_PREFIXES)
+            .chain(CORE_PREFIXES)
+            .collect();
+        for prefix in PREFIXES_TO_STRIP {
+            assert!(
+                transcribed.contains(&prefix),
+                "{prefix:?} is stripped in production but no test transcribes it"
+            );
+        }
+        for prefix in transcribed {
+            assert!(
+                PREFIXES_TO_STRIP.contains(prefix),
+                "{prefix:?} is transcribed as live but production does not strip it"
+            );
+        }
+    }
+
+    /// The prefixes arrive stacked, from three different layers, in one message.
+    #[test]
+    fn a_stack_of_core_and_duckdb_prefixes_is_stripped_down_to_the_message() {
         assert_eq!(
-            sanitize_message("IO error: datafusion side"),
-            "datafusion side"
+            sanitize_message(
+                "engine error: write execution failed: IO Error: /data/core.duckdb: \
+                 Permission denied"
+            ),
+            "/data/core.duckdb: Permission denied"
         );
-        assert_eq!(sanitize_message("IO Error: duckdb side"), "duckdb side");
+    }
+
+    /// Ballista names the executor a task failed on, address and all. The client gets the
+    /// failure and none of the topology.
+    #[test]
+    fn a_ballista_executor_address_never_reaches_the_client() {
+        let result = sanitize_message(
+            "Task 3 failed on executor http://192.168.1.5:50051: query failed on shard \
+             'orders_shard0'",
+        );
+        assert_eq!(result, "query failed on shard 'orders_shard0'");
+        assert!(!result.contains("192.168.1.5"), "{result}");
+        assert!(!result.contains("http://"), "{result}");
+    }
+
+    /// A node address in a message that wears no wrapper at all is still an address.
+    #[test]
+    fn a_node_url_anywhere_in_a_message_is_replaced_by_a_placeholder() {
+        assert_eq!(
+            sanitize_message("connection to http://10.0.0.1:50041 failed"),
+            "connection to [node] failed"
+        );
     }
 
     #[test]
@@ -458,12 +470,24 @@ mod tests {
         assert_eq!(sanitize_message(msg), msg);
     }
 
+    /// A signature dump reached through another `Debug` rendering carries its own quotes
+    /// escaped — a timezone, a struct field's name — and the dump still has to go. This is
+    /// the case that decides the quoting rule in [`elide_signature_dumps`]: read as a
+    /// string literal, the `\"` below would swallow the rest of the dump and the whole
+    /// kilobyte would reach the client.
     #[test]
-    fn a_message_with_no_signature_dump_is_unchanged() {
+    fn a_signature_dump_containing_escaped_quotes_is_still_elided() {
+        let msg = "Failed to coerce arguments to satisfy a call to 'date_trunc': Signature { \
+                   type_signature: Exact([Utf8, Timestamp(Nanosecond, Some(\\\"UTC\\\"))]), \
+                   volatility: Immutable } failed";
+        let result = sanitize_message(msg);
         assert_eq!(
-            sanitize_message("column \"nope\" does not exist"),
-            "column \"nope\" does not exist"
+            result,
+            "Failed to coerce arguments to satisfy a call to 'date_trunc': Signature { … } failed"
         );
+        for leaked in ["type_signature", "Nanosecond", "Immutable"] {
+            assert!(!result.contains(leaked), "{leaked} survived: {result}");
+        }
     }
 
     /// The measured shape, copied from what `psql` printed for
@@ -530,31 +554,6 @@ mod tests {
         }
     }
 
-    /// One case per Ballista prefix. `"Configuration error: "` is the interesting one: it
-    /// was deleted from the DataFusion block as dead and is live here.
-    #[test]
-    fn every_ballista_prefix_is_stripped() {
-        for prefix in [
-            "Not implemented: ",
-            "General error: ",
-            "DataFusion error: ",
-            "Tonic error: ",
-            "Grpc error: ",
-            "Grpc connection error: ",
-            "Grpc Execute Action error: ",
-            "Internal Ballista error: ",
-            "Tokio join error: ",
-            "Configuration error: ",
-            "Could not parse plan: ",
-        ] {
-            let result = sanitize_message(&format!("{prefix}the part a client should read"));
-            assert_eq!(
-                result, "the part a client should read",
-                "prefix {prefix:?} was not stripped"
-            );
-        }
-    }
-
     /// Ballista re-wraps a `DataFusionError` under its own name, so the phrase arrives
     /// twice with DataFusion's own prefix between the two.
     #[test]
@@ -576,11 +575,13 @@ mod tests {
         assert_eq!(sanitize_message(msg), msg);
     }
 
-    /// Nothing about an ordinary message should survive a trip through the unwrapper
-    /// differently — parentheses in a client's own text are not a `Debug` dump.
+    /// The other half of the contract: a message that is already the sentence PostgreSQL
+    /// would have written comes back byte for byte. Parentheses in a client's own text are
+    /// not a `Debug` dump, and a brace is not a debug dump either.
     #[test]
-    fn a_message_with_ordinary_parentheses_is_unchanged() {
+    fn a_message_a_client_should_read_is_returned_unchanged() {
         for msg in [
+            "column \"nope\" does not exist",
             "function count(bigint) does not exist",
             "COPY (SELECT 1) TO STDOUT is not supported here",
         ] {
@@ -610,13 +611,5 @@ mod tests {
             sanitize_message("column \"[VDB-x]\" does not exist"),
             "column \"[VDB-x]\" does not exist"
         );
-    }
-
-    #[test]
-    fn test_sanitize_strips_constraint_error_prefix() {
-        let msg = "Constraint Error: NOT NULL constraint failed for column 'id'";
-        let result = sanitize_message(msg);
-        assert!(!result.contains("Constraint Error"));
-        assert!(result.contains("NOT NULL constraint failed"));
     }
 }

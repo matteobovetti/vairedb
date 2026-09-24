@@ -56,15 +56,15 @@
 use std::fmt;
 use std::sync::{Arc, OnceLock};
 
-use arrow::array::{Array, ArrayRef, AsArray, BinaryBuilder, StringArray};
-use arrow::compute::kernels::cast::cast;
+use arrow::array::{Array, ArrayRef, BinaryBuilder};
 use arrow::datatypes::DataType;
-use datafusion::common::{Result, exec_err, plan_err};
+use datafusion::common::{DataFusionError, Result, exec_err, plan_err};
 use datafusion::execution::FunctionRegistry;
 use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
 };
 
+use crate::columns::strings;
 use crate::proto::vairedb::v1::VdbErrorCode;
 
 /// The name the read path emits and every node resolves the call by.
@@ -121,6 +121,25 @@ impl fmt::Display for ByteaInputError {
 }
 
 impl std::error::Error for ByteaInputError {}
+
+/// How a decode failure leaves this module: an `Execution` error whose message is
+/// PostgreSQL's wording and nothing else.
+///
+/// Deliberately **untagged**, where [`crate::uuid_in`] and [`crate::json_pg`] wrap their
+/// message in [`crate::error::tagged_message`] so the code travels as a `[VDB-…]` prefix.
+/// Here the wording *is* the transport: [`error_code_of_message`] below reads the code back
+/// out of it and is registered as this family's classifier in
+/// [`crate::distributed_functions`], which pins the exact messages on both sides of the
+/// Ballista boundary. A tag would add nothing the classifier does not already recover, and
+/// would change the text those tests — and the coordinator's — read.
+///
+/// One impl rather than a `map_err` at each call site, so the choice is made once and is
+/// documented where the type is.
+impl From<ByteaInputError> for DataFusionError {
+    fn from(e: ByteaInputError) -> Self {
+        DataFusionError::Execution(e.to_string())
+    }
+}
 
 /// The `VdbErrorCode` for a decode failure recognized by its *message*, or `None` if `msg`
 /// is not one of them.
@@ -201,34 +220,38 @@ fn hex_digit(c: char) -> std::result::Result<u8, ByteaInputError> {
 /// character is stored as its UTF-8 bytes, so `'é'::bytea` is two bytes.
 fn decode_escape(bytes: &[u8]) -> std::result::Result<Vec<u8>, ByteaInputError> {
     let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        if bytes[i] != b'\\' {
-            out.push(bytes[i]);
-            i += 1;
+    let mut rest = bytes;
+    while let Some((&byte, tail)) = rest.split_first() {
+        if byte != b'\\' {
+            out.push(byte);
+            rest = tail;
             continue;
         }
-        match bytes.get(i + 1) {
-            Some(b'\\') => {
-                out.push(b'\\');
-                i += 2;
-            }
-            // Three octal digits, the first no higher than `3` so the value fits a byte.
-            // `\400` is an error in PostgreSQL rather than a wrapped `\000`.
-            Some(&first @ b'0'..=b'3') => {
-                let (Some(&second @ b'0'..=b'7'), Some(&third @ b'0'..=b'7')) =
-                    (bytes.get(i + 2), bytes.get(i + 3))
-                else {
-                    return Err(ByteaInputError::Syntax);
-                };
-                out.push((first - b'0') << 6 | (second - b'0') << 3 | (third - b'0'));
-                i += 4;
-            }
-            // Including a trailing backslash, which is `None` here.
-            _ => return Err(ByteaInputError::Syntax),
-        }
+        let (escaped, width) = escaped_byte(tail)?;
+        out.push(escaped);
+        rest = &tail[width..];
     }
     Ok(out)
+}
+
+/// One escape sequence, read from the bytes that *follow* a backslash: the byte it stands
+/// for and how many of them it spans.
+///
+/// Every spelling other than these two is an error, which is what makes `\12` (two digits),
+/// `\400` (out of range), `\x41` (the hex format's marker inside the escape format) and a
+/// trailing `\` all `22P02` in PostgreSQL.
+fn escaped_byte(after_backslash: &[u8]) -> std::result::Result<(u8, usize), ByteaInputError> {
+    match *after_backslash {
+        [b'\\', ..] => Ok((b'\\', 1)),
+        // Three octal digits, the first no higher than `3` so the value fits a byte.
+        // `\400` is an error in PostgreSQL rather than a wrapped `\000`.
+        [high @ b'0'..=b'3', mid @ b'0'..=b'7', low @ b'0'..=b'7', ..] => {
+            let byte = (high - b'0') << 6 | (mid - b'0') << 3 | (low - b'0');
+            Ok((byte, 3))
+        }
+        // Including a trailing backslash, which is the empty slice here.
+        _ => Err(ByteaInputError::Syntax),
+    }
 }
 
 /// Register PostgreSQL's `bytea` input conversion on `registry`.
@@ -241,26 +264,26 @@ pub fn register_bytea_in(registry: &mut dyn FunctionRegistry) -> Result<()> {
     Ok(())
 }
 
-/// The shared [`ScalarUDF`] handle, for the read-path rewrite that builds the call.
-pub fn bytea_in_udf() -> Arc<ScalarUDF> {
+/// The one [`ScalarUDF`] handle, built once however many contexts register it.
+///
+/// Not public: the read path builds the call from [`BYTEA_IN_UDF_NAME`] and every node
+/// resolves it from its own registry, so nothing outside needs the handle itself.
+fn bytea_in_udf() -> Arc<ScalarUDF> {
     static UDF: OnceLock<Arc<ScalarUDF>> = OnceLock::new();
     Arc::clone(UDF.get_or_init(|| Arc::new(ScalarUDF::from(ByteaIn::new()))))
 }
 
 /// `vaire_bytea_in(text)` — PostgreSQL's `::bytea` cast of a string.
+///
+/// Private, like every other UDF type in this crate: a caller reaches the function through
+/// [`register_bytea_in`] and the name, never through the type.
 #[derive(Debug, PartialEq, Eq, Hash)]
-pub struct ByteaIn {
+struct ByteaIn {
     signature: Signature,
 }
 
-impl Default for ByteaIn {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl ByteaIn {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
             // User-defined, so [`ScalarUDFImpl::coerce_types`] can accept exactly what
             // PostgreSQL accepts and refuse the rest with PostgreSQL's own words. A
@@ -331,26 +354,22 @@ impl ScalarUDFImpl for ByteaIn {
     }
 }
 
-/// Decode every row of a `Utf8` array, keeping NULLs NULL.
+/// Decode every row of a text array, keeping NULLs NULL.
 ///
 /// Strict, like PostgreSQL's cast: a NULL never reaches the decoder, so a column with one
 /// NULL and no bad values raises nothing.
+///
+/// The narrowing to `Utf8` is [`strings`]: `coerce_types` has already asked for `Utf8`, but
+/// that is not enough on its own to make a view or dictionary layout unreachable here.
 fn decode_array(text: &ArrayRef) -> Result<ArrayRef> {
-    // `cast` rather than a direct downcast: `coerce_types` has already asked for `Utf8`,
-    // and this keeps the function correct if a caller hands it a `Utf8View` anyway.
-    let text: StringArray = match text.data_type() {
-        DataType::Utf8 => text.as_string::<i32>().clone(),
-        _ => cast(text, &DataType::Utf8)?.as_string::<i32>().clone(),
-    };
+    let text = strings(text)?;
     let mut out = BinaryBuilder::with_capacity(text.len(), text.value_data().len());
     for value in text.iter() {
         match value {
-            Some(value) => out.append_value(decode(value).map_err(|e| {
-                // `exec_datafusion_err` would lose the wording, and the wording is what
-                // maps back to PostgreSQL's SQLSTATE once the error crosses the wire as
-                // text — see this module's doc.
-                datafusion::common::DataFusionError::Execution(e.to_string())
-            })?),
+            // `?`, so the wording reaching the client is the one the [`From`] impl above
+            // chose — the wording is what maps back to PostgreSQL's SQLSTATE once the error
+            // crosses the wire as text.
+            Some(value) => out.append_value(decode(value)?),
             None => out.append_null(),
         }
     }
@@ -360,7 +379,7 @@ fn decode_array(text: &ArrayRef) -> Result<ArrayRef> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::BinaryArray;
+    use arrow::array::{BinaryArray, StringArray};
     use datafusion::execution::context::SessionContext;
 
     /// Decode, or the message PostgreSQL would have printed.
@@ -508,16 +527,21 @@ mod tests {
     }
 
     /// Invoke the function the way a physical expression does, over a whole column.
-    fn invoke(text: Vec<Option<&str>>) -> Result<Vec<Option<Vec<u8>>>> {
-        let rows = text.len();
+    fn invoke_column(column: ArrayRef) -> Result<ArrayRef> {
+        let rows = column.len();
         let args = ScalarFunctionArgs {
-            args: vec![ColumnarValue::Array(Arc::new(StringArray::from(text)))],
+            args: vec![ColumnarValue::Array(column)],
             arg_fields: vec![],
             number_rows: rows,
             return_field: Arc::new(arrow::datatypes::Field::new("b", DataType::Binary, true)),
             config_options: Arc::new(datafusion::config::ConfigOptions::default()),
         };
-        let out = ByteaIn::new().invoke_with_args(args)?.to_array(rows)?;
+        ByteaIn::new().invoke_with_args(args)?.to_array(rows)
+    }
+
+    /// The decoded bytes of a column of text, row by row.
+    fn invoke(text: Vec<Option<&str>>) -> Result<Vec<Option<Vec<u8>>>> {
+        let out = invoke_column(Arc::new(StringArray::from(text)))?;
         Ok(out
             .as_any()
             .downcast_ref::<BinaryArray>()
@@ -527,30 +551,21 @@ mod tests {
             .collect())
     }
 
-    /// A whole column at once, with a NULL that must stay NULL rather than raise.
+    /// A whole column at once: a NULL stays NULL rather than raise, one bad row fails the
+    /// batch with the message that classifies back into PostgreSQL's SQLSTATE, and a batch
+    /// of no rows raises nothing — so `SELECT s::bytea` over an empty table answers no rows
+    /// the way PostgreSQL does.
     #[test]
     fn a_column_decodes_row_by_row_and_keeps_nulls() {
         assert_eq!(
             invoke(vec![Some("\\x41"), None, Some("b")]).expect("should not raise"),
             vec![Some(vec![0x41]), None, Some(b"b".to_vec())]
         );
-    }
-
-    /// One bad row fails the batch, with the message that classifies back into
-    /// PostgreSQL's SQLSTATE.
-    #[test]
-    fn one_bad_row_raises_with_postgresqls_message() {
         let err = invoke(vec![Some("\\x41"), Some("\\xzz")]).expect_err("should have raised");
         assert!(
             err.to_string().contains("invalid hexadecimal digit"),
             "got: {err}"
         );
-    }
-
-    /// A batch of no rows raises nothing, so `SELECT s::bytea` over an empty table answers
-    /// no rows the way PostgreSQL does.
-    #[test]
-    fn an_empty_batch_raises_nothing() {
         assert_eq!(invoke(vec![]).expect("should not raise"), vec![]);
     }
 
@@ -558,18 +573,7 @@ mod tests {
     #[test]
     fn bytes_pass_through_unchanged() {
         let bytes: ArrayRef = Arc::new(BinaryArray::from(vec![Some(&[0xDEu8, 0xAD][..]), None]));
-        let args = ScalarFunctionArgs {
-            args: vec![ColumnarValue::Array(Arc::clone(&bytes))],
-            arg_fields: vec![],
-            number_rows: 2,
-            return_field: Arc::new(arrow::datatypes::Field::new("b", DataType::Binary, true)),
-            config_options: Arc::new(datafusion::config::ConfigOptions::default()),
-        };
-        let out = ByteaIn::new()
-            .invoke_with_args(args)
-            .expect("should not raise")
-            .to_array(2)
-            .expect("two rows");
+        let out = invoke_column(Arc::clone(&bytes)).expect("should not raise");
         assert_eq!(&out, &bytes);
     }
 

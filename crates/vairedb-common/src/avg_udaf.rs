@@ -75,10 +75,9 @@ use std::sync::{Arc, OnceLock};
 
 use arrow::array::{
     Array, ArrayRef, AsArray, BooleanArray, Decimal128Array, Decimal128Builder, Int64Array,
-    ListArray, UInt64Array,
+    UInt64Array,
 };
-use arrow::buffer::{OffsetBuffer, ScalarBuffer};
-use arrow::datatypes::{DataType, Decimal128Type, Field, FieldRef, Int64Type, UInt64Type};
+use arrow::datatypes::{DataType, Decimal128Type, FieldRef, Int64Type, UInt64Type};
 use datafusion::common::{DataFusionError, Result, ScalarValue, internal_err, plan_err};
 use datafusion::execution::FunctionRegistry;
 use datafusion::logical_expr::function::{AccumulatorArgs, StateFieldsArgs};
@@ -87,8 +86,10 @@ use datafusion::logical_expr::{
     Signature, Volatility,
 };
 
-use crate::error::tagged_message;
-use crate::proto::vairedb::v1::VdbErrorCode;
+use crate::numeric::{
+    DECIMAL128_CEILING, OutOfRange, RESULT_PRECISION, RESULT_SCALE, distinct_state,
+    distinct_state_field, state_field,
+};
 
 /// The name the read path emits and every node resolves the call by.
 ///
@@ -98,21 +99,9 @@ use crate::proto::vairedb::v1::VdbErrorCode;
 /// when a `bigint` and a `numeric` argument have become the same expression.
 pub const EXACT_AVG_UDAF_NAME: &str = "vaire_avg";
 
-/// The precision the answer is reported at: Arrow's widest 128-bit decimal, which is what
-/// `sum`'s exact total and [`crate::stats_udaf`] report too.
-const RESULT_PRECISION: u8 = 38;
-
-/// The decimal places of the answer — PostgreSQL's own sixteen, for the reason in the
-/// module doc.
-const RESULT_SCALE: i8 = 16;
-
 /// `10¹⁶`, the factor a quotient is scaled by to become the unscaled integer of a
 /// `Decimal128(38, 16)`.
 const RESULT_MULTIPLIER: u128 = 10u128.pow(RESULT_SCALE as u32);
-
-/// The magnitude a running total must stay under, so that it is a value the
-/// `Decimal128(38, 0)` it crosses the wire as can hold.
-const TOTAL_CEILING: i128 = 10i128.pow(RESULT_PRECISION as u32);
 
 /// Register VaireDB's exact integer average on `registry`.
 ///
@@ -136,18 +125,12 @@ pub fn exact_average_udaf() -> Arc<AggregateUDF> {
 
 /// `vaire_avg(<integer>)` — the exact average of an integer column, as `numeric(38, 16)`.
 #[derive(Debug, PartialEq, Eq, Hash)]
-pub struct ExactAverage {
+struct ExactAverage {
     signature: Signature,
 }
 
-impl Default for ExactAverage {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl ExactAverage {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
             // User-defined, because the only coercion this aggregate admits is the widening
             // of one integer to another — see [`Self::coerce_types`], which is also what
@@ -198,27 +181,17 @@ impl AggregateUDFImpl for ExactAverage {
     }
 
     fn state_fields(&self, args: StateFieldsArgs) -> Result<Vec<FieldRef>> {
-        let state = |suffix: &str, data_type: DataType| {
-            Arc::new(Field::new(
-                format!("{}[{suffix}]", args.name),
-                data_type,
-                true,
-            )) as FieldRef
-        };
         if args.is_distinct {
             // The values themselves, because whether a value counts towards the total
             // depends on every value before it — see [`ExactAverageAccumulator::distinct`].
-            return Ok(vec![state(
-                "distinct",
-                DataType::List(Arc::new(Field::new_list_field(DataType::Int64, true))),
-            )]);
+            return Ok(vec![distinct_state_field(args.name, DataType::Int64)]);
         }
         // What a shard sends a final aggregate: `n` and `Σuᵢ`. Merging is two additions,
         // and the total crosses at scale 0 — the scale of the answer is applied to the
         // quotient, so no digit of it is spent on the wire.
         Ok(vec![
-            state("count", DataType::UInt64),
-            state("sum", DataType::Decimal128(RESULT_PRECISION, 0)),
+            state_field(args.name, "count", DataType::UInt64),
+            state_field(args.name, "sum", DataType::Decimal128(RESULT_PRECISION, 0)),
         ])
     }
 
@@ -261,21 +234,9 @@ impl AggregateUDFImpl for ExactAverage {
     }
 }
 
-/// The out-of-range refusal, tagged so it survives the trip from an executor.
-///
-/// This runs on the node that evaluates the aggregate, and a `DataFusionError` raised there
-/// reaches the coordinator as text with its variant gone (§ 1.3 of the gap analysis).
-/// Without the tag the client would be told `XX000 internal_error` — that the server broke
-/// and the statement is worth retrying — where the truth is `22003`: the answer does not
-/// fit, and it will not fit on a retry either.
+/// [`crate::numeric::out_of_range`] in this aggregate's own words.
 fn out_of_range() -> DataFusionError {
-    DataFusionError::Execution(tagged_message(
-        VdbErrorCode::NumericValueOutOfRange,
-        format!(
-            "the exact average of these values does not fit \
-             numeric({RESULT_PRECISION}, {RESULT_SCALE})"
-        ),
-    ))
+    crate::numeric::out_of_range("average")
 }
 
 /// `n` and `Σuᵢ` over the `bigint`s of one group, and everything that can be said about a
@@ -287,12 +248,20 @@ struct Totals {
 }
 
 impl Totals {
-    /// Fold `count` values summing to `sum` in, `None` if the total left the range a
+    /// The totals of one value, which is what a row of a value column contributes.
+    fn single(value: i64) -> Self {
+        Self {
+            count: 1,
+            sum: i128::from(value),
+        }
+    }
+
+    /// Fold another row's or another node's totals in, `None` if the total left the range a
     /// `Decimal128(38, 0)` can carry to another node.
-    fn merge(&mut self, count: u64, sum: i128) -> Option<()> {
-        self.count = self.count.checked_add(count)?;
-        self.sum = self.sum.checked_add(sum)?;
-        match self.sum.checked_abs()? < TOTAL_CEILING {
+    fn merge(&mut self, other: Totals) -> Option<()> {
+        self.count = self.count.checked_add(other.count)?;
+        self.sum = self.sum.checked_add(other.sum)?;
+        match self.sum.checked_abs()? < DECIMAL128_CEILING {
             true => Some(()),
             false => None,
         }
@@ -306,24 +275,86 @@ impl Totals {
     }
 }
 
+/// The `n` and `Σuᵢ` a partial aggregate sent, as the two state columns hold them.
+///
+/// Both accumulators below merge the same pair of columns, and the rule for a null in either
+/// is the same one: a group that saw no values contributes nothing rather than refusing,
+/// because a partial aggregate over an empty partition is a legitimate state to merge.
+struct PartialTotals<'a> {
+    counts: &'a UInt64Array,
+    sums: &'a Decimal128Array,
+}
+
+impl<'a> PartialTotals<'a> {
+    /// The two state columns, in the order [`ExactAverage`]'s state fields declare them.
+    fn read(states: &'a [ArrayRef]) -> Result<Self> {
+        let [counts, sums] = states else {
+            return internal_err!(
+                "{EXACT_AVG_UDAF_NAME} merges two totals, got {}",
+                states.len()
+            );
+        };
+        Ok(Self {
+            counts: counts.as_primitive::<UInt64Type>(),
+            sums: sums.as_primitive::<Decimal128Type>(),
+        })
+    }
+
+    fn rows(&self) -> usize {
+        self.counts.len()
+    }
+
+    /// One row's contribution, a null in either column reading as nothing at all.
+    fn row(&self, row: usize) -> Totals {
+        Totals {
+            count: match self.counts.is_null(row) {
+                true => 0,
+                false => self.counts.value(row),
+            },
+            sum: match self.sums.is_null(row) {
+                true => 0,
+                false => self.sums.value(row),
+            },
+        }
+    }
+}
+
 /// The unscaled integer of the `Decimal128(38, 16)` average of `totals`, or `None` for a
 /// group PostgreSQL answers NULL for.
 ///
 /// `Σuᵢ · 10¹⁶ / n` rounded half away from zero, which is PostgreSQL's own rule for a
-/// `numeric` division, computed as a whole part plus a scaled remainder so that the widest
-/// intermediate is `(n − 1) · 10¹⁶` rather than `Σuᵢ · 10¹⁶`. The sign is carried outside
-/// the arithmetic: away from zero and up are then the same rounding.
+/// `numeric` division. The sign is carried outside the arithmetic — away from zero and up are
+/// then the same rounding, and [`rounded_quotient`] divides two magnitudes.
 fn exact_average(totals: Totals) -> std::result::Result<Option<i128>, OutOfRange> {
     if totals.count == 0 {
         return Ok(None);
     }
-    let count = u128::from(totals.count);
-    let magnitude = totals.sum.unsigned_abs();
+    let magnitude = rounded_quotient(totals.sum.unsigned_abs(), u128::from(totals.count))?;
 
+    // The last step, and the one that keeps a plausible wrong number off the wire: a value
+    // wider than the declared precision is not reported at a lower one. No integer column
+    // reaches it — a `bigint` average needs 35 of the 38 digits — so this fires only for a
+    // total that was already past `10³⁸`.
+    let magnitude = i128::try_from(magnitude).map_err(|_| OutOfRange)?;
+    if magnitude >= DECIMAL128_CEILING {
+        return Err(OutOfRange);
+    }
+    Ok(Some(match totals.sum.is_negative() {
+        true => -magnitude,
+        false => magnitude,
+    }))
+}
+
+/// `⌊magnitude · 10¹⁶ / count⌉` rounded half up, for `count > 0`.
+///
+/// Computed as a whole part plus a scaled remainder so that the widest intermediate is
+/// `(count − 1) · 10¹⁶` rather than `magnitude · 10¹⁶`, which is what lets the total be kept
+/// at scale 0 and the scale of the answer be applied here, to the quotient.
+fn rounded_quotient(magnitude: u128, count: u128) -> std::result::Result<u128, OutOfRange> {
     let whole = magnitude / count;
     let remainder = magnitude % count;
     let scaled_remainder = remainder.checked_mul(RESULT_MULTIPLIER).ok_or(OutOfRange)?;
-    let unscaled = whole
+    let quotient = whole
         .checked_mul(RESULT_MULTIPLIER)
         .ok_or(OutOfRange)?
         .checked_add(scaled_remainder / count)
@@ -331,32 +362,11 @@ fn exact_average(totals: Totals) -> std::result::Result<Option<i128>, OutOfRange
     // `remainder ≥ count − remainder` rather than `2 · remainder ≥ count`, so that the
     // comparison cannot overflow: `0 ≤ remainder < count`.
     let remainder = scaled_remainder % count;
-    let unscaled = match remainder >= count - remainder {
-        true => unscaled.checked_add(1).ok_or(OutOfRange)?,
-        false => unscaled,
-    };
-
-    // The last step, and the one that keeps a plausible wrong number off the wire: a value
-    // wider than the declared precision is not reported at a lower one. No integer column
-    // reaches it — a `bigint` average needs 35 of the 38 digits — so this fires only for a
-    // total that was already past `10³⁸`.
-    let unscaled = i128::try_from(unscaled).map_err(|_| OutOfRange)?;
-    if unscaled >= TOTAL_CEILING {
-        return Err(OutOfRange);
+    match remainder >= count - remainder {
+        true => quotient.checked_add(1).ok_or(OutOfRange),
+        false => Ok(quotient),
     }
-    Ok(Some(match totals.sum.is_negative() {
-        true => -unscaled,
-        false => unscaled,
-    }))
 }
-
-/// The answer does not fit `Decimal128(38, 16)`, or a total outgrew the range it crosses the
-/// wire in.
-///
-/// Kept as a unit type rather than a `DataFusionError` so the arithmetic above has no
-/// opinion about how a refusal is reported.
-#[derive(Debug, PartialEq, Eq)]
-struct OutOfRange;
 
 /// Accumulates `n` and `Σuᵢ` and answers their exact quotient.
 #[derive(Debug, Default)]
@@ -377,14 +387,6 @@ impl ExactAverageAccumulator {
         }
     }
 
-    /// The values in `array`, checked to be the `bigint`s the accumulator was opened for.
-    fn integers<'a>(&self, array: &'a ArrayRef) -> Result<&'a Int64Array> {
-        match array.data_type() {
-            DataType::Int64 => Ok(array.as_primitive::<Int64Type>()),
-            other => internal_err!("{EXACT_AVG_UDAF_NAME} accumulates a bigint, not {other}"),
-        }
-    }
-
     /// The totals to answer from, which for `DISTINCT` are folded only now.
     fn totals(&self) -> Result<Totals> {
         let Some(seen) = &self.distinct else {
@@ -393,11 +395,40 @@ impl ExactAverageAccumulator {
         let mut totals = Totals::default();
         for value in seen {
             totals
-                .merge(1, i128::from(*value))
+                .merge(Totals::single(*value))
                 .ok_or_else(out_of_range)?;
         }
         Ok(totals)
     }
+}
+
+/// The values in `array`, checked to be the `bigint`s an accumulator was opened for.
+///
+/// Both accumulators read the same column and refuse the same way: the coercion admits only
+/// `Int64`, so anything else here is a plan this aggregate was never asked to answer.
+fn integers(array: &ArrayRef) -> Result<&Int64Array> {
+    match array.data_type() {
+        DataType::Int64 => Ok(array.as_primitive::<Int64Type>()),
+        other => internal_err!("{EXACT_AVG_UDAF_NAME} accumulates a bigint, not {other}"),
+    }
+}
+
+/// Fold another accumulator's `DISTINCT` values into the ones already seen.
+fn merge_distinct(seen: &mut HashSet<i64>, states: &[ArrayRef]) -> Result<()> {
+    let Some(state) = states.first() else {
+        return internal_err!("{EXACT_AVG_UDAF_NAME} needs its own DISTINCT state to merge");
+    };
+    for partial in state.as_list::<i32>().iter().flatten() {
+        match partial.data_type() {
+            DataType::Int64 => seen.extend(partial.as_primitive::<Int64Type>().iter().flatten()),
+            other => {
+                return internal_err!(
+                    "{EXACT_AVG_UDAF_NAME} cannot merge a DISTINCT list of {other}"
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 impl Accumulator for ExactAverageAccumulator {
@@ -405,14 +436,14 @@ impl Accumulator for ExactAverageAccumulator {
         let Some(values) = values.first() else {
             return internal_err!("{EXACT_AVG_UDAF_NAME} needs a value to accumulate");
         };
-        let values = self.integers(values)?;
+        let values = integers(values)?;
         if let Some(seen) = &mut self.distinct {
             seen.extend(values.iter().flatten());
             return Ok(());
         }
         for value in values.iter().flatten() {
             self.totals
-                .merge(1, i128::from(value))
+                .merge(Totals::single(value))
                 .ok_or_else(out_of_range)?;
         }
         Ok(())
@@ -425,7 +456,7 @@ impl Accumulator for ExactAverageAccumulator {
         if self.distinct.is_some() {
             return internal_err!("{EXACT_AVG_UDAF_NAME} cannot retract a DISTINCT value");
         }
-        let values = self.integers(values)?;
+        let values = integers(values)?;
         for value in values.iter().flatten() {
             self.totals.remove(value).ok_or_else(|| {
                 DataFusionError::Internal(format!(
@@ -438,45 +469,13 @@ impl Accumulator for ExactAverageAccumulator {
 
     fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
         if let Some(seen) = &mut self.distinct {
-            let Some(state) = states.first() else {
-                return internal_err!(
-                    "{EXACT_AVG_UDAF_NAME} needs its own DISTINCT state to merge"
-                );
-            };
-            for partial in state.as_list::<i32>().iter().flatten() {
-                match partial.data_type() {
-                    DataType::Int64 => {
-                        seen.extend(partial.as_primitive::<Int64Type>().iter().flatten())
-                    }
-                    other => {
-                        return internal_err!(
-                            "{EXACT_AVG_UDAF_NAME} cannot merge a DISTINCT list of {other}"
-                        );
-                    }
-                }
-            }
-            return Ok(());
+            return merge_distinct(seen, states);
         }
-        let [counts, sums] = states else {
-            return internal_err!(
-                "{EXACT_AVG_UDAF_NAME} merges two totals, got {}",
-                states.len()
-            );
-        };
-        let counts = counts.as_primitive::<UInt64Type>();
-        let sums = sums.as_primitive::<Decimal128Type>();
-        for row in 0..counts.len() {
-            // A group that saw no values contributes nothing rather than refusing: a
-            // partial aggregate over an empty partition is a legitimate state to merge.
-            let count = match counts.is_null(row) {
-                true => 0,
-                false => counts.value(row),
-            };
-            let sum = match sums.is_null(row) {
-                true => 0,
-                false => sums.value(row),
-            };
-            self.totals.merge(count, sum).ok_or_else(out_of_range)?;
+        let partials = PartialTotals::read(states)?;
+        for row in 0..partials.rows() {
+            self.totals
+                .merge(partials.row(row))
+                .ok_or_else(out_of_range)?;
         }
         Ok(())
     }
@@ -484,10 +483,7 @@ impl Accumulator for ExactAverageAccumulator {
     fn state(&mut self) -> Result<Vec<ScalarValue>> {
         if let Some(seen) = &self.distinct {
             let values = Int64Array::from_iter_values(seen.iter().copied());
-            let element = Field::new_list_field(DataType::Int64, true);
-            let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, values.len() as i32]));
-            let list = ListArray::new(Arc::new(element), offsets, Arc::new(values), None);
-            return Ok(vec![ScalarValue::List(Arc::new(list))]);
+            return Ok(vec![distinct_state(Arc::new(values))]);
         }
         Ok(vec![
             ScalarValue::UInt64(Some(self.totals.count)),
@@ -535,15 +531,13 @@ impl ExactAverageGroupsAccumulator {
         self.totals.resize(total_num_groups, Totals::default());
     }
 
-    /// Fold a partial total into one group.
-    fn merge(&mut self, group: usize, count: u64, sum: i128) -> Result<()> {
+    /// Fold a row's or a partial aggregate's totals into one group.
+    fn merge(&mut self, group: usize, partial: Totals) -> Result<()> {
+        let groups = self.totals.len();
         let Some(totals) = self.totals.get_mut(group) else {
-            return internal_err!(
-                "{EXACT_AVG_UDAF_NAME} was given group {group} of {}",
-                self.totals.len()
-            );
+            return internal_err!("{EXACT_AVG_UDAF_NAME} was given group {group} of {groups}");
         };
-        totals.merge(count, sum).ok_or_else(out_of_range)
+        totals.merge(partial).ok_or_else(out_of_range)
     }
 
     /// The groups `emit_to` asks for, taken out of the state.
@@ -574,19 +568,13 @@ impl GroupsAccumulator for ExactAverageGroupsAccumulator {
         let Some(values) = values.first() else {
             return internal_err!("{EXACT_AVG_UDAF_NAME} needs a value to accumulate");
         };
-        let DataType::Int64 = values.data_type() else {
-            return internal_err!(
-                "{EXACT_AVG_UDAF_NAME} accumulates a bigint, not {}",
-                values.data_type()
-            );
-        };
-        let values = values.as_primitive::<Int64Type>();
+        let values = integers(values)?;
         self.widen(total_num_groups);
         for (row, group) in group_indices.iter().enumerate() {
             if values.is_null(row) || !included(opt_filter, row) {
                 continue;
             }
-            self.merge(*group, 1, i128::from(values.value(row)))?;
+            self.merge(*group, Totals::single(values.value(row)))?;
         }
         Ok(())
     }
@@ -598,28 +586,13 @@ impl GroupsAccumulator for ExactAverageGroupsAccumulator {
         opt_filter: Option<&BooleanArray>,
         total_num_groups: usize,
     ) -> Result<()> {
-        let [counts, sums] = values else {
-            return internal_err!(
-                "{EXACT_AVG_UDAF_NAME} merges two totals, got {}",
-                values.len()
-            );
-        };
-        let counts = counts.as_primitive::<UInt64Type>();
-        let sums = sums.as_primitive::<Decimal128Type>();
+        let partials = PartialTotals::read(values)?;
         self.widen(total_num_groups);
         for (row, group) in group_indices.iter().enumerate() {
             if !included(opt_filter, row) {
                 continue;
             }
-            let count = match counts.is_null(row) {
-                true => 0,
-                false => counts.value(row),
-            };
-            let sum = match sums.is_null(row) {
-                true => 0,
-                false => sums.value(row),
-            };
-            self.merge(*group, count, sum)?;
+            self.merge(*group, partials.row(row))?;
         }
         Ok(())
     }
@@ -656,16 +629,15 @@ impl GroupsAccumulator for ExactAverageGroupsAccumulator {
 mod tests {
     use super::*;
     use arrow::array::{Int32Array, RecordBatch};
-    use arrow::datatypes::Schema;
+    use arrow::datatypes::{Field, Schema};
     use datafusion::execution::context::SessionContext;
-    use datafusion::logical_expr::{Expr, col};
 
     /// The totals of a set of `bigint`s.
     fn totals(values: &[i64]) -> Totals {
         let mut totals = Totals::default();
         for value in values {
             totals
-                .merge(1, i128::from(*value))
+                .merge(Totals::single(*value))
                 .expect("no overflow in a test fixture");
         }
         totals
@@ -679,18 +651,13 @@ mod tests {
         Some(arrow::util::display::array_value_to_string(&array, 0).expect("rendered"))
     }
 
-    /// The non-terminating case, which is the whole of the gap this module closes:
-    /// PostgreSQL answers `1.6666666666666667` and so does this.
+    /// The non-terminating case, which is the whole of the gap this module closes, and the
+    /// direction it rounds in: half away from zero, PostgreSQL's rule for a `numeric`
+    /// division, and the same rule on both sides of zero. `5/3` and `2/3` are `…666…`
+    /// rounded **up** in the sixteenth place; `−2/3` is the same digits with a sign.
     #[test]
-    fn a_non_terminating_average_carries_postgresqls_sixteen_places() {
+    fn a_repeating_average_rounds_half_away_from_zero_in_the_sixteenth_place() {
         assert_eq!(average(&[1, 2, 2]).as_deref(), Some("1.6666666666666667"));
-    }
-
-    /// Rounding is half away from zero, PostgreSQL's rule for a `numeric` division, and it
-    /// is the same rule on both sides of zero. `2/3` is `0.666…` rounded **up** in the last
-    /// place; `−2/3` is the same digits with a sign.
-    #[test]
-    fn a_repeating_average_rounds_half_away_from_zero() {
         assert_eq!(average(&[0, 0, 2]).as_deref(), Some("0.6666666666666667"));
         assert_eq!(average(&[0, 0, -2]).as_deref(), Some("-0.6666666666666667"));
         // Exactly a half in the seventeenth place, which is the boundary the rule decides:
@@ -734,9 +701,12 @@ mod tests {
     fn a_total_past_the_wire_ceiling_is_refused() {
         let mut totals = Totals {
             count: 1,
-            sum: TOTAL_CEILING - 1,
+            sum: DECIMAL128_CEILING - 1,
         };
-        assert!(totals.merge(1, 1).is_none(), "one past the ceiling refuses");
+        assert!(
+            totals.merge(Totals::single(1)).is_none(),
+            "one past the ceiling refuses"
+        );
         assert!(
             out_of_range().message().contains("numeric(38, 16)"),
             "the refusal names the type the value did not fit: {}",
@@ -748,10 +718,10 @@ mod tests {
     /// exactly where they were before the value arrived.
     #[test]
     fn retracting_a_value_undoes_accumulating_it() {
-        let mut totals = totals(&[10, 20, 30]);
-        totals.remove(30).expect("accumulated");
-        assert_eq!(totals, super::tests::totals(&[10, 20]));
-        assert_eq!(exact_average(totals), Ok(Some(15 * 10i128.pow(16))));
+        let mut running = totals(&[10, 20, 30]);
+        running.remove(30).expect("accumulated");
+        assert_eq!(running, totals(&[10, 20]));
+        assert_eq!(exact_average(running), Ok(Some(15 * 10i128.pow(16))));
     }
 
     /// One table: two `bigint` values whose exact average is past `2⁵³`, and the same
@@ -909,10 +879,12 @@ mod tests {
         );
     }
 
-    /// The registration is idempotent, because the two contexts that hold this aggregate
-    /// are built by code that may run more than once.
+    /// The registration is keyed on the name the read-path rewrite emits, which is the
+    /// contract between the two halves of the fix: the coordinator names the aggregate and
+    /// the executor resolves the name. And it is idempotent, because the two contexts that
+    /// hold this aggregate are built by code that may run more than once.
     #[test]
-    fn registering_twice_is_registering_once() {
+    fn registering_twice_registers_the_name_the_rewrite_emits() {
         let mut ctx = SessionContext::new();
         register_exact_average(&mut ctx).expect("first registration failed");
         register_exact_average(&mut ctx).expect("second registration failed");
@@ -920,22 +892,6 @@ mod tests {
             ctx.state()
                 .aggregate_functions()
                 .contains_key(EXACT_AVG_UDAF_NAME)
-        );
-    }
-
-    /// The expression the rewrite builds resolves to this aggregate, which is the contract
-    /// between the two halves of the fix: the coordinator names it and the executor
-    /// resolves the name.
-    #[test]
-    fn the_shared_handle_is_named_what_the_rewrite_emits() {
-        let udaf = exact_average_udaf();
-        assert_eq!(udaf.name(), EXACT_AVG_UDAF_NAME);
-        let call: Expr = udaf.call(vec![col("big")]);
-        assert!(
-            call.schema_name()
-                .to_string()
-                .starts_with(EXACT_AVG_UDAF_NAME),
-            "the call renders under its own name: {call}"
         );
     }
 }

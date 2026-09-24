@@ -322,11 +322,13 @@ fn reclassify_transported_error(raw: &str, code: VdbErrorCode) -> (VdbErrorCode,
             return (recovered_code, message);
         }
     }
-    if let Some(bytea_code) = vairedb_common::bytea_in::error_code_of_message(raw) {
-        return (bytea_code, innermost());
-    }
-    if let Some(nth_value_code) = vairedb_common::nth_value::error_code_of_message(raw) {
-        return (nth_value_code, innermost());
+    // A refusal raised inside an executor by one of VaireDB's own functions, recognized by
+    // its wording because the type did not survive the Ballista boundary. Asked of the set
+    // rather than of each family in turn, so a family that gains a classifiable refusal
+    // reaches this line without it being edited — see
+    // [`vairedb_common::distributed_functions::error_code_of_message`].
+    if let Some(function_code) = vairedb_common::distributed_functions::error_code_of_message(raw) {
+        return (function_code, innermost());
     }
     (code, raw.to_string())
 }

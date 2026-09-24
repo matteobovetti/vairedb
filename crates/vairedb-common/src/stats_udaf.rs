@@ -25,7 +25,7 @@
 //! admits nothing but `Float64`, so a decimal argument is cast straight back — and it is not
 //! how `avg` is fixed either, which is [`crate::avg_udaf`], an aggregate like this one.
 //! Registering an `AggregateUDF` under DataFusion's own names replaces
-//! them — the same shadowing [`crate::udaf`] does for `percentile_cont` and
+//! them — the same shadowing [`crate::within_group`] does for `percentile_cont` and
 //! [`crate::nth_value`] does for `nth_value` — and it is registered under **every** alias
 //! DataFusion registers, or a client writing `var_samp` would reach the float version while
 //! `var` reached this one.
@@ -92,11 +92,8 @@ use std::collections::HashSet;
 use std::mem::size_of_val;
 use std::sync::{Arc, OnceLock};
 
-use arrow::array::{Array, ArrayRef, AsArray, Decimal128Array, ListArray};
-use arrow::buffer::{OffsetBuffer, ScalarBuffer};
-use arrow::datatypes::{
-    DataType, Decimal128Type, Decimal256Type, Field, FieldRef, UInt64Type, i256,
-};
+use arrow::array::{Array, ArrayRef, AsArray, Decimal128Array};
+use arrow::datatypes::{DataType, Decimal128Type, Decimal256Type, FieldRef, UInt64Type, i256};
 use datafusion::common::{DataFusionError, Result, ScalarValue, internal_err, plan_err};
 use datafusion::execution::FunctionRegistry;
 use datafusion::functions_aggregate::stddev::{stddev_pop_udaf, stddev_udaf};
@@ -107,16 +104,10 @@ use datafusion::logical_expr::{
     Volatility,
 };
 
-use crate::error::tagged_message;
-use crate::proto::vairedb::v1::VdbErrorCode;
-
-/// The precision every exact answer is reported at: Arrow's widest 128-bit decimal, which
-/// is also the one [`crate`]'s `sum` and `avg` widening reports.
-const RESULT_PRECISION: u8 = 38;
-
-/// The decimal places of an exact answer — `avg`'s sixteen, for the reason in the module
-/// doc.
-const RESULT_SCALE: i8 = 16;
+use crate::numeric::{
+    DECIMAL128_CEILING, OutOfRange, RESULT_PRECISION, RESULT_SCALE, distinct_state,
+    distinct_state_field, state_field,
+};
 
 /// The precision the running totals are carried at.
 ///
@@ -235,12 +226,41 @@ impl Statistic {
     fn minimum_rows(self) -> u64 {
         if self.is_sample() { 2 } else { 1 }
     }
+
+    /// The denominator of the ratio in the module doc: `n(n−1)` for a sample statistic, `n²`
+    /// for a population one.
+    fn denominator(self, count: i256) -> Option<i256> {
+        match self.is_sample() {
+            true => count.checked_mul(count.checked_sub(i256::ONE)?),
+            false => count.checked_mul(count),
+        }
+    }
+
+    /// The power of ten the numerator is scaled by before the division.
+    ///
+    /// The result's own sixteen places, doubled for a standard deviation because the square
+    /// root that follows halves the scale again.
+    fn scale_power(self) -> u32 {
+        let places = u32::from(RESULT_SCALE.unsigned_abs());
+        match self.is_deviation() {
+            true => 2 * places,
+            false => places,
+        }
+    }
+
+    /// The answer's unscaled integer: the rounded ratio, or the rounded square root of it.
+    fn of_ratio(self, numerator: i256, denominator: i256, power: u32) -> Option<i256> {
+        match self.is_deviation() {
+            true => rounded_sqrt(numerator, denominator, power),
+            false => rounded_div(numerator, denominator, power),
+        }
+    }
 }
 
 /// One of PostgreSQL's four statistics: exact over an exact input, DataFusion's over a
 /// float one.
 #[derive(Debug, PartialEq, Eq, Hash)]
-pub struct ExactStatistic {
+struct ExactStatistic {
     kind: Statistic,
     signature: Signature,
     aliases: Vec<String>,
@@ -256,6 +276,24 @@ impl ExactStatistic {
             signature: Signature::user_defined(Volatility::Immutable),
             aliases: kind.aliases(),
         }
+    }
+
+    /// The accumulator for one call, exact or DataFusion's.
+    ///
+    /// `sliding` picks which of DataFusion's two the float path gets; the exact one is
+    /// already able to retract, so there is only one of it.
+    fn open(&self, args: AccumulatorArgs, sliding: bool) -> Result<Box<dyn Accumulator>> {
+        let Some(scale) = exact_input_scale(&args)? else {
+            return match sliding {
+                true => self.kind.delegate().create_sliding_accumulator(args),
+                false => self.kind.delegate().accumulator(args),
+            };
+        };
+        Ok(Box::new(ExactStatistics::new(
+            self.kind,
+            scale,
+            args.is_distinct,
+        )))
     }
 }
 
@@ -303,30 +341,21 @@ impl AggregateUDFImpl for ExactStatistic {
         let Some(scale) = exact_scale(args.return_field.data_type(), input.data_type())? else {
             return self.kind.delegate().state_fields(args);
         };
-        let state = |suffix: &str, data_type: DataType| {
-            Arc::new(Field::new(
-                format!("{}[{suffix}]", args.name),
-                data_type,
-                true,
-            )) as FieldRef
-        };
         if args.is_distinct {
             // The values themselves, because de-duplicating them is not something three
             // running totals can do — see [`ExactStatistics::distinct`].
-            return Ok(vec![state(
-                "distinct",
-                DataType::List(Arc::new(Field::new_list_field(
-                    DataType::Decimal128(RESULT_PRECISION, scale),
-                    true,
-                ))),
+            return Ok(vec![distinct_state_field(
+                args.name,
+                DataType::Decimal128(RESULT_PRECISION, scale),
             )]);
         }
         // What a shard sends a final aggregate: `n`, `Σuᵢ` and `Σuᵢ²`. Merging is three
         // additions, and no value crosses the wire twice.
+        let total = DataType::Decimal256(TOTAL_PRECISION, 0);
         Ok(vec![
-            state("count", DataType::UInt64),
-            state("sum", DataType::Decimal256(TOTAL_PRECISION, 0)),
-            state("sum_squares", DataType::Decimal256(TOTAL_PRECISION, 0)),
+            state_field(args.name, "count", DataType::UInt64),
+            state_field(args.name, "sum", total.clone()),
+            state_field(args.name, "sum_squares", total),
         ])
     }
 
@@ -367,26 +396,6 @@ impl AggregateUDFImpl for ExactStatistic {
 
     fn documentation(&self) -> Option<&Documentation> {
         self.kind.delegate().documentation()
-    }
-}
-
-impl ExactStatistic {
-    /// The accumulator for one call, exact or DataFusion's.
-    ///
-    /// `sliding` picks which of DataFusion's two the float path gets; the exact one is
-    /// already able to retract, so there is only one of it.
-    fn open(&self, args: AccumulatorArgs, sliding: bool) -> Result<Box<dyn Accumulator>> {
-        let Some(scale) = exact_input_scale(&args)? else {
-            return match sliding {
-                true => self.kind.delegate().create_sliding_accumulator(args),
-                false => self.kind.delegate().accumulator(args),
-            };
-        };
-        Ok(Box::new(ExactStatistics::new(
-            self.kind,
-            scale,
-            args.is_distinct,
-        )))
     }
 }
 
@@ -506,22 +515,25 @@ impl ExactStatistics {
         }
     }
 
-    /// The out-of-range refusal, tagged so it survives the trip from an executor.
-    ///
-    /// This runs on the node that evaluates the aggregate, and a `DataFusionError` raised
-    /// there reaches the coordinator as text with its variant gone (§ 1.3). Without the tag
-    /// the client would be told `XX000 internal_error` — that the server broke and the
-    /// statement is worth retrying — where the truth is `22003`: the answer does not fit,
-    /// and it will not fit on a retry either.
+    /// [`crate::numeric::out_of_range`] naming the statistic being computed.
     fn out_of_range(&self) -> DataFusionError {
-        DataFusionError::Execution(tagged_message(
-            VdbErrorCode::NumericValueOutOfRange,
-            format!(
-                "the exact {} of these values does not fit numeric({RESULT_PRECISION}, \
-                 {RESULT_SCALE})",
-                self.kind.name()
-            ),
-        ))
+        crate::numeric::out_of_range(self.kind.name())
+    }
+
+    /// Refuse a total too wide for the `Decimal256(76, 0)` it crosses the wire as.
+    ///
+    /// Both totals are validated against [`TOTAL_PRECISION`] when Arrow builds the array,
+    /// and its message would name a precision no client asked about; refusing here says what
+    /// actually happened.
+    fn ensure_totals_fit_the_wire(&self) -> Result<()> {
+        let ceiling = pow10(u32::from(TOTAL_PRECISION)).expect("10^76 fits an i256");
+        for total in [self.totals.sum, self.totals.sum_squares] {
+            let magnitude = total.checked_abs().ok_or_else(|| self.out_of_range())?;
+            if magnitude >= ceiling {
+                return Err(self.out_of_range());
+            }
+        }
+        Ok(())
     }
 
     /// The values in `array`, checked to be the decimals the accumulator was opened for.
@@ -590,22 +602,7 @@ impl Accumulator for ExactStatistics {
 
     fn merge_batch(&mut self, states: &[ArrayRef]) -> Result<()> {
         if let Some(seen) = &mut self.distinct {
-            let Some(state) = states.first() else {
-                return internal_err!("a DISTINCT statistic needs its own state to merge");
-            };
-            for partial in state.as_list::<i32>().iter().flatten() {
-                match partial.data_type() {
-                    DataType::Decimal128(_, _) => {
-                        seen.extend(partial.as_primitive::<Decimal128Type>().iter().flatten())
-                    }
-                    other => {
-                        return internal_err!(
-                            "a DISTINCT statistic cannot merge a list of {other}"
-                        );
-                    }
-                }
-            }
-            return Ok(());
+            return merge_distinct(seen, states);
         }
         let [counts, sums, sums_of_squares] = states else {
             return internal_err!(
@@ -637,21 +634,9 @@ impl Accumulator for ExactStatistics {
         if let Some(seen) = &self.distinct {
             let values = Decimal128Array::from_iter_values(seen.iter().copied())
                 .with_precision_and_scale(RESULT_PRECISION, self.input_scale)?;
-            let element = Field::new_list_field(values.data_type().clone(), true);
-            let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, values.len() as i32]));
-            let list = ListArray::new(Arc::new(element), offsets, Arc::new(values), None);
-            return Ok(vec![ScalarValue::List(Arc::new(list))]);
+            return Ok(vec![distinct_state(Arc::new(values))]);
         }
-        // Both totals are validated against `TOTAL_PRECISION` when Arrow builds the array,
-        // and its message would name a precision no client asked about; refusing here says
-        // what actually happened.
-        let ceiling = pow10(u32::from(TOTAL_PRECISION)).expect("10^76 fits an i256");
-        for total in [self.totals.sum, self.totals.sum_squares] {
-            let magnitude = total.checked_abs().ok_or_else(|| self.out_of_range())?;
-            if magnitude >= ceiling {
-                return Err(self.out_of_range());
-            }
-        }
+        self.ensure_totals_fit_the_wire()?;
         Ok(vec![
             ScalarValue::UInt64(Some(self.totals.count)),
             ScalarValue::Decimal256(Some(self.totals.sum), TOTAL_PRECISION, 0),
@@ -661,10 +646,8 @@ impl Accumulator for ExactStatistics {
 
     fn evaluate(&mut self) -> Result<ScalarValue> {
         let totals = self.totals()?;
-        let answer = match exact_statistic(self.kind, totals, self.input_scale) {
-            Ok(answer) => answer,
-            Err(OutOfRange) => return Err(self.out_of_range()),
-        };
+        let answer = exact_statistic(self.kind, totals, self.input_scale)
+            .map_err(|OutOfRange| self.out_of_range())?;
         Ok(ScalarValue::Decimal128(
             answer,
             RESULT_PRECISION,
@@ -686,18 +669,30 @@ impl Accumulator for ExactStatistics {
     }
 }
 
-/// The answer does not fit `Decimal128(38, 16)`, or a total outgrew `i256` on the way.
-///
-/// Kept as a unit type rather than a `DataFusionError` so the arithmetic below can be a set
-/// of free functions with no opinion about how a refusal is reported.
-#[derive(Debug, PartialEq, Eq)]
-struct OutOfRange;
+/// Fold another accumulator's `DISTINCT` values into the ones already seen.
+fn merge_distinct(seen: &mut HashSet<i128>, states: &[ArrayRef]) -> Result<()> {
+    let Some(state) = states.first() else {
+        return internal_err!("a DISTINCT statistic needs its own state to merge");
+    };
+    for partial in state.as_list::<i32>().iter().flatten() {
+        match partial.data_type() {
+            DataType::Decimal128(_, _) => {
+                seen.extend(partial.as_primitive::<Decimal128Type>().iter().flatten())
+            }
+            other => {
+                return internal_err!("a DISTINCT statistic cannot merge a list of {other}");
+            }
+        }
+    }
+    Ok(())
+}
 
 /// One of the four statistics as the unscaled integer of a `Decimal128(38, 16)`, or `None`
 /// for a group PostgreSQL answers NULL for.
 ///
 /// Every step is exact and every step is checked. `input_scale` is the scale of the column
-/// the totals were read from, which is what makes `Σuᵢ` an integer at all.
+/// the totals were read from, which is what makes `Σuᵢ` an integer at all — and which of the
+/// four statistics is being computed is a question only [`Statistic`] answers, three times.
 fn exact_statistic(
     kind: Statistic,
     totals: Totals,
@@ -707,65 +702,58 @@ fn exact_statistic(
         return Ok(None);
     }
     let count = i256::from_i128(i128::from(totals.count));
-
-    // SS = n·Σuᵢ² − (Σuᵢ)², the sum of squared deviations times n. Never negative — the
-    // Cauchy–Schwarz inequality is what says so — and computed this way rather than from a
-    // mean so that no division happens before the end.
-    let squared_sum = totals.sum.checked_mul(totals.sum).ok_or(OutOfRange)?;
-    let scaled_squares = count.checked_mul(totals.sum_squares).ok_or(OutOfRange)?;
-    let sum_of_squares = scaled_squares
-        .checked_sub(squared_sum)
-        .ok_or(OutOfRange)?
-        .max(i256::ZERO);
-
-    let denominator = match kind.is_sample() {
-        true => count.checked_mul(count.checked_sub(i256::ONE).ok_or(OutOfRange)?),
-        false => count.checked_mul(count),
-    }
-    .ok_or(OutOfRange)?;
-
-    // The `10²ˢ` of the two formulas in the module doc, and the `10^R` the result is scaled
-    // by, folded into one power on whichever side of the division needs it. Dividing by a
-    // smaller number than `den · 10²ˢ` is what keeps a wide input inside `i256`.
-    let two_scale = 2 * u32::try_from(input_scale).map_err(|_| OutOfRange)?;
-    let target = match kind.is_deviation() {
-        // A square root halves the scale, so it is taken at twice the result's.
-        true => 2 * u32::from(RESULT_SCALE.unsigned_abs()),
-        false => u32::from(RESULT_SCALE.unsigned_abs()),
-    };
-    let (power, denominator) = match target >= two_scale {
-        true => (target - two_scale, denominator),
-        false => (
-            0,
-            denominator
-                .checked_mul(pow10(two_scale - target).ok_or(OutOfRange)?)
-                .ok_or(OutOfRange)?,
-        ),
-    };
-
-    let unscaled = match kind.is_deviation() {
-        true => rounded_sqrt(sum_of_squares, denominator, power),
-        false => rounded_div(sum_of_squares, denominator, power),
-    }
-    .ok_or(OutOfRange)?;
+    let numerator = sum_of_squared_deviations(totals, count)?;
+    let denominator = kind.denominator(count).ok_or(OutOfRange)?;
+    let (power, denominator) = fold_input_scale(denominator, input_scale, kind.scale_power())?;
+    let unscaled = kind
+        .of_ratio(numerator, denominator, power)
+        .ok_or(OutOfRange)?;
 
     // The last step, and the one that keeps a plausible wrong number off the wire: a value
     // wider than the declared precision is not reported at a lower one.
     let unscaled = unscaled.to_i128().ok_or(OutOfRange)?;
-    match unscaled.checked_abs().ok_or(OutOfRange)? < pow10_i128(u32::from(RESULT_PRECISION)) {
+    match unscaled.checked_abs().ok_or(OutOfRange)? < DECIMAL128_CEILING {
         true => Ok(Some(unscaled)),
         false => Err(OutOfRange),
     }
 }
 
+/// `SS = n·Σuᵢ² − (Σuᵢ)²`, the sum of squared deviations times `n`.
+///
+/// Never negative — the Cauchy–Schwarz inequality is what says so — and computed this way
+/// rather than from a mean so that no division happens before the end.
+fn sum_of_squared_deviations(totals: Totals, count: i256) -> std::result::Result<i256, OutOfRange> {
+    let squared_sum = totals.sum.checked_mul(totals.sum).ok_or(OutOfRange)?;
+    let scaled_squares = count.checked_mul(totals.sum_squares).ok_or(OutOfRange)?;
+    Ok(scaled_squares
+        .checked_sub(squared_sum)
+        .ok_or(OutOfRange)?
+        .max(i256::ZERO))
+}
+
+/// The power of ten to scale the numerator by, and the denominator to divide it by.
+///
+/// The `10²ˢ` of the two formulas in the module doc, and the `10^target` the result is scaled
+/// by, folded into one power on whichever side of the division needs it. Dividing by a
+/// smaller number than `den · 10²ˢ` is what keeps a wide input inside `i256`.
+fn fold_input_scale(
+    denominator: i256,
+    input_scale: i8,
+    target: u32,
+) -> std::result::Result<(u32, i256), OutOfRange> {
+    let two_scale = 2 * u32::try_from(input_scale).map_err(|_| OutOfRange)?;
+    if target >= two_scale {
+        return Ok((target - two_scale, denominator));
+    }
+    let scaled = denominator
+        .checked_mul(pow10(two_scale - target).ok_or(OutOfRange)?)
+        .ok_or(OutOfRange)?;
+    Ok((0, scaled))
+}
+
 /// `10ᵏ` as an `i256`, or `None` past its range.
 fn pow10(k: u32) -> Option<i256> {
     i256::from_i128(10).checked_pow(k)
-}
-
-/// `10ᵏ` as an `i128`, for `k` small enough that it has one.
-fn pow10_i128(k: u32) -> i128 {
-    10i128.pow(k)
 }
 
 /// `⌊value · 10^power / den⌋` and the remainder over `den`, for `value ≥ 0` and `den > 0`.
@@ -867,7 +855,7 @@ fn integer_sqrt(value: i256) -> i256 {
 mod tests {
     use super::*;
     use arrow::array::{Int32Array, Int64Array, RecordBatch};
-    use arrow::datatypes::Schema;
+    use arrow::datatypes::{Field, Schema};
     use datafusion::execution::context::SessionContext;
 
     /// The totals of a set of integers read as `Decimal128(38, scale)`.
@@ -1022,14 +1010,14 @@ mod tests {
     /// the sixteen decimal places put the edge exactly.
     #[test]
     fn a_variance_past_the_declared_precision_is_refused() {
-        let huge = pow10_i128(20);
+        let huge = 10i128.pow(20);
         assert_eq!(
             exact_statistic(Statistic::VarPop, totals(&[huge, -huge]), 0),
             Err(OutOfRange)
         );
         // Either side of the edge: ±10¹¹ has a population variance of 10²², refused, while
         // the row below it is answered. This is the six digits the last six places cost.
-        let edge = pow10_i128(11);
+        let edge = 10i128.pow(11);
         assert_eq!(
             exact_statistic(Statistic::VarPop, totals(&[edge, -edge]), 0),
             Err(OutOfRange)
@@ -1168,31 +1156,6 @@ mod tests {
         );
     }
 
-    /// The names and aliases have to be DataFusion's exactly: `register_udaf` inserts under
-    /// each of them, so one left out goes on resolving to the float version and a client
-    /// gets a different type for `var_samp(n)` than for `var(n)`.
-    #[test]
-    fn every_spelling_datafusion_answers_to_is_replaced() {
-        let mut ctx = SessionContext::new();
-        register_statistics_aggregates(&mut ctx).expect("registration failed");
-        for name in [
-            "var",
-            "var_samp",
-            "var_sample",
-            "var_pop",
-            "var_population",
-            "stddev",
-            "stddev_samp",
-            "stddev_pop",
-        ] {
-            let udaf = ctx.udaf(name).unwrap_or_else(|_| panic!("{name} resolves"));
-            assert!(
-                udaf.inner().is::<ExactStatistic>(),
-                "{name} still resolves to DataFusion's"
-            );
-        }
-    }
-
     /// Registering twice is what a context reached by two registration paths does.
     #[test]
     fn registering_twice_is_idempotent() {
@@ -1253,9 +1216,15 @@ mod tests {
         (planned, text)
     }
 
-    /// The gap, end to end through the planner: `numeric` over an integer column.
+    /// The gap, end to end through the planner: `numeric` over an integer column, under every
+    /// spelling DataFusion answers to.
+    ///
+    /// The names and aliases have to be DataFusion's exactly: `register_udaf` inserts under
+    /// each of them, so one left out goes on resolving to the float version and a client gets
+    /// a different type for `var_samp(n)` than for `var(n)` — which is what this loop would
+    /// catch, in the form the client sees it in.
     #[tokio::test]
-    async fn an_integer_statistic_is_planned_as_numeric() {
+    async fn an_integer_statistic_is_planned_as_numeric_under_every_spelling() {
         for function in [
             "var",
             "var_samp",

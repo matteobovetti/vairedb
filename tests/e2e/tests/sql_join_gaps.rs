@@ -2397,7 +2397,9 @@ async fn test_set_operation_branch_mismatch() {
     .await;
 
     // Different types, either order, `ALL` or `DISTINCT`: PostgreSQL's `42804`, before a row
-    // is read, and the message names both types so the client knows what to cast.
+    // is read, and the message names both types so the client knows what to cast. It spells
+    // them as SQL and not as the catalog — `integer`, the way PostgreSQL's own message does,
+    // rather than `int4`, which PostgreSQL never prints in an error.
     for sql in [
         format!("SELECT id FROM {l} UNION ALL SELECT w FROM {r}"),
         format!("SELECT w FROM {r} UNION ALL SELECT id FROM {l}"),
@@ -2405,8 +2407,13 @@ async fn test_set_operation_branch_mismatch() {
     ] {
         let err = assert_sqlstate(&client, &sql, "42804").await;
         assert!(
-            err.message().contains("int4") && err.message().contains("text"),
+            err.message().contains("integer") && err.message().contains("text"),
             "`{sql}` should name both types, got: {}",
+            err.message()
+        );
+        assert!(
+            !err.message().contains("int4"),
+            "`{sql}` must not use the catalog spelling, got: {}",
             err.message()
         );
     }
@@ -2583,7 +2590,7 @@ async fn test_intersect_and_except_branch_mismatch() {
             message.contains(operator),
             "`{sql}` should name {operator}: {message}"
         );
-        for wanted in ["int4", "text", "cannot be matched"] {
+        for wanted in ["integer", "text", "cannot be matched"] {
             assert!(
                 message.contains(wanted),
                 "`{sql}` should name `{wanted}`: {message}"

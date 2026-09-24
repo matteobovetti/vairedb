@@ -142,110 +142,18 @@ fn build_session_state(
 
     // A stage arrives as a plan referring to its functions by name, so the executor
     // has to hold the same set the coordinator planned against — a UDF missing here
-    // fails the stage at deserialization, after the query was accepted. Kept in step
-    // with `vairedb_coordinator::scheduler::register_postgres_functions`.
+    // fails the stage at deserialization, after the query was accepted, and a *shadowing*
+    // UDF missing here is worse: the name resolves to DataFusion's own version and the
+    // stage returns a wrong answer instead of an error.
     let count = datafusion_pg_functions::register_all(&mut state);
     tracing::debug!(count, "registered PostgreSQL built-in functions");
 
-    // Same reasoning for the `pg_catalog` scalar functions: a stage projecting
-    // `format_type(oid, NULL)` resolves that name from *this* registry.
-    vairedb_common::pg_udf::register_pg_catalog_scalar_functions(&mut state)
-        .map_err(|e| CoreError::engine("failed to register the pg_catalog scalar functions", e))?;
-
-    // Same reasoning for the ordered-set aggregates: a stage naming `percentile_cont`
-    // is resolved from *this* registry, so an executor without them would fail a query
-    // the coordinator had already accepted.
-    vairedb_common::udaf::register_ordered_set_aggregates(&mut state)
-        .map_err(|e| CoreError::engine("failed to register the ordered-set aggregates", e))?;
-
-    // And for the rest of the `WITHIN GROUP` family — `mode()` and the hypothetical-set
-    // `rank`/`dense_rank`/`percent_rank`/`cume_dist`. A partial aggregate per shard runs
-    // *here*, so this registry is what resolves the name and this node is what merges the
-    // group the answer describes.
-    vairedb_common::within_group::register_within_group_aggregates(&mut state)
-        .map_err(|e| CoreError::engine("failed to register the WITHIN GROUP aggregates", e))?;
-
-    // Same reasoning for PostgreSQL's float division: the coordinator rewrites `/` into a
-    // call of it on the logical plan, so the stage that arrives here names it and *this*
-    // registry is what resolves it. Without it a query the coordinator accepted would fail
-    // at stage deserialization.
-    vairedb_common::float_div::register_float_division(&mut state)
-        .map_err(|e| CoreError::engine("failed to register the checked float division", e))?;
-
-    // Same reasoning for the list-valued `NOT IN`: the coordinator respells
-    // `HAVING max(k) NOT IN (q)` into a call of it before planning, so the stage that
-    // arrives here names it and *this* registry is what resolves it.
-    vairedb_common::not_in::register_not_in(&mut state)
-        .map_err(|e| CoreError::engine("failed to register the list-valued NOT IN", e))?;
-
-    // Same reasoning for the `bytea` input conversion: the coordinator rewrites `::bytea`
-    // into a call of it before planning, so the stage that arrives here names it and *this*
-    // registry is what resolves it.
-    vairedb_common::bytea_in::register_bytea_in(&mut state)
-        .map_err(|e| CoreError::engine("failed to register the bytea input conversion", e))?;
-
-    // Same reasoning for the `json` family: the coordinator rewrites `::json`, `::jsonb` and
-    // the four accessors `->`, `->>`, `#>` and `#>>` into calls before planning, so the stage
-    // that arrives here names them and *this* registry is what resolves them.
-    vairedb_common::json_pg::register_json_functions(&mut state)
-        .map_err(|e| CoreError::engine("failed to register the json functions", e))?;
-
-    // Same for the rendering half of `json_agg`/`jsonb_agg`. The aggregation itself is
-    // DataFusion's `array_agg`, which this registry already has; what the coordinator wraps
-    // around it is a name only this line resolves.
-    vairedb_common::json_agg::register_json_aggregates(&mut state)
-        .map_err(|e| CoreError::engine("failed to register the json aggregates", e))?;
-
-    // And the same for the `uuid` input conversion behind `::uuid`, which canonicalizes as
-    // well as validating — so the node that runs the projection is the node that decides
-    // whether two spellings of one UUID compare equal.
-    vairedb_common::uuid_in::register_uuid_in(&mut state)
-        .map_err(|e| CoreError::engine("failed to register the uuid input conversion", e))?;
-
-    // PostgreSQL's `nth_value` matters here more than the five above, not less: it shadows
-    // DataFusion's function under DataFusion's own name, so a stage naming `nth_value`
-    // resolves *something* from this registry either way. Without this line it resolves
-    // DataFusion's, and `nth_value(x, 0)` goes back to answering NULL for every row on the
-    // one node that evaluates the window.
-    vairedb_common::nth_value::register_nth_value(&mut state)
-        .map_err(|e| CoreError::engine("failed to register the checked nth_value", e))?;
-
-    // Same reasoning as `nth_value` for the variance and standard deviation family: these
-    // shadow DataFusion's functions under DataFusion's own names, so a stage naming
-    // `stddev` resolves *something* here either way. Without this line it resolves
-    // DataFusion's `f64` accumulator, and the coordinator's `numeric` header meets a
-    // `float8` body on the one node that computes the value.
-    vairedb_common::stats_udaf::register_statistics_aggregates(&mut state)
-        .map_err(|e| CoreError::engine("failed to register the exact statistics aggregates", e))?;
-
-    // And the same for `ntile`: the coordinator advertises `int4`, and this is the registry
-    // that resolves the evaluator producing the array behind it.
-    vairedb_common::ntile::register_ntile(&mut state)
-        .map_err(|e| CoreError::engine("failed to register the int4 ntile", e))?;
-
-    // And the exact integer average, which the coordinator rewrites `avg(integer)` into: the
-    // stage that arrives here names `vaire_avg`, this registry resolves it, and the
-    // accumulator it resolves to is what produces the sixteen decimal places the
-    // coordinator's `numeric(38, 16)` header promised.
-    vairedb_common::avg_udaf::register_exact_average(&mut state)
-        .map_err(|e| CoreError::engine("failed to register the exact integer average", e))?;
-
-    // `pg_typeof`. A projection of it over a column runs here, and the type it reports is the
-    // type *this* node's batch actually carries.
-    vairedb_common::pg_typeof::register_pg_typeof(&mut state)
-        .map_err(|e| CoreError::engine("failed to register pg_typeof", e))?;
-
-    // `format`, `quote_literal` and `quote_nullable`: names of PostgreSQL's own that nothing
-    // rewrites into, so a stage projecting one resolves it from this registry or fails the
-    // query the coordinator already accepted.
-    vairedb_common::pg_format::register_format_functions(&mut state)
-        .map_err(|e| CoreError::engine("failed to register the format functions", e))?;
-
-    // And the datetime family. Two of these are `Volatile` — `clock_timestamp` and
-    // `timeofday` — which is exactly the case constant folding cannot remove, so they are
-    // among the few functions that genuinely arrive here as a name rather than as a value.
-    vairedb_common::pg_datetime::register_datetime_functions(&mut state)
-        .map_err(|e| CoreError::engine("failed to register the datetime functions", e))?;
+    // The set VaireDB adds on top. Asked for as a set rather than listed function by
+    // function, because "identical on both nodes" is the whole of the requirement and a
+    // list written out here is a list that can fall behind the coordinator's. See
+    // [`vairedb_common::distributed_functions`].
+    vairedb_common::distributed_functions::register(&mut state)
+        .map_err(|e| CoreError::engine("failed to register the distributed functions", e))?;
 
     Ok(state)
 }

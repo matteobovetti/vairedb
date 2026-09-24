@@ -36,10 +36,10 @@
 //! compare equal after it, which is the whole point of the type.
 
 use std::fmt;
+use std::str::Chars;
 use std::sync::{Arc, OnceLock};
 
-use arrow::array::{Array, ArrayRef, AsArray, StringArray, StringBuilder};
-use arrow::compute::kernels::cast::cast;
+use arrow::array::{Array, StringBuilder};
 use arrow::datatypes::DataType;
 use datafusion::common::{DataFusionError, Result, exec_err, plan_err};
 use datafusion::execution::FunctionRegistry;
@@ -47,6 +47,7 @@ use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
 };
 
+use crate::columns::strings;
 use crate::error::tagged_message;
 use crate::proto::vairedb::v1::VdbErrorCode;
 
@@ -63,6 +64,13 @@ pub struct UuidInputError {
     pub text: String,
 }
 
+impl UuidInputError {
+    /// PostgreSQL's SQLSTATE for it.
+    pub fn error_code(&self) -> VdbErrorCode {
+        VdbErrorCode::InvalidTextRepresentation
+    }
+}
+
 impl fmt::Display for UuidInputError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "invalid input syntax for type uuid: \"{}\"", self.text)
@@ -70,13 +78,6 @@ impl fmt::Display for UuidInputError {
 }
 
 impl std::error::Error for UuidInputError {}
-
-impl UuidInputError {
-    /// PostgreSQL's SQLSTATE for it.
-    pub fn error_code(&self) -> VdbErrorCode {
-        VdbErrorCode::InvalidTextRepresentation
-    }
-}
 
 impl From<UuidInputError> for DataFusionError {
     fn from(e: UuidInputError) -> Self {
@@ -90,44 +91,59 @@ impl From<UuidInputError> for DataFusionError {
 ///
 /// The one implementation of the rule; see the module doc for the spellings.
 pub fn canonicalize(text: &str) -> std::result::Result<String, UuidInputError> {
-    let invalid = || UuidInputError {
-        text: text.to_string(),
-    };
-    let braced = text.starts_with('{');
-    let body = if braced {
-        text.strip_prefix('{')
-            .and_then(|body| body.strip_suffix('}'))
-            .ok_or_else(invalid)?
-    } else {
-        text
-    };
+    // One refusal for every way the reading can fail, because PostgreSQL raises one: the
+    // message names the whole value and says nothing about which character was wrong.
+    let digits = unbraced(text)
+        .and_then(hex_digits)
+        .ok_or_else(|| UuidInputError {
+            text: text.to_string(),
+        })?;
+    Ok(hyphenated(&digits))
+}
 
+/// What is inside the optional `{`…`}`, or `None` if a brace opens and none closes.
+fn unbraced(text: &str) -> Option<&str> {
+    match text.strip_prefix('{') {
+        Some(inside) => inside.strip_suffix('}'),
+        None => Some(text),
+    }
+}
+
+/// The 32 lower-case hexadecimal digits `body` spells, or `None` if it is not 16 bytes with
+/// hyphens only where PostgreSQL allows them.
+fn hex_digits(body: &str) -> Option<String> {
     let mut digits = String::with_capacity(32);
     let mut rest = body.chars();
     for byte in 0..16 {
-        let (high, low) = (rest.next(), rest.next());
-        let (Some(high), Some(low)) = (high, low) else {
-            return Err(invalid());
-        };
+        let (high, low) = (rest.next()?, rest.next()?);
         if !high.is_ascii_hexdigit() || !low.is_ascii_hexdigit() {
-            return Err(invalid());
+            return None;
         }
         digits.push(high.to_ascii_lowercase());
         digits.push(low.to_ascii_lowercase());
         // A hyphen may follow every second byte, but not the last one — which is where
         // PostgreSQL allows it, and only there. Optional at each such position.
         if byte % 2 == 1 && byte < 15 {
-            let mut lookahead = rest.clone();
-            if lookahead.next() == Some('-') {
-                rest = lookahead;
-            }
+            rest = past_one_hyphen(rest);
         }
     }
-    if rest.next().is_some() {
-        return Err(invalid());
-    }
+    // Anything left over is not part of a UUID, however well the 32 digits read.
+    rest.next().is_none().then_some(digits)
+}
 
-    // The canonical rendering, whatever the input's punctuation was.
+/// `rest` advanced past a single hyphen, or `rest` itself when the next character is not
+/// one — the hyphen at every allowed position is optional.
+fn past_one_hyphen(rest: Chars<'_>) -> Chars<'_> {
+    let mut lookahead = rest.clone();
+    match lookahead.next() {
+        Some('-') => lookahead,
+        _ => rest,
+    }
+}
+
+/// The canonical rendering of 32 digits: hyphens in the standard four places, whatever the
+/// input's punctuation was.
+fn hyphenated(digits: &str) -> String {
     let mut out = String::with_capacity(36);
     for (position, digit) in digits.chars().enumerate() {
         if matches!(position, 8 | 12 | 16 | 20) {
@@ -135,7 +151,7 @@ pub fn canonicalize(text: &str) -> std::result::Result<String, UuidInputError> {
         }
         out.push(digit);
     }
-    Ok(out)
+    out
 }
 
 /// Register PostgreSQL's `uuid` input conversion on `registry`.
@@ -146,27 +162,30 @@ pub fn register_uuid_in(registry: &mut dyn FunctionRegistry) -> Result<()> {
     Ok(())
 }
 
-/// The shared [`ScalarUDF`] handle, for the read-path rewrite that builds the call.
-pub fn uuid_in_udf() -> Arc<ScalarUDF> {
+/// The one [`ScalarUDF`] handle, built once however many contexts register it.
+///
+/// Not public: the read path builds the call from [`UUID_IN_UDF_NAME`] and every node
+/// resolves it from its own registry, so nothing outside needs the handle itself.
+fn uuid_in_udf() -> Arc<ScalarUDF> {
     static UDF: OnceLock<Arc<ScalarUDF>> = OnceLock::new();
     Arc::clone(UDF.get_or_init(|| Arc::new(ScalarUDF::from(UuidIn::new()))))
 }
 
 /// `vaire_uuid_in(text)` — PostgreSQL's `::uuid` cast of a string.
+///
+/// Private, like every other UDF type in this crate: a caller reaches the function through
+/// [`register_uuid_in`] and the name, never through the type.
 #[derive(Debug, PartialEq, Eq, Hash)]
-pub struct UuidIn {
+struct UuidIn {
     signature: Signature,
 }
 
-impl Default for UuidIn {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl UuidIn {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
+            // User-defined, so [`ScalarUDFImpl::coerce_types`] accepts exactly what
+            // PostgreSQL accepts and refuses the rest in PostgreSQL's words; see
+            // [`crate::bytea_in`] for what a built-in signature would coerce instead.
             signature: Signature::user_defined(Volatility::Immutable),
         }
     }
@@ -222,18 +241,10 @@ impl ScalarUDFImpl for UuidIn {
     }
 }
 
-/// One argument as a `Utf8` array, tolerating a view type [`ScalarUDFImpl::coerce_types`]
-/// asked to be rewritten away.
-fn strings(array: &ArrayRef) -> Result<StringArray> {
-    match array.data_type() {
-        DataType::Utf8 => Ok(array.as_string::<i32>().clone()),
-        _ => Ok(cast(array, &DataType::Utf8)?.as_string::<i32>().clone()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::{AsArray, StringArray};
     use datafusion::execution::context::SessionContext;
 
     const CANONICAL: &str = "a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11";
@@ -289,17 +300,10 @@ mod tests {
                 "`{text}`"
             );
         }
-        assert_eq!(
-            UuidInputError {
-                text: "x".to_string()
-            }
-            .error_code(),
-            VdbErrorCode::InvalidTextRepresentation
-        );
     }
 
-    /// The SQLSTATE has to survive the executor boundary, which it does by being written
-    /// into the message.
+    /// The SQLSTATE is `22P02` and it has to survive the executor boundary, which it does by
+    /// being written into the message.
     #[test]
     fn the_error_carries_its_sqlstate_in_the_message() {
         let e = DataFusionError::from(UuidInputError {
@@ -346,6 +350,7 @@ mod tests {
         assert_eq!(invoke(vec![]).expect("valid"), vec![]);
     }
 
+    /// The types PostgreSQL accepts, and the refusal for the rest in PostgreSQL's words.
     #[test]
     fn only_a_string_can_be_cast_to_uuid() {
         let f = UuidIn::new();

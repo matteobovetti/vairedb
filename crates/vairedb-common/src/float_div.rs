@@ -101,19 +101,19 @@ pub fn float_division_udf() -> Arc<ScalarUDF> {
 
 /// `vaire_float_div(dividend, divisor)` — `dividend / divisor` for `float4` and `float8`,
 /// raising `division by zero` where PostgreSQL raises it.
+///
+/// Private to this module, because the three things a caller can want are already public:
+/// the name to emit ([`FLOAT_DIV_UDF_NAME`]), the handle to build a call from
+/// ([`float_division_udf`]) and the registration ([`register_float_division`]). The concrete
+/// type carries nothing but its signature, and a Ballista node resolves the call by name
+/// rather than by type, so nothing outside this module has a use for it.
 #[derive(Debug, PartialEq, Eq, Hash)]
-pub struct FloatDivision {
+struct FloatDivision {
     signature: Signature,
 }
 
-impl Default for FloatDivision {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl FloatDivision {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
             // Uniform, so both arguments arrive at the same width and the result is that
             // width: `float4 / float4` stays `real` and does not silently widen to
@@ -212,8 +212,11 @@ where
         .iter()
         .zip(divisor.iter())
         .any(|(dividend, divisor)| match (dividend, divisor) {
-            // `== 0.0` and not `is_zero`, because IEEE's negative zero is a zero divisor
-            // to PostgreSQL too — `1.0::float8 / -0.0` raises.
+            // IEEE equality, and deliberately not Arrow's `eq` kernel against a zero
+            // scalar: Arrow compares floats by their bits — `ArrowNativeTypeOp::is_eq` is
+            // `self.to_bits() == rhs.to_bits()` — which makes `-0.0` a different value
+            // from `0.0` and would let `1.0::float8 / -0.0` answer `-inf` where PostgreSQL
+            // raises. `== 0.0` is what PostgreSQL means by a zero divisor.
             (Some(dividend), Some(divisor)) => divisor.into() == 0.0 && !dividend.into().is_nan(),
             // A NULL on either side is PostgreSQL's strict NULL, not an error.
             _ => false,
@@ -224,51 +227,68 @@ where
 mod tests {
     use super::*;
     use arrow::array::{Float32Array, Float64Array};
+    use arrow::datatypes::Field;
+    use datafusion::config::ConfigOptions;
     use datafusion::execution::context::SessionContext;
-    use datafusion::logical_expr::{ColumnarValue, ScalarFunctionArgs};
     use datafusion::scalar::ScalarValue;
-    use std::sync::Arc;
 
-    /// Invoke the function the way a physical expression does, over whole columns.
-    fn divide(dividend: Vec<Option<f64>>, divisor: Vec<Option<f64>>) -> Result<Vec<Option<f64>>> {
-        let rows = dividend.len();
+    /// Invoke the function the way a physical expression does: with whatever
+    /// [`ColumnarValue`]s the planner produced, over a batch of `rows` rows.
+    ///
+    /// The row count is the batch's and not the operands', because that is the distinction
+    /// two literal operands over an empty batch turn on.
+    fn invoke(dividend: ColumnarValue, divisor: ColumnarValue, rows: usize) -> Result<ArrayRef> {
+        let width = dividend.data_type();
         let args = ScalarFunctionArgs {
-            args: vec![
-                ColumnarValue::Array(Arc::new(Float64Array::from(dividend))),
-                ColumnarValue::Array(Arc::new(Float64Array::from(divisor))),
-            ],
+            args: vec![dividend, divisor],
             arg_fields: vec![],
             number_rows: rows,
-            return_field: Arc::new(arrow::datatypes::Field::new("d", DataType::Float64, true)),
-            config_options: Arc::new(datafusion::config::ConfigOptions::default()),
+            return_field: Arc::new(Field::new("d", width, true)),
+            config_options: Arc::new(ConfigOptions::default()),
         };
-        let out = FloatDivision::new().invoke_with_args(args)?;
-        let out = out.to_array(rows)?;
-        Ok(out.as_primitive::<Float64Type>().iter().collect())
+        FloatDivision::new().invoke_with_args(args)?.to_array(rows)
     }
 
-    /// The gap itself: the answer used to be `inf`.
-    #[test]
-    fn a_zero_divisor_raises_instead_of_answering_an_infinity() {
-        let err = divide(vec![Some(1.0)], vec![Some(0.0)]).expect_err("should have raised");
-        assert!(
-            err.to_string().to_lowercase().contains("division by zero"),
-            "the message is what classifies as 22012: {err}"
-        );
+    /// Column over column, which is how every row of a real scan arrives.
+    fn divide(dividend: Vec<Option<f64>>, divisor: Vec<Option<f64>>) -> Result<Vec<Option<f64>>> {
+        let rows = dividend.len();
+        let answer = invoke(
+            ColumnarValue::Array(Arc::new(Float64Array::from(dividend))),
+            ColumnarValue::Array(Arc::new(Float64Array::from(divisor))),
+            rows,
+        )?;
+        Ok(answer.as_primitive::<Float64Type>().iter().collect())
     }
 
-    /// Measured against PostgreSQL 17: negative zero is a zero divisor.
-    #[test]
-    fn a_negative_zero_divisor_raises() {
-        assert!(divide(vec![Some(1.0)], vec![Some(-0.0)]).is_err());
+    /// Literal over literal, which is the shape DataFusion's simplifier evaluates when it
+    /// folds a constant expression.
+    fn divide_scalars(dividend: f64, divisor: f64, rows: usize) -> Result<ArrayRef> {
+        invoke(
+            ColumnarValue::Scalar(ScalarValue::Float64(Some(dividend))),
+            ColumnarValue::Scalar(ScalarValue::Float64(Some(divisor))),
+            rows,
+        )
     }
 
-    /// Measured against PostgreSQL 17: `0::float8 / 0` raises rather than answering NaN,
-    /// and an infinite dividend raises too.
+    /// Every raising row of the table in this module's header, each measured against
+    /// PostgreSQL 17 and each one IEEE 754 answers a value for instead.
+    ///
+    /// The message and not only the failure, because the message is what classifies as
+    /// `22012` — for an executor's failure, the words are the only channel there is.
     #[test]
-    fn a_zero_or_infinite_dividend_over_zero_raises() {
-        assert!(divide(vec![Some(0.0)], vec![Some(0.0)]).is_err());
-        assert!(divide(vec![Some(f64::INFINITY)], vec![Some(0.0)]).is_err());
+    fn a_zero_divisor_raises_for_every_dividend_postgresql_raises_for() {
+        let raises = |dividend: f64, divisor: f64| {
+            let err = divide(vec![Some(dividend)], vec![Some(divisor)])
+                .expect_err("a zero divisor has to raise");
+            assert!(
+                err.to_string().to_lowercase().contains("division by zero"),
+                "{dividend} / {divisor} has to raise PostgreSQL's wording, got: {err}"
+            );
+        };
+        raises(1.0, 0.0); // the case this module exists for; IEEE answers inf
+        raises(0.0, 0.0); // IEEE answers NaN
+        raises(f64::INFINITY, 0.0); // an infinite dividend is still an error
+        raises(1.0, -0.0); // negative zero is zero
     }
 
     /// Measured against PostgreSQL 17, and the one carve-out: `'nan'::float8 / 0` is NaN.
@@ -301,61 +321,41 @@ mod tests {
     }
 
     /// A batch of no rows raises nothing, which is what makes `SELECT f / 0` over an
-    /// empty table answer no rows the way PostgreSQL does.
+    /// empty table answer no rows the way PostgreSQL does — including when both operands
+    /// are literals, which are the case that has to be materialized against the batch's
+    /// row count instead of expanding to one row each.
     #[test]
     fn an_empty_batch_raises_nothing() {
         assert_eq!(divide(vec![], vec![]).expect("should not raise"), vec![]);
+        let literals = divide_scalars(1.0, 0.0, 0).expect("should not raise");
+        assert_eq!(literals.len(), 0);
     }
 
-    /// Two scalars still divide, and still raise — this is the shape DataFusion's
-    /// simplifier evaluates when it folds a constant expression.
+    /// Two scalars over one row still divide, and still raise — this is what DataFusion's
+    /// simplifier evaluates when it folds a constant expression, so it is where a constant
+    /// `1.0 / 0` raises at planning time.
     #[test]
     fn two_scalar_operands_are_divided_and_checked() {
-        let scalars = |dividend: f64, divisor: f64| ScalarFunctionArgs {
-            args: vec![
-                ColumnarValue::Scalar(ScalarValue::Float64(Some(dividend))),
-                ColumnarValue::Scalar(ScalarValue::Float64(Some(divisor))),
-            ],
-            arg_fields: vec![],
-            number_rows: 1,
-            return_field: Arc::new(arrow::datatypes::Field::new("d", DataType::Float64, true)),
-            config_options: Arc::new(datafusion::config::ConfigOptions::default()),
-        };
-        let answer = FloatDivision::new()
-            .invoke_with_args(scalars(3.0, 2.0))
-            .expect("should not raise")
-            .to_array(1)
-            .expect("one row");
+        let answer = divide_scalars(3.0, 2.0, 1).expect("should not raise");
         assert_eq!(answer.as_primitive::<Float64Type>().value(0), 1.5);
-        assert!(
-            FloatDivision::new()
-                .invoke_with_args(scalars(3.0, 0.0))
-                .is_err()
-        );
+        assert!(divide_scalars(3.0, 0.0, 1).is_err());
     }
 
     /// `float4` keeps its own width, so the rewrite cannot turn a `real` column into a
     /// `double precision` one — and the zero check reaches it too.
     #[test]
     fn float4_divides_at_float4_and_is_checked() {
-        let args = |divisor: f32| ScalarFunctionArgs {
-            args: vec![
-                ColumnarValue::Array(Arc::new(Float32Array::from(vec![Some(1.0f32)]))),
-                ColumnarValue::Array(Arc::new(Float32Array::from(vec![Some(divisor)]))),
-            ],
-            arg_fields: vec![],
-            number_rows: 1,
-            return_field: Arc::new(arrow::datatypes::Field::new("d", DataType::Float32, true)),
-            config_options: Arc::new(datafusion::config::ConfigOptions::default()),
+        let divide_float4 = |divisor: f32| {
+            invoke(
+                ColumnarValue::Array(Arc::new(Float32Array::from(vec![1.0f32]))),
+                ColumnarValue::Array(Arc::new(Float32Array::from(vec![divisor]))),
+                1,
+            )
         };
-        let answer = FloatDivision::new()
-            .invoke_with_args(args(2.0))
-            .expect("should not raise")
-            .to_array(1)
-            .expect("one row");
+        let answer = divide_float4(2.0).expect("should not raise");
         assert_eq!(answer.data_type(), &DataType::Float32);
         assert_eq!(answer.as_primitive::<Float32Type>().value(0), 0.5);
-        assert!(FloatDivision::new().invoke_with_args(args(0.0)).is_err());
+        assert!(divide_float4(0.0).is_err());
     }
 
     /// The declared type is the argument type at both widths, since that is the type the
@@ -375,19 +375,13 @@ mod tests {
         );
     }
 
-    /// The wire carries only the name, so the name has to resolve after registration.
+    /// The wire carries only the name, so the name has to resolve after registration — and
+    /// registering twice has to stay allowed, since a context reached by two registration
+    /// paths registers twice.
     #[test]
     fn the_function_resolves_by_name_after_registration() {
         let mut ctx = SessionContext::new();
         assert!(ctx.udf(FLOAT_DIV_UDF_NAME).is_err());
-        register_float_division(&mut ctx).expect("registration failed");
-        assert!(ctx.udf(FLOAT_DIV_UDF_NAME).is_ok());
-    }
-
-    /// Registering twice is what a context reached by two registration paths does.
-    #[test]
-    fn registering_twice_is_idempotent() {
-        let mut ctx = SessionContext::new();
         register_float_division(&mut ctx).expect("first registration failed");
         register_float_division(&mut ctx).expect("second registration failed");
         assert!(ctx.udf(FLOAT_DIV_UDF_NAME).is_ok());

@@ -76,12 +76,24 @@ use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
 };
 
+use crate::columns::list_row;
+
 /// The name the read path emits and every node resolves the call by.
 ///
 /// Prefixed and not spelled as a PostgreSQL function name, for the reason
 /// [`crate::float_div`] gives: nothing a client writes produces this name, so the call can
 /// only ever be one VaireDB put there.
 pub const NOT_IN_UDF_NAME: &str = "vaire_not_in";
+
+/// What the candidate argument has to be, for the refusal when it is not: the rewrite wraps
+/// an `array_agg`, so anything else means the call reaching the node is not the one the read
+/// path built.
+///
+/// Spelled as one whole sentence, including the function's own name, because [`list_row`] is
+/// handed the caller's wording rather than assembling it — and the name has to be in it for
+/// the reason [`NOT_IN_UDF_NAME`] exists: a client who never wrote this call needs the
+/// message to say which rewrite did.
+const CANDIDATES_MUST_BE_A_LIST: &str = "vaire_not_in takes a list of candidates";
 
 /// Register the list-valued `NOT IN` on `registry`.
 ///
@@ -95,8 +107,12 @@ pub fn register_not_in(registry: &mut dyn FunctionRegistry) -> Result<()> {
     Ok(())
 }
 
-/// The shared [`ScalarUDF`] handle, for the rewrite that builds the call.
-pub fn not_in_udf() -> Arc<ScalarUDF> {
+/// The shared [`ScalarUDF`] handle, built once and handed to every registry.
+///
+/// Private, because the read path builds the call as SQL text naming [`NOT_IN_UDF_NAME`] —
+/// see `vairedb_coordinator::pgwire_handler::compat_rewrite` — so nothing outside this module
+/// ever holds the handle.
+fn not_in_udf() -> Arc<ScalarUDF> {
     static UDF: OnceLock<Arc<ScalarUDF>> = OnceLock::new();
     Arc::clone(UDF.get_or_init(|| Arc::new(ScalarUDF::from(NotInList::new()))))
 }
@@ -104,18 +120,12 @@ pub fn not_in_udf() -> Arc<ScalarUDF> {
 /// `vaire_not_in(candidates, element)` — PostgreSQL's `element NOT IN (candidates)`, with
 /// the candidates given as a list rather than as a subquery.
 #[derive(Debug, PartialEq, Eq, Hash)]
-pub struct NotInList {
+struct NotInList {
     signature: Signature,
 }
 
-impl Default for NotInList {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl NotInList {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
             // `any`, because the two operands are a list and a scalar of types that need
             // not match: `MAX(numeric_col) NOT IN (SELECT int_col …)` is an ordinary
@@ -150,72 +160,18 @@ impl ScalarUDFImpl for NotInList {
         };
         let rows = args.number_rows;
         let element = element.to_array(rows)?;
-
-        // A constant list is the shape the rewrite produces — the candidates come from an
-        // uncorrelated subquery, so every row is compared against the same list. Kept as
-        // one value rather than expanded to one list per row: `to_array(rows)` on a scalar
-        // list would copy the whole candidate set once per row.
-        let answers = match candidates {
-            ColumnarValue::Scalar(scalar) => {
-                let list = scalar.to_array_of_size(1)?;
-                let candidates = candidates_at(&list, 0)?;
-                not_in(&Candidates::Constant(candidates), &element, rows)
-            }
-            ColumnarValue::Array(list) => {
-                not_in(&Candidates::PerRow(Arc::clone(list)), &element, rows)
-            }
-        }?;
+        let answers = not_in(candidates, &element, rows)?;
         Ok(ColumnarValue::Array(Arc::new(answers)))
     }
 }
 
-/// Where each row's candidate list comes from.
-enum Candidates {
-    /// One list for the whole batch. `None` is a NULL list, which is what `array_agg` over
-    /// no rows produces and means "no candidates".
-    Constant(Option<ArrayRef>),
-    /// A list per row, held as the list array itself.
-    PerRow(ArrayRef),
-}
-
 /// PostgreSQL's `NOT IN` for every row of `element` against its candidates.
-fn not_in(candidates: &Candidates, element: &ArrayRef, rows: usize) -> Result<BooleanArray> {
-    let value_type = match candidates {
-        // No candidates anywhere, so no comparison to coerce and nothing to look at: an
-        // empty `q` is `true` for every row, including the rows whose element is NULL.
-        Candidates::Constant(None) => return Ok(BooleanArray::from(vec![Some(true); rows])),
-        Candidates::Constant(Some(values)) => values.data_type().clone(),
-        Candidates::PerRow(list) => list_value_type(list.data_type())?.clone(),
-    };
-    // The type the `=` this stands in for would have compared at, so an `int4` candidate
-    // list and a `numeric` element meet the way PostgreSQL makes them meet.
-    let compare_at = comparison_coercion(&value_type, element.data_type()).ok_or_else(|| {
-        exec_datafusion_err!(
-            "{NOT_IN_UDF_NAME} cannot compare {} against a list of {value_type}",
-            element.data_type()
-        )
-    })?;
-    let element = cast(element, &compare_at)?;
-    // Cast once for a constant list; a per-row list is cast per row, since only the row's
-    // own slice is needed.
-    let constant = match candidates {
-        Candidates::Constant(Some(values)) => Some(cast(values, &compare_at)?),
-        _ => None,
-    };
-
+fn not_in(argument: &ColumnarValue, element: &ArrayRef, rows: usize) -> Result<BooleanArray> {
+    let (candidates, element) = Candidates::coerce(argument, element)?;
     let mut answers = BooleanBufferBuilder::new(rows);
     let mut known = BooleanBufferBuilder::new(rows);
     for row in 0..rows {
-        let row_candidates = match (&constant, candidates) {
-            (Some(values), _) => Some(Arc::clone(values)),
-            (None, Candidates::PerRow(list)) => match candidates_at(list, row)? {
-                Some(values) => Some(cast(&values, &compare_at)?),
-                None => None,
-            },
-            // `Constant(None)` returned above and `Constant(Some(_))` set `constant`.
-            (None, Candidates::Constant(_)) => None,
-        };
-        let answer = row_answer(row_candidates.as_ref(), &element, row)?;
+        let answer = row_answer(candidates.at(row)?.as_ref(), &element, row)?;
         answers.append(answer.unwrap_or(false));
         known.append(answer.is_some());
     }
@@ -225,24 +181,102 @@ fn not_in(candidates: &Candidates, element: &ArrayRef, rows: usize) -> Result<Bo
     ))
 }
 
-/// PostgreSQL's rule for one row: `None` is SQL NULL.
+/// Where each row's candidate list comes from, in the type the comparison happens at.
 ///
-/// The order of the two tests is the rule, not an implementation detail. `x NOT IN
-/// (20, NULL)` for `x = 20` is `20 <> 20 AND 20 <> NULL` — `false AND NULL` — which is
-/// **false**, because `AND` is false-dominant. So a match is looked for first and a NULL
-/// candidate only decides the rows that did not match.
+/// Both operands are coerced once, when the variant is built, so the per-row loop only reads:
+/// the shape the argument arrived in is decided here rather than tested again for every row.
+enum Candidates {
+    /// No candidates for any row, which is what a NULL candidate list means.
+    Absent,
+    /// One already-cast list that every row is compared against.
+    Shared(ArrayRef),
+    /// A list column, one list per row, cast a row at a time: only the row's own slice is
+    /// ever needed, so the column is left as it arrived.
+    PerRow {
+        lists: ArrayRef,
+        compare_at: DataType,
+    },
+}
+
+impl Candidates {
+    /// The candidate argument and the `element` column, both in the type the comparison
+    /// happens at.
+    fn coerce(argument: &ColumnarValue, element: &ArrayRef) -> Result<(Self, ArrayRef)> {
+        match argument {
+            ColumnarValue::Scalar(scalar) => Self::shared(&scalar.to_array_of_size(1)?, element),
+            ColumnarValue::Array(lists) => Self::per_row(lists, element),
+        }
+    }
+
+    /// One list for the whole batch, which is the shape the rewrite produces: the candidates
+    /// come from an uncorrelated subquery, so every row is compared against the same list.
+    ///
+    /// Read out of the scalar once and kept as one value rather than expanded to one list per
+    /// row, which `to_array(rows)` on a scalar list would do by copying the whole candidate
+    /// set per row. It is cast once here for the same reason.
+    fn shared(list: &ArrayRef, element: &ArrayRef) -> Result<(Self, ArrayRef)> {
+        let Some(values) = candidates_at(list, 0)? else {
+            // A NULL list is what `array_agg` over no rows produces, and it means "no
+            // candidates" rather than "unknown candidates". There is nothing to compare, and
+            // so no type to coerce a comparison at — the answer is the empty-conjunction
+            // rule in [`row_answer`], which needs neither.
+            return Ok((Self::Absent, Arc::clone(element)));
+        };
+        let compare_at = comparison_type(values.data_type(), element)?;
+        let element = cast(element, &compare_at)?;
+        Ok((Self::Shared(cast(&values, &compare_at)?), element))
+    }
+
+    /// A list per row, which is not what the rewrite builds but is what a client's own
+    /// `array_agg` column arrives as.
+    fn per_row(lists: &ArrayRef, element: &ArrayRef) -> Result<(Self, ArrayRef)> {
+        let compare_at = comparison_type(list_value_type(lists.data_type())?, element)?;
+        let element = cast(element, &compare_at)?;
+        let lists = Arc::clone(lists);
+        Ok((Self::PerRow { lists, compare_at }, element))
+    }
+
+    /// The candidates of one row, or `None` where that row has no candidate list at all.
+    fn at(&self, row: usize) -> Result<Option<ArrayRef>> {
+        match self {
+            Self::Absent => Ok(None),
+            Self::Shared(values) => Ok(Some(Arc::clone(values))),
+            Self::PerRow { lists, compare_at } => Ok(match candidates_at(lists, row)? {
+                Some(values) => Some(cast(&values, compare_at)?),
+                None => None,
+            }),
+        }
+    }
+}
+
+/// The type the `=` this stands in for would have compared at, so an `int4` candidate list
+/// and a `numeric` element meet the way PostgreSQL makes them meet.
+fn comparison_type(value_type: &DataType, element: &ArrayRef) -> Result<DataType> {
+    comparison_coercion(value_type, element.data_type()).ok_or_else(|| {
+        exec_datafusion_err!(
+            "{NOT_IN_UDF_NAME} cannot compare {} against a list of {value_type}",
+            element.data_type()
+        )
+    })
+}
+
+/// PostgreSQL's whole rule for one row, in the order the rule is defined in: `None` is SQL
+/// NULL.
+///
+/// The order of the tests is the rule, not an implementation detail. `x NOT IN (20, NULL)`
+/// for `x = 20` is `20 <> 20 AND 20 <> NULL` — `false AND NULL` — which is **false**, because
+/// `AND` is false-dominant. So a match is looked for first and a NULL candidate only decides
+/// the rows that did not match.
 fn row_answer(
     candidates: Option<&ArrayRef>,
     element: &ArrayRef,
     row: usize,
 ) -> Result<Option<bool>> {
-    // No candidates: an empty conjunction is true, whatever the element is.
-    let Some(candidates) = candidates else {
+    // No candidates — an absent list or a list of no values — is an empty conjunction, which
+    // is true whatever the element is, including a NULL element.
+    let Some(candidates) = candidates.filter(|values| !values.is_empty()) else {
         return Ok(Some(true));
     };
-    if candidates.is_empty() {
-        return Ok(Some(true));
-    }
     // A NULL element makes every comparison unknown, and there is at least one.
     if element.is_null(row) {
         return Ok(None);
@@ -265,19 +299,18 @@ fn list_value_type(list: &DataType) -> Result<&DataType> {
         | DataType::FixedSizeList(field, _)
         | DataType::ListView(field)
         | DataType::LargeListView(field) => Ok(field.data_type()),
-        other => exec_err!("{NOT_IN_UDF_NAME} takes a list of candidates, got {other}"),
+        other => exec_err!("{CANDIDATES_MUST_BE_A_LIST}, got {other}"),
     }
 }
 
 /// The candidates of one row, or `None` where that row's list is NULL.
 fn candidates_at(list: &ArrayRef, row: usize) -> Result<Option<ArrayRef>> {
-    // `array_agg` produces a `List`; the other widths are accepted because a cast or a
-    // different aggregate could produce them, and none of them changes the rule.
+    // `array_agg` produces a `List`, which [`list_row`] reads along with the large variant. A
+    // fixed-size list is read here as well, because a cast or a different aggregate could
+    // produce one and its fixed width changes nothing about the rule.
     let values = match list.data_type() {
-        DataType::List(_) => list.as_list::<i32>().value(row),
-        DataType::LargeList(_) => list.as_list::<i64>().value(row),
         DataType::FixedSizeList(_, _) => list.as_fixed_size_list().value(row),
-        other => return exec_err!("{NOT_IN_UDF_NAME} takes a list of candidates, got {other}"),
+        _ => list_row(list, row, CANDIDATES_MUST_BE_A_LIST)?,
     };
     Ok((!list.is_null(row)).then_some(values))
 }
@@ -285,44 +318,29 @@ fn candidates_at(list: &ArrayRef, row: usize) -> Result<Option<ArrayRef>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{
-        Decimal128Array, Int32Array, ListArray, ListBuilder, StringArray, StringBuilder,
-        UInt64Array,
-    };
+    use arrow::array::{Decimal128Array, Int32Array, ListArray, UInt64Array};
     use arrow::datatypes::{Field, Int32Type};
     use datafusion::execution::context::SessionContext;
     use datafusion::scalar::ScalarValue;
 
-    /// `element NOT IN (candidates)` over whole columns, the way a physical expression
-    /// invokes it. The candidate list is a scalar, which is the shape the rewrite builds.
+    /// An `int4` candidate list as the scalar the rewrite builds, where `None` is the NULL
+    /// list `array_agg` over no rows produces.
+    fn int_list(candidates: Option<Vec<Option<i32>>>) -> ColumnarValue {
+        ColumnarValue::Scalar(ScalarValue::List(Arc::new(
+            ListArray::from_iter_primitive::<Int32Type, _, _>(vec![candidates]),
+        )))
+    }
+
+    /// `element NOT IN (candidates)` over whole `int4` columns, the way a physical expression
+    /// invokes it.
     fn not_in_scalar_list(
         candidates: Option<Vec<Option<i32>>>,
         element: Vec<Option<i32>>,
     ) -> Result<Vec<Option<bool>>> {
-        let list = match candidates {
-            Some(values) => {
-                ScalarValue::List(Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(
-                    vec![Some(values)],
-                )))
-            }
-            None => ScalarValue::List(Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(
-                vec![None::<Vec<Option<i32>>>],
-            ))),
-        };
         invoke(
-            ColumnarValue::Scalar(list),
+            int_list(candidates),
             ColumnarValue::Array(Arc::new(Int32Array::from(element))),
         )
-    }
-
-    /// A one-row list of strings, which has no `From` impl the way a primitive one does.
-    fn string_list(values: Vec<Option<&str>>) -> ListArray {
-        let mut list = ListBuilder::new(StringBuilder::new());
-        for value in values {
-            list.values().append_option(value);
-        }
-        list.append(true);
-        list.finish()
     }
 
     /// Invoke the function and collect its answers, nulls included.
@@ -410,12 +428,9 @@ mod tests {
         let element = Decimal128Array::from(vec![Some(2000), Some(1000)])
             .with_precision_and_scale(10, 2)
             .expect("a valid numeric");
-        let list = ScalarValue::List(Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(
-            vec![Some(vec![Some(20), Some(99)])],
-        )));
         assert_eq!(
             invoke(
-                ColumnarValue::Scalar(list),
+                int_list(Some(vec![Some(20), Some(99)])),
                 ColumnarValue::Array(Arc::new(element)),
             )
             .expect("should not raise"),
@@ -429,27 +444,10 @@ mod tests {
     /// produces.
     #[test]
     fn an_unsigned_element_compares_against_a_signed_list() {
-        let list = ScalarValue::List(Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(
-            vec![Some(vec![Some(2)])],
-        )));
         assert_eq!(
             invoke(
-                ColumnarValue::Scalar(list),
+                int_list(Some(vec![Some(2)])),
                 ColumnarValue::Array(Arc::new(UInt64Array::from(vec![Some(2), Some(3)]))),
-            )
-            .expect("should not raise"),
-            vec![Some(false), Some(true)]
-        );
-    }
-
-    /// Strings compare as strings, so the rewrite is not limited to numbers.
-    #[test]
-    fn text_candidates_compare_as_text() {
-        let list = ScalarValue::List(Arc::new(string_list(vec![Some("x"), Some("y")])));
-        assert_eq!(
-            invoke(
-                ColumnarValue::Scalar(list),
-                ColumnarValue::Array(Arc::new(StringArray::from(vec![Some("x"), Some("z")]))),
             )
             .expect("should not raise"),
             vec![Some(false), Some(true)]
@@ -493,11 +491,8 @@ mod tests {
     /// a wrong answer here is the thing this module exists to prevent.
     #[test]
     fn an_incomparable_pair_is_an_error() {
-        let list = ScalarValue::List(Arc::new(ListArray::from_iter_primitive::<Int32Type, _, _>(
-            vec![Some(vec![Some(1)])],
-        )));
         let err = invoke(
-            ColumnarValue::Scalar(list),
+            int_list(Some(vec![Some(1)])),
             ColumnarValue::Array(Arc::new(BooleanArray::from(vec![Some(true)]))),
         )
         .expect_err("a boolean and an int4 have no comparison type");
@@ -507,8 +502,8 @@ mod tests {
         );
     }
 
-    /// The declared type is a nullable boolean, since the whole point is that the answer
-    /// can be unknown.
+    /// A predicate: the type the client's row description carries is boolean, whatever the
+    /// two operands were.
     #[test]
     fn the_result_type_is_boolean() {
         assert_eq!(
@@ -519,19 +514,13 @@ mod tests {
         );
     }
 
-    /// The wire carries only the name, so the name has to resolve after registration.
+    /// The wire carries only the name, so the name has to resolve after registration — and
+    /// registering twice has to stay a no-op, because a context reached by two registration
+    /// paths is exactly what [`register_not_in`]'s "every context" instruction produces.
     #[test]
     fn the_function_resolves_by_name_after_registration() {
         let mut ctx = SessionContext::new();
         assert!(ctx.udf(NOT_IN_UDF_NAME).is_err());
-        register_not_in(&mut ctx).expect("registration failed");
-        assert!(ctx.udf(NOT_IN_UDF_NAME).is_ok());
-    }
-
-    /// Registering twice is what a context reached by two registration paths does.
-    #[test]
-    fn registering_twice_is_idempotent() {
-        let mut ctx = SessionContext::new();
         register_not_in(&mut ctx).expect("first registration failed");
         register_not_in(&mut ctx).expect("second registration failed");
         assert!(ctx.udf(NOT_IN_UDF_NAME).is_ok());

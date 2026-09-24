@@ -1,6 +1,7 @@
 use std::path::Path;
 
 use serde::Deserialize;
+use vairedb_common::config::ConfigError;
 
 /// Configuration for a core node, deserialized from a YAML file.
 ///
@@ -36,7 +37,10 @@ pub struct CoreConfig {
 
 impl CoreConfig {
     /// Load and deserialize a [`CoreConfig`] from the YAML file at `path`.
-    pub fn from_file(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+    ///
+    /// The error distinguishes a file that could not be read from one that was read and is
+    /// not a configuration — see [`ConfigError`].
+    pub fn from_file(path: &Path) -> Result<Self, ConfigError> {
         vairedb_common::config::from_file(path)
     }
 

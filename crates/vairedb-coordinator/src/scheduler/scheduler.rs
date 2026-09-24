@@ -221,120 +221,23 @@ pub(crate) fn register_postgres_functions(
 ) {
     let count = datafusion_pg_functions::register_all(registry);
     tracing::debug!(count, "registered PostgreSQL built-in functions");
-    // The `pg_catalog` scalar functions. `setup_pg_catalog_schema` registers these on the
-    // two contexts that answer catalog queries, and that is not the same set of contexts:
-    // the scheduler's own state never calls it, so a plan carrying `format_type` over a
-    // column could be planned and then not be decoded. See that module's doc.
-    if let Err(e) = vairedb_common::pg_udf::register_pg_catalog_scalar_functions(registry) {
-        tracing::warn!(error = %e, "failed to register the pg_catalog scalar functions");
-    }
-    // The ordered-set aggregates, which DataFusion either lacks (`percentile_disc`) or
-    // answers imprecisely (`percentile_cont`). They live in `vairedb-common` because the
-    // executor has to register the identical pair — see that module's doc.
-    if let Err(e) = vairedb_common::udaf::register_ordered_set_aggregates(registry) {
-        tracing::warn!(error = %e, "failed to register the ordered-set aggregates");
-    }
-    // The rest of PostgreSQL's `WITHIN GROUP` family — `mode()` and the hypothetical-set
-    // `rank`/`dense_rank`/`percent_rank`/`cume_dist`, none of which DataFusion has as an
-    // aggregate at all. Same reason as the percentiles above: the executor has to resolve the
-    // identical names. See [`vairedb_common::within_group`].
-    if let Err(e) = vairedb_common::within_group::register_within_group_aggregates(registry) {
-        tracing::warn!(error = %e, "failed to register the WITHIN GROUP aggregates");
-    }
-    // PostgreSQL's float division, which the read path rewrites `/` into so a zero divisor
-    // raises `22012` instead of answering an infinity. Also here rather than in the
-    // coordinator alone: the rewrite happens on the logical plan the client submits, so the
-    // scheduler decodes the name and an executor runs it. See
-    // [`crate::pgwire_handler::pg_float_division`].
-    if let Err(e) = vairedb_common::float_div::register_float_division(registry) {
-        tracing::warn!(error = %e, "failed to register the checked float division");
-    }
-    // PostgreSQL's three-valued `NOT IN` over a candidate list, which the read path
-    // rewrites a `HAVING max(k) NOT IN (q)` into: that one clause cannot carry the anti-join
-    // respelling, because no correlated subquery over an aggregate can be planned. Here for
-    // the same reason as the division above — the call is on the plan the client submits, so
-    // the scheduler decodes the name and an executor runs it. See
-    // [`crate::pgwire_handler::compat_rewrite::rewrite_not_in_subqueries`].
-    if let Err(e) = vairedb_common::not_in::register_not_in(registry) {
-        tracing::warn!(error = %e, "failed to register the list-valued NOT IN");
-    }
-    // PostgreSQL's `bytea` input conversion, which the read path rewrites `::bytea` into so
-    // `'\xDEADBEEF'` is four bytes and not the ten characters Arrow's string-to-binary cast
-    // copies. Here for the same reason as the two above — the call is in the AST the client
-    // submits, so the scheduler decodes the name and an executor runs it. See
-    // [`crate::pgwire_handler::pg_operators`].
-    if let Err(e) = vairedb_common::bytea_in::register_bytea_in(registry) {
-        tracing::warn!(error = %e, "failed to register the bytea input conversion");
-    }
-    // The `json`/`jsonb` input conversions and the four accessors `->`, `->>`, `#>` and
-    // `#>>`, which the read path rewrites those casts and operators into. Here for the same
-    // reason as `bytea` above: the calls are in the AST the client submits, so the scheduler
-    // decodes their names and an executor runs them. See [`vairedb_common::json_pg`].
-    if let Err(e) = vairedb_common::json_pg::register_json_functions(registry) {
-        tracing::warn!(error = %e, "failed to register the json functions");
-    }
-    // The rendering half of `json_agg`/`jsonb_agg`, which the read path composes over
-    // DataFusion's own `array_agg` so the in-aggregate `ORDER BY` survives a partial
-    // aggregate per shard. See [`vairedb_common::json_agg`].
-    if let Err(e) = vairedb_common::json_agg::register_json_aggregates(registry) {
-        tracing::warn!(error = %e, "failed to register the json aggregates");
-    }
-    // PostgreSQL's `uuid` input conversion, which `::uuid` becomes — a validation that also
-    // canonicalizes, so two spellings of one UUID compare equal. Same reason again. See
-    // [`vairedb_common::uuid_in`].
-    if let Err(e) = vairedb_common::uuid_in::register_uuid_in(registry) {
-        tracing::warn!(error = %e, "failed to register the uuid input conversion");
-    }
-    // PostgreSQL's `nth_value`, which refuses an offset of zero instead of answering NULL
-    // for every row. Unlike the four above it is not a name the read path rewrites into:
-    // it *replaces* DataFusion's function under DataFusion's own name, so a registry that
-    // misses it silently keeps the wrong answer rather than failing to resolve a call.
-    // That makes registering it on every node the whole of the fix. See
-    // [`vairedb_common::nth_value`].
-    if let Err(e) = vairedb_common::nth_value::register_nth_value(registry) {
-        tracing::warn!(error = %e, "failed to register the checked nth_value");
-    }
-    // The variance and standard deviation family, which PostgreSQL answers in `numeric`
-    // over an exact input and DataFusion answers in `float8` over every input. Shadowing,
-    // like `nth_value` above and for the same reason: the names are DataFusion's own, so a
-    // registry that misses these keeps the inexact answer instead of failing to resolve.
-    // See [`vairedb_common::stats_udaf`].
-    if let Err(e) = vairedb_common::stats_udaf::register_statistics_aggregates(registry) {
-        tracing::warn!(error = %e, "failed to register the exact statistics aggregates");
-    }
-    // PostgreSQL's `ntile`, which is an `int4` where every other ranking function is an
-    // `int8`. Shadowing for the same reason again — and the type matters here rather than
-    // the value, which stays DataFusion's. See [`vairedb_common::ntile`].
-    if let Err(e) = vairedb_common::ntile::register_ntile(registry) {
-        tracing::warn!(error = %e, "failed to register the int4 ntile");
-    }
-    // The exact integer average, which the aggregate rewrite below turns `avg(integer)` into
-    // so the answer carries PostgreSQL's sixteen decimal places. Not a shadow — a name of
-    // VaireDB's own, because which arguments it applies to is a question only the rewrite
-    // can answer — so here for the same reason as the division above: the call is on the
-    // plan the client submits, and the scheduler decodes the name an executor then runs.
-    // See [`vairedb_common::avg_udaf`].
-    if let Err(e) = vairedb_common::avg_udaf::register_exact_average(registry) {
-        tracing::warn!(error = %e, "failed to register the exact integer average");
-    }
-    // `pg_typeof`, which reports the type of its argument by PostgreSQL's SQL name. A name of
-    // PostgreSQL's own that nothing rewrites into, so this line and its twin on the executor
-    // are the whole of it. See [`vairedb_common::pg_typeof`].
-    if let Err(e) = vairedb_common::pg_typeof::register_pg_typeof(registry) {
-        tracing::warn!(error = %e, "failed to register pg_typeof");
-    }
-    // `format`, `quote_literal` and `quote_nullable` — the family a client uses to build SQL
-    // text, where the quoting rules are the answer and getting them wrong is an injection.
-    // See [`vairedb_common::pg_format`].
-    if let Err(e) = vairedb_common::pg_format::register_format_functions(registry) {
-        tracing::warn!(error = %e, "failed to register the format functions");
-    }
-    // The calendar-arithmetic half of PostgreSQL's datetime surface: `age`, `make_timestamp`,
-    // `make_interval`, `isfinite`, the three `justify_*` and the two clock readers. The
-    // `datafusion-pg-functions` `datetime` category is an empty module in 0.1, so none of
-    // these arrive with the `register_all` above. See [`vairedb_common::pg_datetime`].
-    if let Err(e) = vairedb_common::pg_datetime::register_datetime_functions(registry) {
-        tracing::warn!(error = %e, "failed to register the datetime functions");
+    // The set VaireDB adds on top: the `pg_catalog` scalar functions, the ordered-set and
+    // `WITHIN GROUP` aggregates, the checked float division and list-valued `NOT IN`, the
+    // `bytea`/`json`/`uuid` input conversions, the shadowing `nth_value`, statistics
+    // aggregates and `ntile`, the exact integer average, `pg_typeof`, and the `format` and
+    // datetime families.
+    //
+    // Asked for as a set rather than listed function by function. Which functions belong to
+    // it is a question about the functions, and they live in `vairedb-common` so that the
+    // executor in `vairedb-core` can register the identical set — so that crate answers it
+    // for both, and neither node carries a list that can fall behind the other's. Each
+    // family's own module doc says why it is in the set; see
+    // [`vairedb_common::distributed_functions`] for the rule the set exists to keep.
+    //
+    // Warned rather than propagated, as before: this runs while a session is being built,
+    // and the error names the family that failed.
+    if let Err(e) = vairedb_common::distributed_functions::register(registry) {
+        tracing::warn!(error = %e, "failed to register the distributed functions");
     }
 }
 

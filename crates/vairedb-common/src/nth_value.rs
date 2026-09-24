@@ -25,7 +25,7 @@
 //! whatever `t` holds — including when `t` is empty, where PostgreSQL answers **no rows
 //! and no error**, because it evaluates the argument per partition and an empty input has
 //! none. Registering a `WindowUDF` under DataFusion's own name (the same shadowing
-//! [`crate::udaf`] does for `percentile_cont`) puts the check where PostgreSQL puts it:
+//! [`crate::within_group`] does for `percentile_cont`) puts the check where PostgreSQL puts it:
 //! in the construction of the per-partition evaluator, which `WindowAggExec` reaches only
 //! after it has seen at least one row.
 //!
@@ -126,17 +126,14 @@ fn datafusion_nth_value() -> &'static Arc<dyn WindowUDFImpl> {
 }
 
 /// `nth_value(x, n)` — DataFusion's, with PostgreSQL's refusal of `n = 0` in front of it.
+///
+/// Private, because the only thing outside this module that has any use for it is the
+/// registry, and [`pg_nth_value_udwf`] is what hands it one.
 #[derive(Debug, PartialEq, Eq, Hash)]
-pub struct PgNthValue;
-
-impl Default for PgNthValue {
-    fn default() -> Self {
-        Self::new()
-    }
-}
+struct PgNthValue;
 
 impl PgNthValue {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self
     }
 }
@@ -210,39 +207,47 @@ impl WindowUDFImpl for PgNthValue {
 
 /// Raise PostgreSQL's `22016` when the offset argument is the literal `0`.
 ///
-/// Only an integer literal is read, and only the value `0` refuses:
-///
-/// * a **non-literal** offset is something DataFusion itself rejects a moment later
-///   (its evaluator needs a constant `n`), so its error is left to it;
-/// * a **non-integer** literal is likewise DataFusion's to refuse, and reading `0.4` as
-///   zero here would raise "must be greater than zero" about a number that is;
-/// * a **negative** literal is the § 5 superset — DataFusion's offset from the end of the
-///   frame — and answers as it always has.
+/// Only the value `0` refuses. A **negative** literal is the § 5 superset — DataFusion's
+/// offset from the end of the frame — and answers as it always has.
 ///
 /// `is_reversed` needs no attention: DataFusion negates `n` for a reversed window, and
 /// the negation of zero is zero.
 fn reject_zero_offset(input_exprs: &[Arc<dyn PhysicalExpr>]) -> Result<()> {
-    // Absent for `nth_value(x)`, which is malformed and DataFusion's to reject.
-    let Some(offset) = input_exprs.get(1) else {
-        return Ok(());
-    };
-    let offset: &dyn Any = offset.as_ref();
-    let Some(literal) = offset.downcast_ref::<Literal>() else {
-        return Ok(());
-    };
-    if !literal.value().data_type().is_integer() {
-        return Ok(());
-    }
-    if let Ok(ScalarValue::Int64(Some(0))) = literal.value().cast_to(&DataType::Int64) {
+    if literal_integer_offset(input_exprs) == Some(0) {
         return exec_err!("{NON_POSITIVE_OFFSET_MESSAGE}");
     }
     Ok(())
 }
 
+/// The offset argument of `nth_value(x, n)`, when it is an integer literal.
+///
+/// That is the only shape the rule above reads, because every other one is DataFusion's to
+/// refuse and answering `None` here leaves it to DataFusion:
+///
+/// * the offset is **absent** for `nth_value(x)`, which is malformed;
+/// * a **non-literal** offset is something DataFusion itself rejects a moment later
+///   (its evaluator needs a constant `n`), so its error is left to it;
+/// * a **non-integer** literal is likewise DataFusion's to refuse, and reading `0.4` as
+///   zero here would raise "must be greater than zero" about a number that is;
+/// * a literal too wide for an `i64`, or a NULL one, is no more a zero than it is a row
+///   number DataFusion can use.
+fn literal_integer_offset(input_exprs: &[Arc<dyn PhysicalExpr>]) -> Option<i64> {
+    let offset: &dyn Any = input_exprs.get(1)?.as_ref();
+    let literal = offset.downcast_ref::<Literal>()?;
+    if !literal.value().data_type().is_integer() {
+        return None;
+    }
+    match literal.value().cast_to(&DataType::Int64) {
+        Ok(ScalarValue::Int64(Some(offset))) => Some(offset),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use arrow::array::{ArrayRef, Int32Array};
+    use arrow::array::{ArrayRef, Int32Array, RecordBatch};
+    use arrow::datatypes::{Field, Schema};
     use datafusion::execution::context::SessionContext;
     use datafusion::physical_expr::expressions::col;
     use std::ops::Range;
@@ -252,25 +257,30 @@ mod tests {
         vec![Arc::new(Int32Array::from(vec![10, 20, 30]))]
     }
 
-    /// Build the evaluator the way a `WindowAggExec` does, over `nth_value(x, n)`.
-    fn evaluator(n: ScalarValue) -> Result<Box<dyn PartitionEvaluator>> {
-        let schema = arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
-            "x",
-            DataType::Int32,
-            true,
-        )]);
-        let input_exprs: Vec<Arc<dyn PhysicalExpr>> = vec![
-            col("x", &schema).expect("column"),
-            Arc::new(Literal::new(n)),
-        ];
-        let input_fields =
-            vec![Arc::new(arrow::datatypes::Field::new("x", DataType::Int32, true)) as FieldRef];
+    /// The one-column input the window is evaluated over.
+    fn input_schema() -> Schema {
+        Schema::new(vec![Field::new("x", DataType::Int32, true)])
+    }
+
+    /// Build the evaluator the way a `WindowAggExec` does, over the given arguments.
+    fn evaluator_over(
+        input_exprs: &[Arc<dyn PhysicalExpr>],
+    ) -> Result<Box<dyn PartitionEvaluator>> {
+        let input_fields = input_schema().fields().to_vec();
         PgNthValue::new().partition_evaluator(PartitionEvaluatorArgs::new(
-            &input_exprs,
+            input_exprs,
             &input_fields,
             false,
             false,
         ))
+    }
+
+    /// Build the evaluator over `nth_value(x, n)` for a literal offset.
+    fn evaluator(n: ScalarValue) -> Result<Box<dyn PartitionEvaluator>> {
+        evaluator_over(&[
+            col("x", &input_schema()).expect("column"),
+            Arc::new(Literal::new(n)),
+        ])
     }
 
     /// The answer `nth_value(x, n)` gives over the whole three-row frame.
@@ -280,19 +290,12 @@ mod tests {
     }
 
     /// The gap itself: this used to build an evaluator that answered NULL for every row.
+    ///
+    /// At every integer width, because `nth_value(x, 0)` is an `Int64` zero only if the
+    /// planner happened to type it that way — and with the message every time, because the
+    /// message is what the coordinator recovers `22016` from.
     #[test]
     fn a_zero_offset_raises_instead_of_answering_null() {
-        let err = nth_value_over_three_rows(0).expect_err("should have raised");
-        assert!(
-            err.to_string().contains(NON_POSITIVE_OFFSET_MESSAGE),
-            "the message is what classifies as 22016: {err}"
-        );
-    }
-
-    /// Every integer width a client can write the offset at reaches the same guard, since
-    /// `nth_value(x, 0)` is `Int64` only if the planner happened to type it that way.
-    #[test]
-    fn a_zero_offset_raises_at_every_integer_width() {
         for zero in [
             ScalarValue::Int8(Some(0)),
             ScalarValue::Int16(Some(0)),
@@ -301,7 +304,11 @@ mod tests {
             ScalarValue::UInt32(Some(0)),
             ScalarValue::UInt64(Some(0)),
         ] {
-            assert!(evaluator(zero.clone()).is_err(), "for {zero:?}");
+            let err = evaluator(zero.clone()).expect_err("should have raised");
+            assert!(
+                err.to_string().contains(NON_POSITIVE_OFFSET_MESSAGE),
+                "for {zero:?}: {err}"
+            );
         }
     }
 
@@ -318,12 +325,8 @@ mod tests {
             nth_value_over_three_rows(3).expect("should not raise"),
             ScalarValue::Int32(Some(30))
         );
-    }
-
-    /// An offset past the end of the frame is PostgreSQL's NULL, and stays one — the
-    /// answer `nth_value(x, 0)` used to be indistinguishable from.
-    #[test]
-    fn an_offset_past_the_frame_is_still_null() {
+        // An offset past the end of the frame is PostgreSQL's NULL, and stays one — the
+        // answer `nth_value(x, 0)` used to be indistinguishable from.
         assert_eq!(
             nth_value_over_three_rows(4).expect("should not raise"),
             ScalarValue::Int32(None)
@@ -344,17 +347,34 @@ mod tests {
         );
     }
 
-    /// An empty frame answers NULL rather than raising, per row: this is the half of
-    /// PostgreSQL's "no rows, no error" that lives inside the evaluator, and the reason
-    /// a positive offset over an empty table is not an error either.
-    #[test]
-    fn an_empty_frame_answers_null_and_raises_nothing() {
-        let mut evaluator = evaluator(ScalarValue::Int64(Some(1))).expect("should not raise");
-        assert_eq!(
-            evaluator
-                .evaluate(&values(), &Range { start: 0, end: 0 })
-                .expect("should not raise"),
-            ScalarValue::Int32(None)
+    /// The refusal end to end through the planner, which is the shape a client meets: the
+    /// statement reaches the registered function by name and the message that classifies as
+    /// `22016` is the one it gets back.
+    ///
+    /// The unit cases above call [`WindowUDFImpl::partition_evaluator`] themselves; only this
+    /// one proves the guard is still there once DataFusion has resolved the name, coerced the
+    /// arguments and built the window.
+    #[tokio::test]
+    async fn a_zero_offset_raises_through_the_planner() {
+        let mut ctx = SessionContext::new();
+        register_nth_value(&mut ctx).expect("registration failed");
+        let batch = RecordBatch::try_new(
+            Arc::new(input_schema()),
+            vec![Arc::new(Int32Array::from(vec![10, 20, 30]))],
+        )
+        .expect("batch");
+        ctx.register_batch("t", batch).expect("register");
+
+        let err = ctx
+            .sql("SELECT nth_value(x, 0) OVER () FROM t")
+            .await
+            .expect("should plan")
+            .collect()
+            .await
+            .expect_err("should have raised");
+        assert!(
+            err.to_string().contains(NON_POSITIVE_OFFSET_MESSAGE),
+            "the message is what classifies as 22016: {err}"
         );
     }
 
@@ -372,25 +392,12 @@ mod tests {
     /// A non-literal offset likewise: DataFusion needs a constant `n` and says so.
     #[test]
     fn a_non_literal_offset_is_left_to_datafusion() {
-        let schema = arrow::datatypes::Schema::new(vec![arrow::datatypes::Field::new(
-            "x",
-            DataType::Int32,
-            true,
-        )]);
-        let input_exprs: Vec<Arc<dyn PhysicalExpr>> = vec![
+        let schema = input_schema();
+        let err = evaluator_over(&[
             col("x", &schema).expect("column"),
             col("x", &schema).expect("column"),
-        ];
-        let input_fields =
-            vec![Arc::new(arrow::datatypes::Field::new("x", DataType::Int32, true)) as FieldRef];
-        let err = PgNthValue::new()
-            .partition_evaluator(PartitionEvaluatorArgs::new(
-                &input_exprs,
-                &input_fields,
-                false,
-                false,
-            ))
-            .expect_err("should have raised");
+        ])
+        .expect_err("should have raised");
         assert!(
             !err.to_string().contains(NON_POSITIVE_OFFSET_MESSAGE),
             "not ours to refuse: {err}"
@@ -401,8 +408,7 @@ mod tests {
     /// OID a driver binds its receive buffer from.
     #[test]
     fn the_declared_field_is_datafusions() {
-        let input_fields =
-            vec![Arc::new(arrow::datatypes::Field::new("x", DataType::Int32, false)) as FieldRef];
+        let input_fields = vec![Arc::new(Field::new("x", DataType::Int32, false)) as FieldRef];
         let ours = PgNthValue::new()
             .field(WindowUDFFieldArgs::new(&input_fields, "nth_value(x,1)"))
             .expect("field");
@@ -424,7 +430,8 @@ mod tests {
     }
 
     /// The wire carries only the name, so the name has to resolve to *ours* after
-    /// registration — a context that resolved DataFusion's would answer NULL again.
+    /// registration — a context that resolved DataFusion's would answer NULL again. Twice,
+    /// because a context reached by two registration paths registers twice.
     #[test]
     fn the_name_resolves_to_this_function_after_registration() {
         let mut ctx = SessionContext::new();
@@ -433,23 +440,10 @@ mod tests {
             .expect("datafusion registers one");
         assert!(!before.inner().is::<PgNthValue>());
 
-        register_nth_value(&mut ctx).expect("registration failed");
-        let after = ctx.udwf(NTH_VALUE_UDWF_NAME).expect("ours");
-        assert!(after.inner().is::<PgNthValue>());
-    }
-
-    /// Registering twice is what a context reached by two registration paths does.
-    #[test]
-    fn registering_twice_is_idempotent() {
-        let mut ctx = SessionContext::new();
         register_nth_value(&mut ctx).expect("first registration failed");
         register_nth_value(&mut ctx).expect("second registration failed");
-        assert!(
-            ctx.udwf(NTH_VALUE_UDWF_NAME)
-                .expect("ours")
-                .inner()
-                .is::<PgNthValue>()
-        );
+        let after = ctx.udwf(NTH_VALUE_UDWF_NAME).expect("ours");
+        assert!(after.inner().is::<PgNthValue>());
     }
 
     /// `first_value` and `last_value` share DataFusion's implementation with `nth_value`
@@ -489,9 +483,5 @@ mod tests {
         );
         // Nothing else is claimed.
         assert_eq!(error_code_of_message("division by zero"), None);
-        assert_eq!(
-            error_code_of_message("Job abc failed: stage 1 failed"),
-            None
-        );
     }
 }

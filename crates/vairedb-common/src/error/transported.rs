@@ -1,5 +1,4 @@
-//! Carrying a structured error code across the Ballista scheduler boundary, and reading
-//! one back out of the text a transported failure arrives as.
+//! Reading a `DataFusionError` back out of the text a transported failure arrives as.
 //!
 //! An error raised inside a Ballista executor never reaches the coordinator as a value.
 //! The executor hands its failure to the scheduler as a `FailedTask`, whose only payload
@@ -8,21 +7,11 @@
 //! why every failure raised on an executor used to land `XX000 internal_error`, the one
 //! class that tells a client the *server* broke and the statement is worth retrying.
 //!
-//! Two things survive that trip, and this module is built on both.
+//! Two things survive that trip. The first is a tag VaireDB puts in the message itself,
+//! which is [`super::tag`]'s job and the structured half of the recovery. The second is the
+//! subject of this module.
 //!
-//! ## 1. A tag VaireDB puts in the message itself
-//!
-//! [`tagged_message`] writes a `[VDB-<code>]` prefix into an error VaireDB raises on an
-//! executor, and [`code_of_tagged_message`] reads it back. That is the *structured* half:
-//! the code is chosen where the error is raised, by the code that knows what went wrong,
-//! rather than guessed at the other end from wording. A guard added to a UDF or UDAF gets
-//! the right SQLSTATE by tagging its message and nothing else.
-//!
-//! The tag is a transport artifact and never reaches a client:
-//! [`crate::error::sanitize_message`] strips it, and the coordinator re-attaches exactly
-//! one `[VDB-…]` of its own when it formats the reply.
-//!
-//! ## 2. The variant name, still spelled out in the rendered text
+//! ## The variant name, still spelled out in the rendered text
 //!
 //! DataFusion's own errors cannot be tagged, but nothing is actually *lost* when one is
 //! rendered — the variant is still there, as text. Ballista renders a failed task with
@@ -57,70 +46,9 @@
 //! message (`No function matches 'Execution(x)'`) is not mistaken for the error's own
 //! variant and does not truncate the message to its argument.
 
-use std::fmt::Display;
-
-use super::sanitize::{string_literal_end, unescape};
-use crate::proto::vairedb::v1::VdbErrorCode;
-
-/// What a [`VdbErrorCode`] tag opens with.
-const TAG_OPEN: &str = "[VDB-";
-
-/// Write `message` with a `[VDB-<code>]` tag, so `code` survives being rendered to text.
-///
-/// Use this for any error raised where the typed value cannot reach the coordinator —
-/// inside a UDF, a UDAF or a window evaluator, all of which run on an executor. The tag
-/// is read back by [`code_of_tagged_message`] and removed before the client sees the
-/// message, so the wording stays whatever PostgreSQL's is.
-pub fn tagged_message(code: VdbErrorCode, message: impl Display) -> String {
-    format!("{TAG_OPEN}{}] {message}", code as i32)
-}
-
-/// The [`VdbErrorCode`] tagged into `msg`, or `None` if it carries no tag.
-///
-/// Scans rather than matching a prefix: the tag is written where the error is raised and
-/// arrives wrapped in whatever the scheduler put around it. An `Unspecified` tag reads as
-/// no tag at all — it carries no more information than the absence of one.
-pub fn code_of_tagged_message(msg: &str) -> Option<VdbErrorCode> {
-    let digits = tag_digits(msg)?.1;
-    let code = VdbErrorCode::try_from(digits.parse::<i32>().ok()?).ok()?;
-    (code != VdbErrorCode::Unspecified).then_some(code)
-}
-
-/// Remove every `[VDB-<code>]` tag from `msg`, along with the single space after it.
-///
-/// Called by [`crate::error::sanitize_message`], because the coordinator formats its
-/// reply with a tag of its own: left in, a transported tag would reach the client as a
-/// second `[VDB-…]` in the middle of the sentence.
-pub fn strip_code_tags(msg: &str) -> String {
-    let mut out = String::with_capacity(msg.len());
-    let mut rest = msg;
-    while let Some((at, digits)) = tag_digits(rest) {
-        out.push_str(&rest[..at]);
-        let after = at + TAG_OPEN.len() + digits.len() + 1;
-        rest = rest[after..].strip_prefix(' ').unwrap_or(&rest[after..]);
-    }
-    out.push_str(rest);
-    out
-}
-
-/// The offset of the first `[VDB-<digits>]` tag in `msg` and the digits it spells.
-///
-/// Digits only, so a `[VDB-…]` that is not a tag — one carrying a name, or an unclosed
-/// bracket — is left alone rather than half-consumed.
-fn tag_digits(msg: &str) -> Option<(usize, &str)> {
-    let mut from = 0;
-    while let Some(found) = msg[from..].find(TAG_OPEN) {
-        let at = from + found;
-        let rest = &msg[at + TAG_OPEN.len()..];
-        from = at + TAG_OPEN.len();
-        let end = rest.find(']')?;
-        let digits = &rest[..end];
-        if !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) {
-            return Some((at, digits));
-        }
-    }
-    None
-}
+use super::scan::{
+    MAX_TRANSPORT_LAYERS, PARENS, Quoting, end_of_nesting, string_literal_end, unescape,
+};
 
 /// A `DataFusionError` variant, recovered from the text a transported failure arrives as.
 ///
@@ -172,6 +100,34 @@ struct Marker {
     /// The `Display` prefix — transcribed from `DataFusionError::error_prefix`, which is
     /// the only thing that decides what a rendered `DataFusionError` starts with.
     display: &'static str,
+}
+
+/// Which of a [`Marker`]'s two spellings a scan found, and therefore how the payload
+/// behind it has to be read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Spelling {
+    /// `{:?}` — the variant's constructor, so its payload is a delimited `Debug` field.
+    Debug,
+    /// `{}` — an engine prefix, so everything after it is the message.
+    Display,
+}
+
+impl Spelling {
+    /// The text this spelling of `marker` is written as.
+    fn needle(self, marker: &Marker) -> &'static str {
+        match self {
+            Self::Debug => marker.debug,
+            Self::Display => marker.display,
+        }
+    }
+
+    /// The message carried by the text following this spelling's needle.
+    fn payload(self, rest: &str) -> Option<String> {
+        match self {
+            Self::Debug => debug_payload(rest),
+            Self::Display => Some(rest.trim().to_string()),
+        }
+    }
 }
 
 /// Every variant worth recovering, with both of its spellings.
@@ -242,13 +198,6 @@ const MARKERS: &[Marker] = &[
     },
 ];
 
-/// How many layers [`recover_transported_error`] will peel.
-///
-/// Bounded rather than run to a fixed point. The deepest shape measured is four — a job
-/// wrapper, a task wrapper, `Execution("…")`, and an `ArrowError(…)` inside it — and a
-/// bound means no input can make the loop spin.
-const MAX_PEEL_PASSES: usize = 8;
-
 /// Read `text` back into the innermost `DataFusionError` variant it was rendered from.
 ///
 /// Returns `None` when the text names no variant at all, which is the honest answer for a
@@ -257,7 +206,7 @@ const MAX_PEEL_PASSES: usize = 8;
 pub fn recover_transported_error(text: &str) -> Option<TransportedError> {
     let mut current = text.to_string();
     let mut recovered = None;
-    for _ in 0..MAX_PEEL_PASSES {
+    for _ in 0..MAX_TRANSPORT_LAYERS {
         let Some(peeled) = peel(&current) else {
             break;
         };
@@ -273,33 +222,31 @@ pub fn recover_transported_error(text: &str) -> Option<TransportedError> {
 /// Outermost and not innermost, because the inner layers are still escaped — one pass
 /// unescapes what it takes, which is what makes the next marker findable.
 fn peel(text: &str) -> Option<TransportedError> {
-    let mut best: Option<(usize, &Marker, bool)> = None;
-    for marker in MARKERS {
-        for (needle, is_debug) in [(marker.debug, true), (marker.display, false)] {
-            if let Some(at) = first_structural(text, needle)
-                && best.is_none_or(|(found, _, _)| at < found)
-            {
-                best = Some((at, marker, is_debug));
-            }
-        }
-    }
-
-    let (at, marker, is_debug) = best?;
-    let needle = if is_debug {
-        marker.debug
-    } else {
-        marker.display
-    };
-    let rest = &text[at + needle.len()..];
-    let message = if is_debug {
-        debug_payload(rest)?
-    } else {
-        rest.trim().to_string()
-    };
+    let (marker, spelling, after) = outermost_marker(text)?;
+    let message = spelling.payload(&text[after..])?;
     (!message.is_empty()).then_some(TransportedError {
         variant: marker.variant,
         message,
     })
+}
+
+/// The marker a renderer put outermost in `text`: the variant it names, which of its two
+/// spellings was found, and the offset just past that spelling.
+///
+/// Outermost means leftmost, since every layer of rendering wraps the one before it.
+fn outermost_marker(text: &str) -> Option<(&'static Marker, Spelling, usize)> {
+    let mut best: Option<(usize, &'static Marker, Spelling, usize)> = None;
+    for marker in MARKERS {
+        for spelling in [Spelling::Debug, Spelling::Display] {
+            let needle = spelling.needle(marker);
+            if let Some(at) = first_structural(text, needle)
+                && best.is_none_or(|(found, ..)| at < found)
+            {
+                best = Some((at, marker, spelling, at + needle.len()));
+            }
+        }
+    }
+    best.map(|(_, marker, spelling, after)| (marker, spelling, after))
 }
 
 /// The offset of the first occurrence of `needle` in `text` that sits where a renderer
@@ -347,57 +294,15 @@ fn debug_payload(rest: &str) -> Option<String> {
         let end = string_literal_end(literal)?;
         return Some(unescape(&literal[..end]));
     }
-    Some(rest[..matching_paren(rest)?].to_string())
-}
-
-/// Byte offset, within `s`, of the `)` closing an already-consumed `(` — `None` if it
-/// never closes.
-///
-/// Quoting is respected: a parenthesis inside a message the rendering quoted must not
-/// close the variant that carries it.
-fn matching_paren(s: &str) -> Option<usize> {
-    let mut depth = 1usize;
-    let mut in_string = false;
-    let mut escaped = false;
-    for (i, c) in s.char_indices() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match c {
-            '\\' if in_string => escaped = true,
-            '"' => in_string = !in_string,
-            '(' if !in_string => depth += 1,
-            ')' if !in_string => {
-                depth -= 1;
-                if depth == 0 {
-                    return Some(i);
-                }
-            }
-            _ => {}
-        }
-    }
-    None
+    let end = end_of_nesting(rest, PARENS, Quoting::Respected)?;
+    Some(rest[..end].to_string())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// A tag round-trips, and the code it carries is the one that was written.
-    #[test]
-    fn a_tag_round_trips_through_its_own_message() {
-        for code in [
-            VdbErrorCode::FeatureNotSupported,
-            VdbErrorCode::DivisionByZero,
-            VdbErrorCode::GroupingError,
-            VdbErrorCode::InvalidArgumentForNthValue,
-        ] {
-            let msg = tagged_message(code, "something the client reads");
-            assert_eq!(code_of_tagged_message(&msg), Some(code));
-            assert_eq!(strip_code_tags(&msg), "something the client reads");
-        }
-    }
+    use crate::error::{strip_code_tags, tagged_message};
+    use crate::proto::vairedb::v1::VdbErrorCode;
 
     /// The point of the tag: it is still readable after the scheduler has rendered the
     /// error it was written into, twice.
@@ -408,32 +313,9 @@ mod tests {
             "Job 3QdcFzH failed: Job failed due to stage 1 failed: Task failed due to \
              runtime execution error: DataFusionError(Plan({raised:?}))"
         );
-        assert_eq!(
-            code_of_tagged_message(&transported),
-            Some(VdbErrorCode::FeatureNotSupported)
-        );
         let recovered = recover_transported_error(&transported).expect("a Plan error");
         assert_eq!(recovered.variant, TransportedVariant::Plan);
         assert_eq!(strip_code_tags(&recovered.message), "no array of these");
-    }
-
-    /// Text that is not a tag is left alone rather than half-consumed.
-    #[test]
-    fn something_that_is_not_a_tag_is_not_read_as_one() {
-        for msg in [
-            "no tag at all",
-            "[VDB-] empty",
-            "[VDB-abc] not digits",
-            "[VDB-1004 unclosed",
-            // Code 0 is `Unspecified`, which says no more than the absence of a tag.
-            "[VDB-0] unspecified",
-        ] {
-            assert_eq!(code_of_tagged_message(msg), None, "for {msg:?}");
-        }
-        assert_eq!(
-            strip_code_tags("[VDB-abc] not digits"),
-            "[VDB-abc] not digits"
-        );
     }
 
     /// Both spellings of a transported error, as measured on a five-node cluster.

@@ -4,6 +4,7 @@
 use std::path::Path;
 
 use serde::Deserialize;
+use vairedb_common::config::ConfigError;
 
 /// Fully-specified coordinator configuration deserialized from YAML.
 #[derive(Debug, Deserialize)]
@@ -38,9 +39,9 @@ pub struct CoordinatorConfig {
 impl CoordinatorConfig {
     /// Load and deserialize the coordinator config from the YAML file at `path`.
     ///
-    /// Returns `Err` if the file cannot be read or fails to deserialize (e.g. a
-    /// missing required field).
-    pub fn from_file(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
+    /// The error distinguishes a file that could not be read from one that was read and is
+    /// not a configuration — a missing required field, say. See [`ConfigError`].
+    pub fn from_file(path: &Path) -> Result<Self, ConfigError> {
         vairedb_common::config::from_file(path)
     }
 }

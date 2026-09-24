@@ -20,7 +20,7 @@
 //! introspection query by string interpolation quotes its OIDs, and `format_type('23', 0)`
 //! is what arrives. The value it wants back is the one upstream already computes correctly,
 //! which is why this is a widening of the signature and not a second implementation —
-//! [`FormatType`] converts the arguments and delegates every rendering decision to
+//! `FormatType` converts the arguments and delegates every rendering decision to
 //! upstream's `format_type` UDF.
 //!
 //! ## Why the conversion is not left to DataFusion's cast
@@ -44,8 +44,7 @@
 
 use std::sync::{Arc, OnceLock};
 
-use arrow::array::{Array, ArrayRef, AsArray, Int32Array, Int32Builder};
-use arrow::compute::kernels::cast::cast;
+use arrow::array::{Array, Int32Array, Int32Builder};
 use arrow::datatypes::{DataType, Field, FieldRef};
 use datafusion::common::{DataFusionError, Result, exec_err, plan_err};
 use datafusion::execution::FunctionRegistry;
@@ -54,6 +53,7 @@ use datafusion::logical_expr::{
 };
 use datafusion_pg_catalog::pg_catalog::format_type::create_format_type_udf;
 
+use crate::columns::strings;
 use crate::error::tagged_message;
 use crate::proto::vairedb::v1::VdbErrorCode;
 
@@ -67,7 +67,16 @@ pub fn format_type_udf() -> Arc<ScalarUDF> {
 }
 
 /// Register the widened `format_type` on `registry`, replacing any `format_type` already
-/// there — which on the coordinator's catalog contexts is upstream's own.
+/// there.
+///
+/// Nothing in production calls this, and that is not an oversight: `format_type` reaches a
+/// node *inside* [`crate::pg_udf`]'s `pg_catalog` set, which is the family
+/// [`crate::distributed_functions`] lists, and the coordinator puts it back by hand after
+/// `setup_pg_catalog` replaces it. So this name already travels the one list, one row
+/// further down than its own module — giving it a row of its own would give one function
+/// two registration paths, which is the thing that list exists to prevent. The seam is kept
+/// because it is how the tests below register this one function in isolation, and because
+/// every sibling function module offers the same shape.
 pub fn register_format_type(registry: &mut dyn FunctionRegistry) -> Result<()> {
     registry.register_udf(format_type_udf())?;
     Ok(())
@@ -131,25 +140,42 @@ impl Argument {
             _ => None,
         }
     }
+
+    /// One whole argument as the integer column upstream reads, converting a string
+    /// spelling of it the way PostgreSQL's input function for this type would.
+    fn column(self, value: &ColumnarValue, rows: usize) -> Result<ColumnarValue> {
+        match value.data_type() {
+            DataType::Int32 | DataType::Int64 => Ok(value.clone()),
+            // Only reachable when this is invoked without `coerce_types` having run, which
+            // the unit tests below do: an all-NULL column is an argument that carries no
+            // value, and `Int32` is the width upstream reads that as.
+            DataType::Null => Ok(ColumnarValue::Array(Arc::new(Int32Array::new_null(rows)))),
+            _ => {
+                let text = strings(&value.to_array(rows)?)?;
+                let mut out = Int32Builder::with_capacity(text.len());
+                for spelling in text.iter() {
+                    match spelling {
+                        Some(spelling) => out.append_value(self.read(spelling)?),
+                        None => out.append_null(),
+                    }
+                }
+                Ok(ColumnarValue::Array(Arc::new(out.finish())))
+            }
+        }
+    }
 }
 
 /// `format_type(oid, integer)` — upstream's renderer behind PostgreSQL's own signature.
 #[derive(Debug, PartialEq, Eq, Hash)]
-pub struct FormatType {
+struct FormatType {
     signature: Signature,
     /// Upstream's UDF, which owns every rendering decision: this type only converts
     /// arguments, so the answer cannot drift from the one `\d` already gets.
     inner: ScalarUDF,
 }
 
-impl Default for FormatType {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl FormatType {
-    pub fn new() -> Self {
+    fn new() -> Self {
         Self {
             // `Stable`, as upstream declares it: a call whose arguments are all literals is
             // then folded before the plan is serialized, which is what keeps `\gdesc`'s
@@ -206,8 +232,8 @@ impl ScalarUDFImpl for FormatType {
                 values.len()
             );
         };
-        let oid = integers(oid, number_rows, Argument::Oid)?;
-        let typemod = integers(typemod, number_rows, Argument::Integer)?;
+        let oid = Argument::Oid.column(oid, number_rows)?;
+        let typemod = Argument::Integer.column(typemod, number_rows)?;
         self.inner.invoke_with_args(ScalarFunctionArgs {
             arg_fields: vec![arg_field(&oid), arg_field(&typemod)],
             args: vec![oid, typemod],
@@ -215,38 +241,6 @@ impl ScalarUDFImpl for FormatType {
             return_field,
             config_options,
         })
-    }
-}
-
-/// One argument as the integer column upstream reads, converting a string spelling of it
-/// the way PostgreSQL's input function for the argument's type would.
-fn integers(value: &ColumnarValue, rows: usize, argument: Argument) -> Result<ColumnarValue> {
-    match value.data_type() {
-        DataType::Int32 | DataType::Int64 => Ok(value.clone()),
-        // Only reachable when this is invoked without `coerce_types` having run, which the
-        // unit tests below do: an all-NULL column is an argument that carries no value, and
-        // `Int32` is the width upstream reads that as.
-        DataType::Null => Ok(ColumnarValue::Array(Arc::new(Int32Array::new_null(rows)))),
-        _ => {
-            let text = strings(&value.to_array(rows)?)?;
-            let mut out = Int32Builder::with_capacity(text.len());
-            for value in text.iter() {
-                match value {
-                    Some(value) => out.append_value(argument.read(value)?),
-                    None => out.append_null(),
-                }
-            }
-            Ok(ColumnarValue::Array(Arc::new(out.finish())))
-        }
-    }
-}
-
-/// One argument as a `Utf8` array, tolerating a view or large layout
-/// [`ScalarUDFImpl::coerce_types`] asked to be rewritten away.
-fn strings(array: &ArrayRef) -> Result<arrow::array::StringArray> {
-    match array.data_type() {
-        DataType::Utf8 => Ok(array.as_string::<i32>().clone()),
-        _ => Ok(cast(array, &DataType::Utf8)?.as_string::<i32>().clone()),
     }
 }
 
@@ -259,6 +253,7 @@ fn arg_field(value: &ColumnarValue) -> FieldRef {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use arrow::array::AsArray;
     use datafusion::execution::context::SessionContext;
     use datafusion::logical_expr::type_coercion::functions::fields_with_udf;
 
@@ -303,24 +298,12 @@ mod tests {
         ColumnarValue::Array(Arc::new(Int32Array::from(values.to_vec())))
     }
 
-    /// The premise of the module: upstream resolves the four integer pairs and nothing else,
-    /// so a string argument is not a call it has. If this ever fails because upstream widened
-    /// its own signature, the shadowing below is no longer needed.
+    /// The premise of the module: upstream's signature has integer arms only, so a string
+    /// argument is not a call it has. If this ever fails because upstream widened its own
+    /// signature, the shadowing below is no longer needed.
     #[test]
     fn upstream_has_no_arm_for_a_string_argument() {
         let upstream = create_format_type_udf();
-        let integer_pairs = [
-            (DataType::Int32, DataType::Int32),
-            (DataType::Int32, DataType::Int64),
-            (DataType::Int64, DataType::Int32),
-            (DataType::Int64, DataType::Int64),
-        ];
-        for (oid, typemod) in integer_pairs {
-            assert!(
-                resolved(&upstream, &[oid.clone(), typemod.clone()]).is_ok(),
-                "({oid}, {typemod}) is upstream's own"
-            );
-        }
         assert!(
             resolved(&upstream, &[DataType::Utf8, DataType::Int32]).is_err(),
             "a string OID is what a client tool sends and upstream cannot resolve"

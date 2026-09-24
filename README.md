@@ -8,10 +8,19 @@ Read the [When use VaireDB](#when-use-vairedb) section for understanding where
 VaireDB is best suited for your use cases.
 
 > [!IMPORTANT]  
-> VaireDB is currently under active development. Breaking changes 
-> may occur and major features may be added.
+> VaireDB is currently under active development. 
+>
+> Breaking changes may occur and major features may be added.
 > Consider this a work in progress and not yet ready for production use.
 > Any contributions are welcome for targeting the production-ready v1.0 release.
+
+> [!IMPORTANT]  
+> AI full disclosure.
+> 
+> This software is developed with strong assistance from AI coding agents and 
+> with humans leading the ideas, testing, and debugging. We say this openly 
+> because it shaped how the project was built. If you are not happy with 
+> AI-developed code, this software is not for you.
 
 ## Overview
 

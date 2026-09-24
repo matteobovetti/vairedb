@@ -67,7 +67,7 @@ use crate::pg_format_type::format_type_udf;
 /// why the set is limited to functions that take an argument.
 pub fn register_pg_catalog_scalar_functions(registry: &mut dyn FunctionRegistry) -> Result<()> {
     for udf in pg_catalog_scalar_functions() {
-        // The previous registration under the same name, if any: the coordinator's
+        // Replaces the previous registration under the same name, if any: the coordinator's
         // catalog contexts get these from `setup_pg_catalog` too, and re-registering the
         // same function is how that stays idempotent.
         registry.register_udf(Arc::new(udf))?;
@@ -75,7 +75,9 @@ pub fn register_pg_catalog_scalar_functions(registry: &mut dyn FunctionRegistry)
     Ok(())
 }
 
-/// The functions themselves, in the order `setup_pg_catalog` registers them.
+/// The functions themselves, in the order `setup_pg_catalog` registers them — which is the
+/// only way a function upstream adds or renames is ever noticed, by reading the two lists
+/// side by side.
 fn pg_catalog_scalar_functions() -> Vec<ScalarUDF> {
     vec![
         create_current_schemas_udf(),
@@ -110,6 +112,15 @@ fn pg_catalog_scalar_functions() -> Vec<ScalarUDF> {
 mod tests {
     use super::*;
     use datafusion::execution::context::SessionContext;
+    use std::collections::HashSet;
+
+    /// The name of every function in the set, in the order the set lists them.
+    fn registered_names() -> Vec<String> {
+        pg_catalog_scalar_functions()
+            .iter()
+            .map(|udf| udf.name().to_string())
+            .collect()
+    }
 
     /// The one a client tool found, and the reason this module exists.
     #[test]
@@ -135,17 +146,62 @@ mod tests {
         );
     }
 
-    /// Every name in the set has to resolve, because the wire carries only the name.
+    /// The set of names is itself the contract, because the wire carries only a name: one
+    /// that leaves this list stops resolving on the node that runs the stage, and one that
+    /// joins it *shadows* whatever DataFusion or `setup_pg_catalog` had registered under it —
+    /// a wrong answer instead of a failure. Both are silent until a client happens to hit
+    /// them, so the list is pinned rather than described, in the registration order the
+    /// function above claims to keep.
     #[test]
-    fn every_registered_function_resolves_by_its_own_name() {
+    fn the_set_registers_exactly_these_names_in_this_order() {
+        let names = registered_names();
+        assert_eq!(
+            names,
+            [
+                "current_schemas",
+                "pg_get_userbyid",
+                "has_table_privilege",
+                "has_schema_privilege",
+                "has_database_privilege",
+                "has_any_column_privilege",
+                "pg_table_is_visible",
+                "format_type",
+                "pg_get_expr",
+                "pg_get_partkeydef",
+                "pg_relation_is_publishable",
+                "pg_get_statisticsobjdef_columns",
+                "pg_encoding_to_char",
+                "pg_relation_size",
+                "pg_total_relation_size",
+                "pg_stat_get_numscans",
+                "pg_get_constraintdef",
+                // Not `pg_get_partition_ancestors`, which is only what upstream calls the
+                // *constructor*: PostgreSQL's function is `pg_partition_ancestors`, and the
+                // name is the whole of what crosses the wire.
+                "pg_partition_ancestors",
+                "quote_ident",
+                "parse_ident",
+                "array_upper",
+                "array_lower",
+            ]
+        );
+
+        // And no name twice: a registry keys on the name, so a second entry under one name
+        // would silently replace the first and the list would be claiming a function it does
+        // not install.
+        let unique: HashSet<&String> = names.iter().collect();
+        assert_eq!(
+            unique.len(),
+            names.len(),
+            "a name appears twice in {names:?}"
+        );
+
+        // And one call installs all of them, since a name the list holds but the seam does not
+        // register is the failure this module exists to prevent.
         let mut ctx = SessionContext::new();
         register_pg_catalog_scalar_functions(&mut ctx).expect("registration failed");
-        for udf in pg_catalog_scalar_functions() {
-            assert!(
-                ctx.udf(udf.name()).is_ok(),
-                "{} did not resolve by name",
-                udf.name()
-            );
+        for name in &names {
+            assert!(ctx.udf(name).is_ok(), "{name} did not resolve by name");
         }
     }
 
@@ -155,10 +211,7 @@ mod tests {
     /// session-scoped, which an executor could not answer correctly anyway.
     #[test]
     fn the_session_scoped_functions_are_left_out() {
-        let names: Vec<String> = pg_catalog_scalar_functions()
-            .iter()
-            .map(|udf| udf.name().to_string())
-            .collect();
+        let names = registered_names();
         for excluded in [
             "current_database",
             "current_schema",

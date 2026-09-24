@@ -16,8 +16,9 @@
 //! keeps the ordering columns beside the values in its own state so the merge can re-sort,
 //! which is machinery worth reusing rather than writing twice.
 //!
-//! So the read path rewrites the aggregate into a composition — [`crate::pgwire_handler`]'s
-//! side of it lives in `pg_operators`:
+//! So the read path rewrites the aggregate into a composition — the coordinator's side of
+//! it lives in its `pgwire_handler::pg_operators`, which this crate cannot link to because
+//! nothing here depends on the coordinator:
 //!
 //! ```text
 //! json_agg(v ORDER BY v DESC)  -->  vaire_json_array(array_agg(v ORDER BY v DESC))
@@ -47,7 +48,7 @@
 //! other and nothing distinguishes it. `json_agg(payload::jsonb)` is the spelling that
 //! embeds. This is recorded in `docs/specs/gap-analysis.md` rather than guessed at.
 
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 use arrow::array::{Array, ArrayRef, AsArray, StringBuilder};
 use arrow::datatypes::{DataType, Field, FieldRef};
@@ -58,7 +59,13 @@ use datafusion::logical_expr::{
     ColumnarValue, ScalarFunctionArgs, ScalarUDF, ScalarUDFImpl, Signature, Volatility,
 };
 
+use crate::columns::list_row;
 use crate::json_pg::{JsonType, validate};
+
+/// What the aggregated column has to be, for the refusal when it is not: the rewrite wraps
+/// an `array_agg`, so anything else means the plan the executor received is not the one the
+/// read path builds.
+const AGGREGATE_NEEDS_A_LIST: &str = "a json aggregate needs a list to render";
 
 /// The name the read path emits for `json_agg`/`jsonb_agg` over ordinary values.
 pub const JSON_ARRAY_UDF_NAME: &str = "vaire_json_array";
@@ -70,49 +77,84 @@ pub const JSON_AGG_NAME: &str = "json_agg";
 /// The same for `jsonb`. Both render identically here; see the module doc.
 pub const JSONB_AGG_NAME: &str = "jsonb_agg";
 
+/// What the aggregated elements are — the whole difference between the two renderings, and
+/// the one thing this module is told rather than works out. See "Quoting versus embedding"
+/// in the module doc.
+///
+/// The distinction cannot be read off the values, because both arrive as Arrow text; only
+/// the expression that produced them says which it is. So the read path decides it once,
+/// records the decision in the name it emits, and the UDF registered under that name carries
+/// it from there down to the element that gets written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum Elements {
+    /// Ordinary values, each encoded as JSON: text comes out quoted and escaped.
+    Values,
+    /// JSON documents already, each spliced into the array verbatim.
+    Documents,
+}
+
+impl Elements {
+    /// The name the read path emits for this rendering, which is also the UDF's own name.
+    fn udf_name(self) -> &'static str {
+        match self {
+            Elements::Values => JSON_ARRAY_UDF_NAME,
+            Elements::Documents => JSON_ARRAY_DOCS_UDF_NAME,
+        }
+    }
+}
+
 /// Register both renderings on `registry`.
 ///
 /// Call this on every context that plans **or** executes a read: the inner `array_agg`
 /// crosses the wire as a name and so does the function wrapped around it.
 pub fn register_json_aggregates(registry: &mut dyn FunctionRegistry) -> Result<()> {
-    registry.register_udf(json_array_udf(false))?;
-    registry.register_udf(json_array_udf(true))?;
+    for elements in [Elements::Values, Elements::Documents] {
+        registry.register_udf(Arc::new(ScalarUDF::from(JsonArray::new(elements))))?;
+    }
     Ok(())
 }
 
-/// The shared [`ScalarUDF`] handle for one of the two renderings, for the rewrite that
-/// builds the call. `documents` selects splicing over quoting — see the module doc.
-pub fn json_array_udf(documents: bool) -> Arc<ScalarUDF> {
-    static VALUES: OnceLock<Arc<ScalarUDF>> = OnceLock::new();
-    static DOCUMENTS: OnceLock<Arc<ScalarUDF>> = OnceLock::new();
-    let cell = if documents { &DOCUMENTS } else { &VALUES };
-    Arc::clone(cell.get_or_init(|| Arc::new(ScalarUDF::from(JsonArray::new(documents)))))
-}
-
 /// `vaire_json_array(list)` — a list rendered as a JSON array, in text.
+///
+/// A [`ScalarUDFImpl`] and not an
+/// [`AggregateUDFImpl`](datafusion::logical_expr::AggregateUDFImpl): the aggregate is the
+/// `array_agg` the read path wraps in this, which is what keeps `ORDER BY`, `DISTINCT` and
+/// `FILTER` — and the distributed merge that has to preserve them — out of here. See "Why
+/// this is a scalar function and not an aggregate" in the module doc.
 #[derive(Debug, PartialEq, Eq, Hash)]
-pub struct JsonArray {
-    /// The elements are JSON documents to splice rather than values to quote.
-    documents: bool,
+struct JsonArray {
+    elements: Elements,
     signature: Signature,
 }
 
 impl JsonArray {
-    pub fn new(documents: bool) -> Self {
+    fn new(elements: Elements) -> Self {
         Self {
-            documents,
+            elements,
             signature: Signature::user_defined(Volatility::Immutable),
         }
+    }
+
+    /// One JSON array per row of a list column — which is one per group.
+    fn render_groups(&self, lists: &ArrayRef) -> Result<ArrayRef> {
+        let mut out = StringBuilder::with_capacity(lists.len(), lists.len() * 32);
+        for row in 0..lists.len() {
+            // A group that aggregated no rows: `array_agg` answers NULL and so does
+            // PostgreSQL's `json_agg`.
+            if lists.is_null(row) {
+                out.append_null();
+                continue;
+            }
+            let elements = list_row(lists, row, AGGREGATE_NEEDS_A_LIST)?;
+            out.append_value(render(&elements, self.elements)?);
+        }
+        Ok(Arc::new(out.finish()))
     }
 }
 
 impl ScalarUDFImpl for JsonArray {
     fn name(&self) -> &str {
-        if self.documents {
-            JSON_ARRAY_DOCS_UDF_NAME
-        } else {
-            JSON_ARRAY_UDF_NAME
-        }
+        self.elements.udf_name()
     }
 
     fn signature(&self) -> &Signature {
@@ -135,7 +177,7 @@ impl ScalarUDFImpl for JsonArray {
             DataType::Null => return Ok(vec![DataType::Null]),
             other => return plan_err!("{} takes a list, got {other}", self.name()),
         };
-        if self.documents
+        if self.elements == Elements::Documents
             && !matches!(
                 element,
                 DataType::Utf8 | DataType::LargeUtf8 | DataType::Utf8View | DataType::Null
@@ -163,33 +205,14 @@ impl ScalarUDFImpl for JsonArray {
         };
         // Against `number_rows`, so a batch of no rows stays one.
         let lists = arg.to_array(args.number_rows)?;
+        // What a literal NULL aggregates to: there is no list to render, only SQL NULLs.
         if lists.data_type() == &DataType::Null {
             return Ok(ColumnarValue::Array(arrow::array::new_null_array(
                 &DataType::Utf8,
                 args.number_rows,
             )));
         }
-        let mut out = StringBuilder::with_capacity(lists.len(), lists.len() * 32);
-        for row in 0..lists.len() {
-            // A group that aggregated no rows: `array_agg` answers NULL and so does
-            // PostgreSQL's `json_agg`.
-            if lists.is_null(row) {
-                out.append_null();
-                continue;
-            }
-            let elements = list_row(&lists, row)?;
-            out.append_value(render(&elements, self.documents)?);
-        }
-        Ok(ColumnarValue::Array(Arc::new(out.finish())))
-    }
-}
-
-/// One row of a list column, as an array of its elements.
-fn list_row(lists: &ArrayRef, row: usize) -> Result<ArrayRef> {
-    match lists.data_type() {
-        DataType::List(_) => Ok(lists.as_list::<i32>().value(row)),
-        DataType::LargeList(_) => Ok(lists.as_list::<i64>().value(row)),
-        other => exec_err!("a json aggregate needs a list to render, got {other}"),
+        Ok(ColumnarValue::Array(self.render_groups(&lists)?))
     }
 }
 
@@ -197,51 +220,75 @@ fn list_row(lists: &ArrayRef, row: usize) -> Result<ArrayRef> {
 ///
 /// Kept separate from the function so the rendering — the part that has to match
 /// PostgreSQL — can be tested on an array alone.
-fn render(elements: &ArrayRef, documents: bool) -> Result<String> {
-    let mut out: Vec<u8> = Vec::with_capacity(elements.len() * 8 + 2);
+fn render(elements: &ArrayRef, kind: Elements) -> Result<String> {
+    match kind {
+        Elements::Values => render_values(elements),
+        Elements::Documents => render_documents(elements),
+    }
+}
+
+/// Each element encoded as JSON, which is what quotes and escapes a text element.
+fn render_values(elements: &ArrayRef) -> Result<String> {
+    let field: FieldRef = Arc::new(Field::new(
+        "element",
+        elements.data_type().clone(),
+        elements.is_nullable(),
+    ));
+    // `explicit_nulls` so a null *inside* a struct element stays a `"key": null` member
+    // rather than vanishing, which is how PostgreSQL renders a composite.
+    let options = EncoderOptions::default().with_explicit_nulls(true);
+    let mut encoder = make_encoder(&field, elements.as_ref(), &options)?;
+    // The field, the options and the encoder all have to outlive the loop below, which is
+    // why they are built here rather than behind their own function.
+    json_array(elements.len(), |row, out| {
+        match encoder.is_null(row) {
+            // A NULL row is the JSON `null`, not a skipped element — see the module doc.
+            true => out.extend_from_slice(b"null"),
+            false => encoder.encode(row, out),
+        }
+        Ok(())
+    })
+}
+
+/// Each element spliced in verbatim, which is what makes `json_agg(x::json)` answer an array
+/// of objects rather than an array of strings.
+fn render_documents(elements: &ArrayRef) -> Result<String> {
+    let text = elements.as_string::<i32>();
+    json_array(text.len(), |row, out| {
+        if text.is_null(row) {
+            // A NULL row is the JSON `null`, not a skipped element — see the module doc.
+            out.extend_from_slice(b"null");
+            return Ok(());
+        }
+        let document = text.value(row);
+        // By construction these came from a `::json` cast or an accessor, both of which
+        // already validated. Checking again costs one parse and keeps a malformed document
+        // from being spliced into an answer that would then not parse as JSON at all.
+        validate(document, JsonType::Json)?;
+        out.extend_from_slice(document.as_bytes());
+        Ok(())
+    })
+}
+
+/// `count` elements, each written by `element`, in the array spelling PostgreSQL prints:
+/// square brackets, `, ` between elements.
+///
+/// The frame lives here rather than in each rendering because the spacing is the contract —
+/// a client reads the bytes — and two copies of it are two things to keep in step.
+fn json_array(
+    count: usize,
+    mut element: impl FnMut(usize, &mut Vec<u8>) -> Result<()>,
+) -> Result<String> {
+    let mut out: Vec<u8> = Vec::with_capacity(count * 8 + 2);
     out.push(b'[');
-    if documents {
-        let text = elements.as_string::<i32>();
-        for row in 0..text.len() {
-            if row > 0 {
-                out.extend_from_slice(b", ");
-            }
-            match text.is_null(row) {
-                // A NULL row is the JSON `null`, not a skipped element — see the module doc.
-                true => out.extend_from_slice(b"null"),
-                false => {
-                    let document = text.value(row);
-                    // By construction these came from a `::json` cast or an accessor, both
-                    // of which already validated. Checking again costs one parse and keeps
-                    // a malformed document from being spliced into an answer that would
-                    // then not parse as JSON at all.
-                    validate(document, JsonType::Json)?;
-                    out.extend_from_slice(document.as_bytes());
-                }
-            }
+    for row in 0..count {
+        if row > 0 {
+            out.extend_from_slice(b", ");
         }
-    } else {
-        let field: FieldRef = Arc::new(Field::new(
-            "element",
-            elements.data_type().clone(),
-            elements.is_nullable(),
-        ));
-        // `explicit_nulls` so a null *inside* a struct element stays a `"key": null` member
-        // rather than vanishing, which is how PostgreSQL renders a composite.
-        let options = EncoderOptions::default().with_explicit_nulls(true);
-        let mut encoder = make_encoder(&field, elements.as_ref(), &options)?;
-        for row in 0..elements.len() {
-            if row > 0 {
-                out.extend_from_slice(b", ");
-            }
-            match encoder.is_null(row) {
-                true => out.extend_from_slice(b"null"),
-                false => encoder.encode(row, &mut out),
-            }
-        }
+        element(row, &mut out)?;
     }
     out.push(b']');
-    // Every branch above wrote either an encoder's output or a validated document, both of
+    // Every element above was written by an encoder or was a validated document, both of
     // which are UTF-8 by construction.
     String::from_utf8(out).map_err(|e| {
         datafusion::common::DataFusionError::Internal(format!(
@@ -261,7 +308,7 @@ mod tests {
     use datafusion::execution::context::SessionContext;
 
     fn json_of(elements: ArrayRef) -> String {
-        render(&elements, false).expect("rendering failed")
+        render(&elements, Elements::Values).expect("rendering failed")
     }
 
     /// The shape PostgreSQL prints: square brackets, `, ` between elements.
@@ -327,7 +374,7 @@ mod tests {
             Some("[1,2]"),
         ]));
         assert_eq!(
-            render(&documents, true).expect("rendering failed"),
+            render(&documents, Elements::Documents).expect("rendering failed"),
             r#"[{"a":1}, null, [1,2]]"#
         );
     }
@@ -337,7 +384,7 @@ mod tests {
     #[test]
     fn a_document_that_is_not_json_raises() {
         let broken: ArrayRef = Arc::new(StringArray::from(vec!["{oops"]));
-        let err = render(&broken, true).expect_err("not json");
+        let err = render(&broken, Elements::Documents).expect_err("not json");
         assert!(
             err.to_string()
                 .contains("invalid input syntax for type json"),
@@ -345,21 +392,25 @@ mod tests {
         );
     }
 
-    /// Build a one-row list column and render it the way a physical expression does.
-    fn invoke(elements: ArrayRef, documents: bool) -> Result<Vec<Option<String>>> {
-        let field = Field::new_list_field(elements.data_type().clone(), true);
-        let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, elements.len() as i32]));
-        let list = ListArray::new(Arc::new(field), offsets, elements, None);
-        let data_type = list.data_type().clone();
-        let args = ScalarFunctionArgs {
-            args: vec![ColumnarValue::Array(Arc::new(list))],
+    /// The one-row call a physical expression makes, over the list column `lists`.
+    fn args_over(lists: ArrayRef) -> ScalarFunctionArgs {
+        let data_type = lists.data_type().clone();
+        ScalarFunctionArgs {
+            args: vec![ColumnarValue::Array(lists)],
             arg_fields: vec![Arc::new(Field::new("l", data_type, true))],
             number_rows: 1,
             return_field: Arc::new(Field::new("j", DataType::Utf8, true)),
             config_options: Arc::new(datafusion::config::ConfigOptions::default()),
-        };
-        let out = JsonArray::new(documents)
-            .invoke_with_args(args)?
+        }
+    }
+
+    /// Build a one-row list column and render it the way a physical expression does.
+    fn invoke(elements: ArrayRef, kind: Elements) -> Result<Vec<Option<String>>> {
+        let field = Field::new_list_field(elements.data_type().clone(), true);
+        let offsets = OffsetBuffer::new(ScalarBuffer::from(vec![0, elements.len() as i32]));
+        let list = ListArray::new(Arc::new(field), offsets, elements, None);
+        let out = JsonArray::new(kind)
+            .invoke_with_args(args_over(Arc::new(list)))?
             .to_array(1)?;
         Ok(out
             .as_string::<i32>()
@@ -371,11 +422,19 @@ mod tests {
     #[test]
     fn a_list_column_renders_one_answer_per_group() {
         assert_eq!(
-            invoke(Arc::new(Int32Array::from(vec![Some(1), None])), false).expect("valid"),
+            invoke(
+                Arc::new(Int32Array::from(vec![Some(1), None])),
+                Elements::Values
+            )
+            .expect("valid"),
             vec![Some("[1, null]".to_string())]
         );
         assert_eq!(
-            invoke(Arc::new(StringArray::from(vec![r#"{"a":1}"#])), true).expect("valid"),
+            invoke(
+                Arc::new(StringArray::from(vec![r#"{"a":1}"#])),
+                Elements::Documents
+            )
+            .expect("valid"),
             vec![Some(r#"[{"a":1}]"#.to_string())]
         );
     }
@@ -386,16 +445,8 @@ mod tests {
     fn a_group_with_no_rows_is_null_not_an_empty_array() {
         let element = Field::new_list_field(DataType::Int64, true);
         let list = ListArray::new_null(Arc::new(element), 1);
-        let data_type = list.data_type().clone();
-        let args = ScalarFunctionArgs {
-            args: vec![ColumnarValue::Array(Arc::new(list))],
-            arg_fields: vec![Arc::new(Field::new("l", data_type, true))],
-            number_rows: 1,
-            return_field: Arc::new(Field::new("j", DataType::Utf8, true)),
-            config_options: Arc::new(datafusion::config::ConfigOptions::default()),
-        };
-        let out = JsonArray::new(false)
-            .invoke_with_args(args)
+        let out = JsonArray::new(Elements::Values)
+            .invoke_with_args(args_over(Arc::new(list)))
             .expect("valid")
             .to_array(1)
             .expect("array");
@@ -404,7 +455,7 @@ mod tests {
 
     #[test]
     fn only_a_list_can_be_rendered() {
-        let f = JsonArray::new(false);
+        let f = JsonArray::new(Elements::Values);
         let list = DataType::List(Arc::new(Field::new_list_field(DataType::Int64, true)));
         assert_eq!(
             f.coerce_types(std::slice::from_ref(&list)).expect("a list"),
@@ -419,7 +470,7 @@ mod tests {
             vec![DataType::Null]
         );
         // The document rendering needs text elements, because a document is text here.
-        let err = JsonArray::new(true)
+        let err = JsonArray::new(Elements::Documents)
             .coerce_types(&[list])
             .expect_err("integers are not documents");
         assert!(err.to_string().contains("as json documents"), "got: {err}");
