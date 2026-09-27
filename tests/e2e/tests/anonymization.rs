@@ -191,15 +191,15 @@ async fn test_anonymized_update_stores_digest() {
     // over is what once wrote the plaintext to the shard. The single-column form
     // above is the neighbour that loses no clause and still answers; the refusal's
     // wording is pinned by the unit test beside the code that writes it.
-    let err = execute(
+    let err = execute_expect_err(
         &client,
         &format!("UPDATE {tbl} SET (id, name) = (1, 'Carol') WHERE id = 1"),
     )
-    .await
-    .expect_err("a multi-column assignment to an anonymized column must be refused");
+    .await;
     assert!(
-        format!("{err}").contains("name"),
-        "the refusal must name the column: {err}"
+        err.message().contains("name"),
+        "the refusal must name the column: {}",
+        err.message()
     );
 
     // And the refused statement changed nothing: no plaintext, still Bob's digest.

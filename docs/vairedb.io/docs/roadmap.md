@@ -9,6 +9,7 @@ The tables below reflect the current planned work. Status labels are the project
 | Status | Description |
 |--------|-------------|
 | PLANNED | Fuzzy testing crate with massive testing suite for all the db features. |
+| PLANNED | Improve with buffering, COPY FROM / TO imports. |
 
 ## Roadmap to v0.4
 
