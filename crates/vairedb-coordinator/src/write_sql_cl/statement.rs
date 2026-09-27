@@ -7,8 +7,8 @@ use std::collections::HashMap;
 use std::ops::ControlFlow;
 
 use crate::sqlparser::ast::{
-    Assignment, AssignmentTarget, ConflictTarget, Expr, Ident, ObjectName, OnConflictAction,
-    OnInsert, Parens, SetExpr, Statement, Value, visit_expressions_mut, visit_relations,
+    Assignment, AssignmentTarget, ConflictTarget, Expr, ObjectName, OnConflictAction, OnInsert,
+    Parens, SetExpr, Statement, Value, visit_expressions, visit_expressions_mut, visit_relations,
 };
 use datafusion::scalar::ScalarValue;
 
@@ -16,6 +16,7 @@ use crate::pgwire_handler::query_router::{canonical_table_name, canonicalize_ide
 use crate::util::insert_column_ident;
 
 use super::routing_value::{RoutedValue, expr_routing_value};
+use super::{column_name_is, placeholder_index, quoted_column_names};
 
 /// Position of the shard-key column in an INSERT's explicit column list, or
 /// `None` when the list does not name it.
@@ -98,27 +99,26 @@ pub fn relations_read<V: crate::sqlparser::ast::Visit>(node: &V) -> Vec<String> 
 /// Fill in the implicit column list of a positional `INSERT INTO t VALUES (…)`
 /// from `table_columns`, the table's columns in declaration order.
 ///
-/// PostgreSQL matches a positional row to the leading columns of the table, so
-/// this makes that mapping explicit in the AST and every later step — the
-/// shard-key check, `ON CONFLICT` validation, the anonymization rewrite, the
-/// per-shard row split — works on the one code path it already has, keyed by
-/// name. Without it the shard key is unlocatable and the row would be broadcast
-/// to every shard (or, for an anonymized column, shipped as plaintext).
+/// PostgreSQL matches a positional row to the table's leading columns. Making that
+/// mapping explicit lets every later step — the shard-key check, `ON CONFLICT`
+/// validation, the anonymization rewrite, the per-shard row split — keep working by
+/// name on the one code path it already has. Without it the shard key is unlocatable
+/// and the row would be broadcast to every shard (or, for an anonymized column,
+/// shipped as plaintext).
 ///
-/// A row shorter than the table takes the *first* `n` columns, matching
-/// PostgreSQL: the rest are left to their defaults. If the shard key is not among
-/// them, [`validate_insert_shard_key`] rejects the statement — a column filled by
-/// default has no value here to hash.
+/// A row shorter than the table takes the *first* `n` columns, as PostgreSQL does;
+/// the rest fall to their defaults. If the shard key is not among them,
+/// [`validate_insert_shard_key`] rejects the statement — a defaulted column has no
+/// value here to hash.
 ///
-/// Names are emitted quoted because `table_columns` holds catalog-canonical names
-/// (see [`canonicalize_ident`]), which is exactly how the column is spelled in the
-/// per-shard DuckDB table; quoting stops DuckDB folding a name that survived
-/// `CREATE TABLE` with its case intact.
+/// Names are quoted because `table_columns` holds catalog-canonical names (see
+/// [`canonicalize_ident`]), the exact spelling in the per-shard DuckDB table;
+/// quoting stops DuckDB folding a name that kept its case through `CREATE TABLE`.
 ///
-/// A no-op for anything that is not a positional `INSERT ... VALUES`, and for a
-/// table whose catalog entry lists no columns (nothing to map onto — the caller's
-/// existing shard-key error is a better report than a guess). Returns
-/// `Err(message)` for a row list that cannot be mapped positionally at all.
+/// A no-op for anything but a positional `INSERT ... VALUES`, and for a table whose
+/// catalog entry lists no columns — nothing to map onto, and the caller's shard-key
+/// error reports that better than a guess. `Err(message)` for a row list that cannot
+/// be mapped positionally at all.
 pub fn materialize_insert_columns(
     stmt: &mut Statement,
     table_columns: &[&str],
@@ -155,14 +155,14 @@ pub fn materialize_insert_columns(
 /// Fill in the implicit column list of an `INSERT` with the first `arity` of
 /// `table_columns`, where `arity` is the number of values each row supplies.
 ///
-/// The mapping [`materialize_insert_columns`] makes for a `VALUES` list, for a
-/// row count that comes from somewhere else: an `INSERT ... SELECT` takes its
-/// arity from the source query's result schema, which is known before a single
-/// row is fetched (so a mismatch is reported even for an empty result).
+/// The mapping [`materialize_insert_columns`] makes for a `VALUES` list, for an arity
+/// that comes from elsewhere: an `INSERT ... SELECT` takes it from the source query's
+/// result schema, known before a single row is fetched, so a mismatch is reported even
+/// for an empty result.
 ///
-/// A no-op when the statement already names its columns, when the catalog lists
-/// no columns for the table, and for `arity` 0 — in each case there is nothing to
-/// map, and the caller's existing shard-key error reports it better than a guess.
+/// A no-op when the statement already names its columns, when the catalog lists none
+/// for the table, and for `arity` 0 — nothing to map, and the caller's shard-key error
+/// reports it better than a guess.
 pub fn materialize_insert_columns_for_arity(
     stmt: &mut Statement,
     table_columns: &[&str],
@@ -181,10 +181,7 @@ pub fn materialize_insert_columns_for_arity(
         ));
     }
 
-    insert.columns = table_columns[..arity]
-        .iter()
-        .map(|name| ObjectName::from(vec![Ident::with_quote('"', *name)]))
-        .collect();
+    insert.columns = quoted_column_names(&table_columns[..arity]);
     Ok(())
 }
 
@@ -193,12 +190,11 @@ pub fn materialize_insert_columns_for_arity(
 /// statement that is not an `INSERT ... VALUES` naming the shard key, or whose
 /// rows do not *all* resolve to a routable key.
 ///
-/// All-or-nothing on purpose: a row dropped from the returned list would be
-/// dropped from the shard split too, so the INSERT would silently store fewer
-/// rows than the client sent. `None` sends the caller to the whole-statement
-/// route instead, which reports the reason.
-/// [`validate_insert_shard_key`] rejects those statements up front, so in
-/// practice this only guards against a caller skipping that check.
+/// All-or-nothing on purpose: a row missing from this list would be missing from the
+/// shard split too, so the INSERT would silently store fewer rows than the client
+/// sent. `None` sends the caller to the whole-statement route, which reports why.
+/// [`validate_insert_shard_key`] rejects such statements up front, so in practice this
+/// only guards against a caller skipping that check.
 pub fn extract_insert_row_shard_keys(
     stmt: &Statement,
     shard_key: &str,
@@ -230,11 +226,10 @@ pub fn extract_insert_row_shard_keys(
 /// alone. `None` for any other statement — including `INSERT ... SELECT`, whose
 /// row count only the shards can report.
 ///
-/// The one row count the coordinator may state before a statement runs, which is
-/// what lets a buffered INSERT inside a transaction block report a truthful tag.
-/// So the answer must be *exact*, not a good guess: `ON CONFLICT` can drop rows
-/// and `RETURNING` owes the client the rows themselves, so both give up the count
-/// rather than overstate it.
+/// The one row count the coordinator may state before a statement runs, which is what
+/// lets a buffered INSERT inside a transaction block report a truthful tag. So it must
+/// be *exact*, not a good guess: `ON CONFLICT` can drop rows and `RETURNING` owes the
+/// client the rows themselves, so both give up the count rather than overstate it.
 pub fn insert_values_row_count(stmt: &Statement) -> Option<usize> {
     let Statement::Insert(insert) = stmt else {
         return None;
@@ -255,9 +250,9 @@ pub fn insert_values_row_count(stmt: &Statement) -> Option<usize> {
 /// and is rejected.
 ///
 /// The column list may be the client's or one resolved from the catalog by
-/// [`materialize_insert_columns`], which runs first — so the empty-list branch
-/// below is a backstop for a table whose catalog entry lists no columns, not the
-/// verdict on a positional INSERT.
+/// [`materialize_insert_columns`], which runs first — so the empty-list branch below is
+/// a backstop for a table with no catalogued columns, not the verdict on a positional
+/// INSERT.
 pub fn validate_insert_shard_key(
     stmt: &Statement,
     shard_key: &str,
@@ -335,27 +330,25 @@ pub(super) fn assignments_target_shard_key(assignments: &[Assignment], shard_key
     assignments
         .iter()
         .any(|assignment| match &assignment.target {
-            AssignmentTarget::ColumnName(name) => object_name_matches(name, shard_key),
-            AssignmentTarget::Tuple(names) => names
-                .iter()
-                .any(|name| object_name_matches(name, shard_key)),
+            AssignmentTarget::ColumnName(name) => column_name_is(name, shard_key),
+            AssignmentTarget::Tuple(names) => {
+                names.iter().any(|name| column_name_is(name, shard_key))
+            }
         })
 }
 
 /// Validate an INSERT's `ON CONFLICT` clause against the shard key.
 ///
-/// The UNIQUE/PRIMARY KEY index that resolves a conflict exists once *per shard*,
-/// so each shard only ever detects a conflict among the rows it holds. That is
-/// globally correct exactly when every row sharing the arbiter value lands on the
-/// same shard — which is guaranteed only if the arbiter includes the shard key.
-/// An arbiter on any other column quietly degrades to per-shard uniqueness: the
-/// same "unique" value inserted twice under different shard keys yields two rows
-/// and no error, so the upsert the client asked for did not happen.
+/// The UNIQUE/PRIMARY KEY index resolving a conflict exists once *per shard*, so each
+/// shard only detects conflicts among the rows it holds. That is globally correct
+/// exactly when every row sharing the arbiter value lands on one shard — guaranteed
+/// only if the arbiter includes the shard key. Any other arbiter quietly degrades to
+/// per-shard uniqueness: the same "unique" value inserted twice under different shard
+/// keys yields two rows and no error, and the upsert never happened.
 ///
-/// An untargeted `ON CONFLICT` (no column list, no constraint name) is left
-/// alone: it resolves against whatever unique index the shard has, which is
-/// correct whenever that index is on the shard key — the only kind VaireDB can
-/// enforce globally in the first place.
+/// An untargeted `ON CONFLICT` (no column list, no constraint name) is left alone: it
+/// resolves against whatever unique index the shard has, which is correct whenever that
+/// index is on the shard key — the only kind VaireDB enforces globally anyway.
 ///
 /// Returns `Err(message)` describing why the statement must be rejected.
 pub fn validate_on_conflict(stmt: &Statement, shard_key: &str) -> std::result::Result<(), String> {
@@ -419,13 +412,6 @@ pub fn validate_on_conflict(stmt: &Statement, shard_key: &str) -> std::result::R
     Ok(())
 }
 
-fn object_name_matches(name: &ObjectName, shard_key: &str) -> bool {
-    name.0
-        .last()
-        .and_then(|part| part.as_ident())
-        .is_some_and(|ident| canonicalize_ident(ident) == shard_key)
-}
-
 /// Build a new INSERT containing only the VALUES rows at `row_indices`,
 /// preserving the original column list and query options. Returns `None` if
 /// `stmt` is not an `INSERT ... VALUES` or no rows are selected. Used to send
@@ -478,8 +464,10 @@ pub fn renumber_placeholders(stmt: &mut Statement) -> Option<Vec<usize>> {
         if let Expr::Value(v) = expr
             && let Value::Placeholder(name) = &v.value
         {
-            match name.strip_prefix('$').and_then(|d| d.parse::<usize>().ok()) {
+            match placeholder_index(name) {
                 Some(orig) => {
+                    // `order.len()` after the push is the 1-based position this
+                    // original index now binds at.
                     let new_idx = *mapping.entry(orig).or_insert_with(|| {
                         order.push(orig);
                         order.len()
@@ -495,8 +483,7 @@ pub fn renumber_placeholders(stmt: &mut Statement) -> Option<Vec<usize>> {
     if malformed {
         return None;
     }
-    // Return original zero-based indices in dense order.
-    Some(order.into_iter().map(|n| n - 1).collect())
+    Some(order)
 }
 
 /// The number of distinct positional placeholders (`$1..$N`) in a statement,
@@ -504,14 +491,13 @@ pub fn renumber_placeholders(stmt: &mut Statement) -> Option<Vec<usize>> {
 /// Describe for write statements that DataFusion cannot logical-plan (so no
 /// inferred types are available) — the client still needs the right count.
 pub fn max_placeholder_index(stmt: &Statement) -> usize {
-    let mut stmt = stmt.clone();
     let mut max = 0usize;
-    let _ = visit_expressions_mut(&mut stmt, |expr| {
+    let _ = visit_expressions(stmt, |expr| {
         if let Expr::Value(v) = expr
             && let Value::Placeholder(name) = &v.value
-            && let Some(n) = name.strip_prefix('$').and_then(|d| d.parse::<usize>().ok())
+            && let Some(idx) = placeholder_index(name)
         {
-            max = max.max(n);
+            max = max.max(idx + 1);
         }
         ControlFlow::<()>::Continue(())
     });
@@ -520,13 +506,8 @@ pub fn max_placeholder_index(stmt: &Statement) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use super::super::statement_to_sql;
+    use super::super::{parse_one, statement_to_sql};
     use super::*;
-    use crate::pgwire_handler::parser::parse_sql;
-
-    fn parse_one(sql: &str) -> Statement {
-        parse_sql(sql).unwrap().into_iter().next().unwrap()
-    }
 
     #[test]
     fn null_bound_insert_is_rejected() {

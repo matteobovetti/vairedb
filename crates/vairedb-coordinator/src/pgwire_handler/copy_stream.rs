@@ -38,7 +38,6 @@ use datafusion::arrow::error::ArrowError;
 use futures::SinkExt;
 use futures::sink::Sink;
 use pgwire::api::copy::CopyHandler;
-use pgwire::api::results::Tag;
 use pgwire::api::{ClientInfo, PgWireConnectionState};
 use pgwire::error::{PgWireError, PgWireResult};
 use pgwire::messages::PgWireBackendMessage;
@@ -48,7 +47,8 @@ use vairedb_common::proto::vairedb::v1::VdbErrorCode;
 
 use crate::catalog::TableMeta;
 use crate::pgwire_handler::copy::{
-    CsvDialect, ROWS_PER_BATCH, partial_copy_error, target_columns, validate_target_columns,
+    CsvDialect, ROWS_PER_BATCH, copy_tag, partial_copy_error, target_columns,
+    validate_target_columns,
 };
 use crate::pgwire_handler::error_enrichment::make_vdb_error;
 use crate::pgwire_handler::handler::VaireDbQueryHandler;
@@ -525,7 +525,7 @@ impl CopyHandler for VaireDbQueryHandler {
         // The command tag is this function's to send: pgwire sends `ReadyForQuery`
         // around this call but never a tag, and without one a client would see the
         // copy accepted and never learn how many rows it wrote.
-        let tag = Tag::new("COPY").with_rows(rows as usize);
+        let tag = copy_tag(rows);
         client
             .send(PgWireBackendMessage::CommandComplete(tag.into()))
             .await?;
@@ -583,24 +583,7 @@ impl CopyHandler for VaireDbQueryHandler {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::catalog::ColumnDef;
-
-    fn meta(columns: &[&str], shard_key: &str) -> TableMeta {
-        TableMeta {
-            table_name: "orders".to_string(),
-            columns: columns
-                .iter()
-                .map(|c| ColumnDef {
-                    name: (*c).to_string(),
-                    data_type: "INTEGER".to_string(),
-                    nullable: true,
-                    ..Default::default()
-                })
-                .collect(),
-            shard_key: shard_key.to_string(),
-            ..Default::default()
-        }
-    }
+    use crate::catalog::catalog_test_helper::table_meta;
 
     fn csv(header: bool) -> CsvDialect {
         CsvDialect {
@@ -668,7 +651,7 @@ mod tests {
             "orders",
             &stated.iter().map(|s| (*s).to_string()).collect::<Vec<_>>(),
             dialect,
-            &meta(&["id", "v"], "id"),
+            &table_meta("orders", &["id", "v"], "id"),
         )
         .map(|_| ())
     }
@@ -689,8 +672,13 @@ mod tests {
 
     #[test]
     fn columns_the_statement_did_not_name_cannot_be_judged_yet() {
-        let sink = CopySink::open("orders", &[], &csv(true), &meta(&["id", "v"], "id"))
-            .expect("a COPY without a column list is decided from the data");
+        let sink = CopySink::open(
+            "orders",
+            &[],
+            &csv(true),
+            &table_meta("orders", &["id", "v"], "id"),
+        )
+        .expect("a COPY without a column list is decided from the data");
         // The header has not arrived, so the width advertised is the table's own.
         assert_eq!(sink.advertised_columns(), 2);
         assert_eq!(sink.rows_written(), 0);
@@ -702,7 +690,7 @@ mod tests {
             "orders",
             &["id".to_string()],
             &csv(false),
-            &meta(&["id", "v"], "id"),
+            &table_meta("orders", &["id", "v"], "id"),
         )
         .expect("naming the shard key alone is a valid copy");
         assert_eq!(sink.advertised_columns(), 1);
@@ -722,7 +710,7 @@ mod tests {
             "orders",
             &stated.iter().map(|s| (*s).to_string()).collect::<Vec<_>>(),
             dialect,
-            &meta(table, "id"),
+            &table_meta("orders", table, "id"),
         )?;
 
         let mut sql = Vec::new();

@@ -18,16 +18,16 @@ use vairedb_common::proto::vairedb::v1::{AnonymizationSecret, VdbErrorCode};
 
 use crate::anonymization::{self, HMAC_SHA256_ALGO, Secret, SecretResolver};
 use crate::catalog::{MetadataCatalog, ShardMeta, TableMeta};
-use crate::error::CoordinatorError;
 use crate::pgwire_handler::error_enrichment::{
-    ErrorContext, enrich_coordinator_error, enrich_generic_error, make_vdb_error,
+    ErrorContext, enrich_coordinator_error, enrich_generic_error, make_vdb_error, require_shards,
+    require_table,
 };
 use crate::pgwire_handler::handler::VaireDbQueryHandler;
 use crate::pgwire_handler::query_router::{self, QueryType};
 use crate::pgwire_handler::session::{BufferedWrite, SessionState, Transaction};
 use crate::replication::BatchStatement;
 use crate::util::insert_column_ident;
-use crate::write_router::{compute_shard_index, shard_for_bucket};
+use crate::write_router::{compute_quorum_size, compute_shard_index, shard_for_bucket};
 use crate::write_sql_cl;
 
 /// Schema and table identifiers of the system table that stores anonymization
@@ -229,14 +229,7 @@ impl VaireDbQueryHandler {
             )
         })?;
         let dml_ctx = ErrorContext::for_table(&table_name);
-        let table_meta = self
-            .catalog
-            .get_table(&table_name)
-            .map_err(|e| enrich_coordinator_error(&e, &dml_ctx, &self.catalog))?
-            .ok_or_else(|| {
-                let err = CoordinatorError::TableNotFound(table_name.clone());
-                enrich_coordinator_error(&err, &dml_ctx, &self.catalog)
-            })?;
+        let table_meta = require_table(&self.catalog, &table_name, &dml_ctx)?;
 
         self.reject_hashing_a_digest(
             "INSERT ... SELECT",
@@ -428,14 +421,7 @@ impl VaireDbQueryHandler {
 
         let dml_ctx = ErrorContext::for_table(&table_name);
 
-        let table_meta = self
-            .catalog
-            .get_table(&table_name)
-            .map_err(|e| enrich_coordinator_error(&e, &dml_ctx, &self.catalog))?
-            .ok_or_else(|| {
-                let err = CoordinatorError::TableNotFound(table_name.clone());
-                enrich_coordinator_error(&err, &dml_ctx, &self.catalog)
-            })?;
+        let table_meta = require_table(&self.catalog, &table_name, &dml_ctx)?;
 
         // PostgreSQL matches a positional `INSERT INTO t VALUES (…)` to the
         // table's declared column order. Resolve that list into the statement
@@ -502,9 +488,7 @@ impl VaireDbQueryHandler {
             _ => {}
         }
 
-        let quorum_size = self
-            .write_router
-            .compute_quorum_size(table_meta.replication_factor);
+        let quorum_size = compute_quorum_size(table_meta.replication_factor);
         let dml_ctx = dml_ctx.with_replication(table_meta.replication_factor);
 
         let writes = if *query_type == QueryType::Insert {
@@ -595,18 +579,7 @@ impl VaireDbQueryHandler {
         params: &[ScalarValue],
         insert_ctx: &ErrorContext,
     ) -> PgWireResult<Vec<PlannedWrite>> {
-        let all_shards = self
-            .catalog
-            .get_shards_for_table(&table_meta.table_name)
-            .map_err(|e| enrich_coordinator_error(&e, insert_ctx, &self.catalog))?;
-
-        if all_shards.is_empty() {
-            let err = CoordinatorError::ShardNotAssigned(format!(
-                "no shards for table {}",
-                table_meta.table_name
-            ));
-            return Err(enrich_coordinator_error(&err, insert_ctx, &self.catalog));
-        }
+        let all_shards = require_shards(&self.catalog, table_meta, insert_ctx)?;
 
         let row_keys =
             write_sql_cl::extract_insert_row_shard_keys(stmt, &table_meta.shard_key, params);
@@ -855,25 +828,9 @@ fn string_literal_at(row: &[Expr], idx: usize, col: &str) -> PgWireResult<String
 
 #[cfg(test)]
 mod tests {
+    use super::super::write_path_test_helper::{parse_one, user_error};
     use super::*;
-
-    use pgwire::error::PgWireError;
-
-    fn parse_one(sql: &str) -> Statement {
-        crate::pgwire_handler::parser::parse_sql(sql)
-            .unwrap()
-            .into_iter()
-            .next()
-            .unwrap()
-    }
-
-    /// The (SQLSTATE, message) a client would receive.
-    fn reported(err: PgWireError) -> (String, String) {
-        match err {
-            PgWireError::UserError(info) => (info.code, info.message),
-            other => panic!("expected a user-facing error, got {other:?}"),
-        }
-    }
+    use crate::catalog::catalog_test_helper::{shard_meta, table_meta};
 
     /// Route a DML statement as the handler does, with no parameters bound.
     async fn dml(handler: &VaireDbQueryHandler, sql: &str) -> PgWireResult<Response> {
@@ -942,23 +899,8 @@ mod tests {
     fn register_table(handler: &VaireDbQueryHandler, name: &str, columns: &[&str]) {
         handler
             .catalog
-            .put_table(&TableMeta {
-                table_name: name.to_string(),
-                columns: columns
-                    .iter()
-                    .map(|c| vairedb_common::proto::vairedb::v1::ColumnDef {
-                        name: c.to_string(),
-                        data_type: "INTEGER".to_string(),
-                        nullable: true,
-                        default_expr: String::new(),
-                    })
-                    .collect(),
-                shard_key: "id".to_string(),
-                shard_count: 2,
-                replication_factor: 1,
-                ..Default::default()
-            })
-            .unwrap();
+            .put_table(&table_meta(name, columns, "id"))
+            .expect("the scratch catalog accepts a table");
     }
 
     // The rows come back from every shard the INSERT touched, so there is no one
@@ -968,7 +910,7 @@ mod tests {
     async fn returning_is_refused_on_an_insert_from_a_query() {
         let handler = VaireDbQueryHandler::for_tests(false);
 
-        let (code, message) = reported(
+        let (code, message) = user_error(
             dml(
                 &handler,
                 "INSERT INTO orders (id) SELECT id FROM staging RETURNING id",
@@ -986,7 +928,7 @@ mod tests {
     async fn an_unknown_target_table_is_reported_before_the_source_runs() {
         let handler = VaireDbQueryHandler::for_tests(false);
 
-        let (code, message) = reported(
+        let (code, message) = user_error(
             dml(&handler, "INSERT INTO nowhere (id) SELECT 1")
                 .await
                 .unwrap_err(),
@@ -1003,7 +945,7 @@ mod tests {
         register_table(&handler, "orders", &["id", "amount"]);
 
         // Wider than the table: no positional mapping exists at all.
-        let (code, message) = reported(
+        let (code, message) = user_error(
             dml(&handler, "INSERT INTO orders SELECT 1, 2, 3")
                 .await
                 .unwrap_err(),
@@ -1016,7 +958,7 @@ mod tests {
 
         // Wider than an explicit column list: writing the columns that do line up
         // would store a row the source query did not produce.
-        let (code, message) = reported(
+        let (code, message) = user_error(
             dml(&handler, "INSERT INTO orders (id) SELECT 1, 2")
                 .await
                 .unwrap_err(),
@@ -1031,25 +973,19 @@ mod tests {
     /// Register a table whose `email` column is pseudonymized, so reads of it yield
     /// digests rather than plaintext.
     fn register_anonymized_table(handler: &VaireDbQueryHandler, name: &str) {
-        let mut meta = TableMeta {
-            table_name: name.to_string(),
-            columns: ["id", "email"]
-                .iter()
-                .map(|c| vairedb_common::proto::vairedb::v1::ColumnDef {
-                    name: c.to_string(),
-                    data_type: "VARCHAR".to_string(),
-                    nullable: true,
-                    default_expr: String::new(),
-                })
-                .collect(),
-            shard_key: "id".to_string(),
-            shard_count: 2,
-            replication_factor: 1,
-            ..Default::default()
-        };
+        let mut meta = table_meta(name, &["id", "email"], "id");
+        // A pseudonymized column holds a 64-character digest, so `CREATE TABLE` accepts
+        // only a string type for one: an INTEGER fixture would be a table production
+        // cannot produce.
+        for column in &mut meta.columns {
+            column.data_type = "VARCHAR".to_string();
+        }
         meta.anonymized_columns
             .insert("email".to_string(), "secret1".to_string());
-        handler.catalog.put_table(&meta).unwrap();
+        handler
+            .catalog
+            .put_table(&meta)
+            .expect("the scratch catalog accepts a table");
     }
 
     // Copying between two pseudonymizing tables would store the digest of a digest,
@@ -1061,7 +997,7 @@ mod tests {
         register_anonymized_table(&handler, "dst");
         register_anonymized_table(&handler, "src");
 
-        let (code, message) = reported(
+        let (code, message) = user_error(
             dml(
                 &handler,
                 "INSERT INTO dst (id, email) SELECT id, email FROM src",
@@ -1087,7 +1023,7 @@ mod tests {
         let handler = VaireDbQueryHandler::for_tests(false);
         register_anonymized_table(&handler, "people");
 
-        let (code, _) = reported(
+        let (code, _) = user_error(
             dml(
                 &handler,
                 "INSERT INTO people (id, email) SELECT id, email FROM people",
@@ -1111,7 +1047,7 @@ mod tests {
             "INSERT INTO hashed (id, email) SELECT id, email FROM plain",
             "INSERT INTO plain (id, email) SELECT id, email FROM hashed",
         ] {
-            let (code, message) = reported(dml(&handler, sql).await.unwrap_err());
+            let (code, message) = user_error(dml(&handler, sql).await.unwrap_err());
             // Both get as far as needing a cluster to write to, which is where a
             // handler with no live nodes stops — the guard did not refuse them.
             assert_ne!(code, "0A000", "`{sql}` should not be refused: {message}");
@@ -1132,33 +1068,17 @@ mod tests {
         name: &str,
         shard_count: u32,
     ) -> TableMeta {
-        let meta = TableMeta {
-            table_name: name.to_string(),
-            columns: vec![vairedb_common::proto::vairedb::v1::ColumnDef {
-                name: "id".to_string(),
-                data_type: "INTEGER".to_string(),
-                nullable: false,
-                default_expr: String::new(),
-            }],
-            shard_key: "id".to_string(),
-            shard_count,
-            replication_factor: 1,
-            ..Default::default()
-        };
-        handler.catalog.put_table(&meta).unwrap();
+        let mut meta = table_meta(name, &["id"], "id");
+        meta.shard_count = shard_count;
+        handler
+            .catalog
+            .put_table(&meta)
+            .expect("the scratch catalog accepts a table");
         for bucket in 0..shard_count {
             handler
                 .catalog
-                .put_shard(&ShardMeta {
-                    shard_id: crate::util::logical_shard_id(bucket),
-                    table_name: name.to_string(),
-                    primary_node_id: "node-0".to_string(),
-                    replica_node_ids: Vec::new(),
-                    hash_bucket: bucket,
-                    range_lower: String::new(),
-                    range_upper: String::new(),
-                })
-                .unwrap();
+                .put_shard(&shard_meta(name, bucket, "node-0", &[]))
+                .expect("the scratch catalog accepts a shard");
         }
         meta
     }
@@ -1237,15 +1157,7 @@ mod tests {
         for bucket in (0..WIDE_SHARDS).filter(|bucket| *bucket != orphan) {
             handler
                 .catalog
-                .put_shard(&ShardMeta {
-                    shard_id: crate::util::logical_shard_id(bucket),
-                    table_name: "orders".to_string(),
-                    primary_node_id: "node-0".to_string(),
-                    replica_node_ids: Vec::new(),
-                    hash_bucket: bucket,
-                    range_lower: String::new(),
-                    range_upper: String::new(),
-                })
+                .put_shard(&shard_meta("orders", bucket, "node-0", &[]))
                 .unwrap();
         }
 
@@ -1262,7 +1174,7 @@ mod tests {
             "INSERT INTO orders (id) VALUES ({orphaned_id}), ({other_id})"
         ));
 
-        let (code, message) = reported(
+        let (code, message) = user_error(
             handler
                 .plan_insert_with_split(&stmt, &meta, 1, &[], &ErrorContext::default())
                 .err()

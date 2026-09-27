@@ -124,6 +124,38 @@ fn declared_pg_type(field: &Field) -> Option<Type> {
     }
 }
 
+/// Which of the cells VaireDB writes itself a column holds, or `None` where arrow-pg's
+/// encoder is the one that writes them.
+///
+/// The one place that question is answered, because it is asked twice — once per result to
+/// decide whether to look at all ([`writes_any_own_value`]) and once per cell to write
+/// ([`own_binary_value`]) — and the two answers have to be the same one. A type added to the
+/// writer alone would make the gate say `false` for it, and the column would go out as
+/// arrow-pg's bytes under VaireDB's OID: a wrong answer, silently.
+///
+/// `Numeric` carries the column's scale, which is the display scale and a property of the
+/// column rather than the value.
+enum OwnKind {
+    Numeric(i8),
+    Uuid,
+}
+
+fn own_kind(field: &Field) -> Option<OwnKind> {
+    match field.data_type() {
+        DataType::Decimal128(_, scale) | DataType::Decimal256(_, scale) => {
+            Some(OwnKind::Numeric(*scale))
+        }
+        _ if declared_pg_type(field) == Some(Type::UUID) => Some(OwnKind::Uuid),
+        _ => None,
+    }
+}
+
+/// Whether a wire schema has any column whose bytes VaireDB writes itself, asked once per
+/// result rather than once per cell.
+pub(super) fn writes_any_own_value(wire: &Schema) -> bool {
+    wire.fields().iter().any(|field| own_kind(field).is_some())
+}
+
 /// The value VaireDB writes for the cell at `row` of `col`, or `None` where arrow-pg's
 /// encoder is the one that writes it.
 ///
@@ -138,21 +170,22 @@ pub(super) fn own_binary_value(
     if pg_field.format() != FieldFormat::Binary {
         return Ok(None);
     }
-    let is_null = super::encoding::is_null_on_the_wire(col.as_ref(), row);
-    match field.data_type() {
-        DataType::Decimal128(_, scale) | DataType::Decimal256(_, scale) => {
-            if is_null {
-                return Ok(Some(PgValue::Null));
-            }
+    let kind = match own_kind(field) {
+        Some(kind) => kind,
+        None => return Ok(None),
+    };
+    // Null before the value: a null cell has no bytes to read, whichever kind it is.
+    if super::encoding::is_null_on_the_wire(col.as_ref(), row) {
+        return Ok(Some(PgValue::Null));
+    }
+    match kind {
+        OwnKind::Numeric(scale) => {
             let unscaled = unscaled_decimal(col, row, field)?;
             Ok(Some(PgValue::Numeric(PgNumeric::from_unscaled(
-                &unscaled, *scale,
+                &unscaled, scale,
             ))))
         }
-        _ if declared_pg_type(field) == Some(Type::UUID) => {
-            if is_null {
-                return Ok(Some(PgValue::Null));
-            }
+        OwnKind::Uuid => {
             let text = super::encoding::wire_text_value(col.as_ref(), row);
             let parsed = uuid::Uuid::parse_str(text.trim()).map_err(|_| {
                 make_vdb_error(
@@ -165,7 +198,6 @@ pub(super) fn own_binary_value(
             })?;
             Ok(Some(PgValue::Uuid(parsed.into_bytes())))
         }
-        _ => Ok(None),
     }
 }
 
@@ -456,17 +488,6 @@ fn grouped(padded: &str) -> Vec<i16> {
         .collect()
 }
 
-/// Whether a wire schema has any column whose bytes VaireDB writes itself, asked once per
-/// result rather than once per cell.
-pub(super) fn writes_any_own_value(wire: &Schema) -> bool {
-    wire.fields().iter().any(|field| {
-        matches!(
-            field.data_type(),
-            DataType::Decimal128(_, _) | DataType::Decimal256(_, _)
-        ) || declared_pg_type(field) == Some(Type::UUID)
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
@@ -491,6 +512,12 @@ mod tests {
         PgValue::Numeric(PgNumeric::from_unscaled(unscaled, scale))
     }
 
+    /// A row-description entry for a cell. `own_binary_value` reads only its format, so the
+    /// name is not part of any assertion here.
+    fn described_as(ty: Type, format: FieldFormat) -> FieldInfo {
+        FieldInfo::new("c".into(), None, None, ty, format)
+    }
+
     fn text_of(value: &PgValue) -> String {
         let mut out = BytesMut::new();
         value
@@ -500,95 +527,76 @@ mod tests {
     }
 
     #[test]
-    fn a_number_is_grouped_from_the_decimal_point_outwards() {
-        // 12345.678 — the integral side pads on its left, the fractional on its right, so
-        // `1 | 2345 . 6780`.
-        let (ndigits, weight, sign, dscale, digits) = header(&numeric("12345678", 3));
-        assert_eq!((ndigits, weight, sign, dscale), (3, 1, SIGN_POSITIVE, 3));
-        assert_eq!(digits, vec![1, 2345, 6780]);
-    }
-
-    #[test]
-    fn a_whole_number_that_is_a_power_of_the_base_is_one_digit() {
-        // 10000 is 1 * 10000^1, and the trailing zero group says nothing.
-        let (ndigits, weight, _, dscale, digits) = header(&numeric("10000", 0));
-        assert_eq!((ndigits, weight, dscale), (1, 1, 0));
-        assert_eq!(digits, vec![1]);
-    }
-
-    #[test]
-    fn a_number_below_one_has_a_negative_weight() {
-        // 0.0001 is 1 * 10000^-1.
-        let (ndigits, weight, _, dscale, digits) = header(&numeric("1", 4));
-        assert_eq!((ndigits, weight, dscale), (1, -1, 4));
-        assert_eq!(digits, vec![1]);
-    }
-
-    #[test]
-    fn zero_has_no_digits_at_all_and_still_has_a_scale() {
-        let (ndigits, weight, sign, dscale, digits) = header(&numeric("0", 2));
-        assert_eq!((ndigits, weight, sign, dscale), (0, 0, SIGN_POSITIVE, 2));
-        assert!(digits.is_empty());
-        assert_eq!(text_of(&numeric("0", 2)), "0.00");
-    }
-
-    #[test]
-    fn the_sign_is_a_flag_and_not_a_digit() {
-        let (_, weight, sign, _, digits) = header(&numeric("-12345678", 3));
-        assert_eq!((weight, sign), (1, SIGN_NEGATIVE));
-        assert_eq!(digits, vec![1, 2345, 6780]);
-        assert_eq!(text_of(&numeric("-12345678", 3)), "-12345.678");
-    }
-
-    #[test]
-    fn a_negative_scale_is_multiplied_out_rather_than_carried() {
-        // Arrow allows `Decimal128(3, -2)` — 12 meaning 1200. The wire format has no
-        // negative dscale, so the zeros are spelled.
-        let (_, weight, _, dscale, digits) = header(&numeric("12", -2));
-        assert_eq!((weight, dscale), (0, 0));
-        assert_eq!(digits, vec![1200]);
-        assert_eq!(text_of(&numeric("12", -2)), "1200");
-    }
-
-    #[test]
-    fn a_number_wider_than_rust_decimal_is_exact() {
-        // 31 digits. arrow-pg's path raises `22003` here, because `rust_decimal` has a
-        // 96-bit mantissa; a list of base-10000 digits has no width to exceed.
-        let unscaled = "1234567890123456789012345678901";
-        let value = numeric(unscaled, 2);
-        let (_, weight, _, dscale, digits) = header(&value);
-        assert_eq!((weight, dscale), (7, 2));
-        assert_eq!(
-            digits,
-            vec![1, 2345, 6789, 123, 4567, 8901, 2345, 6789, 100]
-        );
-        assert_eq!(text_of(&value), "12345678901234567890123456789.01");
-    }
-
-    #[test]
-    fn a_number_wider_than_decimal128_is_exact() {
-        // 40 digits: a `Decimal256` value, which arrow-pg refuses outright.
-        let unscaled = "1234567890123456789012345678901234567890";
-        assert_eq!(
-            text_of(&numeric(unscaled, 10)),
-            "123456789012345678901234567890.1234567890"
-        );
+    fn the_header_regroups_a_number_into_base_ten_thousand() {
+        for (unscaled, scale, expected, digits) in [
+            // 12345.678 — the integral side pads on its left, the fractional on its right,
+            // so `1 | 2345 . 6780`.
+            ("12345678", 3, (3, 1, SIGN_POSITIVE, 3), vec![1, 2345, 6780]),
+            // 10000 is 1 * 10000^1, and the trailing zero group says nothing.
+            ("10000", 0, (1, 1, SIGN_POSITIVE, 0), vec![1]),
+            // 0.0001 is 1 * 10000^-1.
+            ("1", 4, (1, -1, SIGN_POSITIVE, 4), vec![1]),
+            // Zero has no digits at all, and still has a scale.
+            ("0", 2, (0, 0, SIGN_POSITIVE, 2), vec![]),
+            // The sign is a flag and not a digit: same digits as 12345.678.
+            (
+                "-12345678",
+                3,
+                (3, 1, SIGN_NEGATIVE, 3),
+                vec![1, 2345, 6780],
+            ),
+            // Arrow allows `Decimal128(3, -2)` — 12 meaning 1200. The wire format has no
+            // negative dscale, so the zeros are spelled out.
+            ("12", -2, (1, 0, SIGN_POSITIVE, 0), vec![1200]),
+            // 31 digits. arrow-pg's path raises `22003` here, because `rust_decimal` has a
+            // 96-bit mantissa; a list of base-10000 digits has no width to exceed.
+            (
+                "1234567890123456789012345678901",
+                2,
+                (9, 7, SIGN_POSITIVE, 2),
+                vec![1, 2345, 6789, 123, 4567, 8901, 2345, 6789, 100],
+            ),
+        ] {
+            let (ndigits, weight, sign, dscale, read) = header(&numeric(unscaled, scale));
+            assert_eq!(
+                ((ndigits, weight, sign, dscale), read),
+                (expected, digits),
+                "{unscaled}e-{scale}"
+            );
+        }
     }
 
     #[test]
     fn the_text_of_a_number_is_the_binary_read_back() {
-        // Every case above spelled again through the other format, so the two cannot drift.
+        // Every header case spelled again through the other format, so the two cannot
+        // drift, plus the spellings only the text format has an opinion about.
         for (unscaled, scale, spelled) in [
             ("12345678", 3, "12345.678"),
+            ("-12345678", 3, "-12345.678"),
             ("10000", 0, "10000"),
             ("1", 4, "0.0001"),
             ("-1", 4, "-0.0001"),
+            ("0", 2, "0.00"),
             ("100", 2, "1.00"),
             ("999999999999", 0, "999999999999"),
             ("1", 0, "1"),
             ("-500", 1, "-50.0"),
             ("100000001", 4, "10000.0001"),
             ("10000000000000001", 0, "10000000000000001"),
+            // A negative scale multiplied out.
+            ("12", -2, "1200"),
+            // 31 digits: wider than `rust_decimal`.
+            (
+                "1234567890123456789012345678901",
+                2,
+                "12345678901234567890123456789.01",
+            ),
+            // 40 digits: a `Decimal256` value, which arrow-pg refuses outright.
+            (
+                "1234567890123456789012345678901234567890",
+                10,
+                "123456789012345678901234567890.1234567890",
+            ),
         ] {
             assert_eq!(
                 text_of(&numeric(unscaled, scale)),
@@ -723,7 +731,7 @@ mod tests {
                 .with_precision_and_scale(12, 2)
                 .unwrap(),
         );
-        let pg_field = FieldInfo::new("d".into(), None, None, Type::NUMERIC, FieldFormat::Binary);
+        let pg_field = described_as(Type::NUMERIC, FieldFormat::Binary);
         assert_eq!(
             own_binary_value(&col, 0, &field, &pg_field).unwrap(),
             Some(numeric("-1234", 2))
@@ -751,7 +759,7 @@ mod tests {
         let field = column_field("u", "UUID", true);
         let spelled = "550e8400-e29b-41d4-a716-446655440000";
         let col: ArrayRef = Arc::new(StringArray::from(vec![Some(spelled), None]));
-        let pg_field = FieldInfo::new("u".into(), None, None, Type::UUID, FieldFormat::Binary);
+        let pg_field = described_as(Type::UUID, FieldFormat::Binary);
         assert_eq!(
             own_binary_value(&col, 0, &field, &pg_field).unwrap(),
             Some(PgValue::Uuid(
@@ -770,7 +778,7 @@ mod tests {
         let col: ArrayRef = Arc::new(StringArray::from(vec![Some(
             "550e8400-e29b-41d4-a716-446655440000",
         )]));
-        let pg_field = FieldInfo::new("u".into(), None, None, Type::UUID, FieldFormat::Text);
+        let pg_field = described_as(Type::UUID, FieldFormat::Text);
         assert_eq!(own_binary_value(&col, 0, &field, &pg_field).unwrap(), None);
     }
 
@@ -778,7 +786,7 @@ mod tests {
     fn a_column_that_is_not_ours_is_left_to_arrow_pg() {
         let field = column_field("t", "TEXT", true);
         let col: ArrayRef = Arc::new(StringArray::from(vec![Some("hello")]));
-        let pg_field = FieldInfo::new("t".into(), None, None, Type::TEXT, FieldFormat::Binary);
+        let pg_field = described_as(Type::TEXT, FieldFormat::Binary);
         assert_eq!(own_binary_value(&col, 0, &field, &pg_field).unwrap(), None);
     }
 }

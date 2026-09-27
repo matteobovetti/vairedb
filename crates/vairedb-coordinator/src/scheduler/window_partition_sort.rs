@@ -157,7 +157,8 @@ mod tests {
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::execution::context::SessionContext;
     use datafusion::execution::session_state::SessionStateBuilder;
-    use datafusion::physical_plan::displayable;
+
+    use crate::scheduler::scheduler_test_helper;
 
     /// Two contexts over the same table: one plain, one with the rule appended after the
     /// default physical optimizer set, exactly as `start_scheduler` installs it.
@@ -204,7 +205,7 @@ mod tests {
             .create_physical_plan()
             .await
             .unwrap();
-        displayable(plan.as_ref()).indent(false).to_string()
+        scheduler_test_helper::plan_text(&plan)
     }
 
     /// The rows `sql` answers with, rendered as a table so a difference reads as one.

@@ -68,6 +68,8 @@ use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::ops::ControlFlow;
 
+use datafusion::arrow::datatypes::{Field, Schema};
+
 use crate::sqlparser::ast::{
     AccessExpr, ArrayElemTypeDef, CastKind, DataType, ExactNumberInfo, Expr, Ident, Query, Select,
     SelectItem, SetExpr, Statement, TimezoneInfo, TrimWhereField, VisitMut, VisitorMut,
@@ -90,6 +92,37 @@ pub(super) const DISAMBIGUATOR: char = '\0';
 /// twice. Exact rather than a guess: a name carrying a `NUL` is one this module built.
 pub(super) fn wire_label(name: &str) -> Option<&str> {
     name.split_once(DISAMBIGUATOR).map(|(label, _)| label)
+}
+
+/// `schema` with every disambiguated field name cut back to [`wire_label`], or `None` when
+/// no field carries one — which is every schema of every query whose columns are distinctly
+/// named.
+///
+/// Both places a client meets a result column's *name* read this: the row description a
+/// `SELECT` is described by ([`super::encoding::wire_schema`]) and the header a `COPY … TO`
+/// writes ([`super::copy`]). One owner, because they are the same claim about the same name,
+/// and the collapse applied in only one of them is a `?column?`⟨NUL⟩`2` in the other — which
+/// is what a CSV header used to carry.
+///
+/// `with_name` rather than `Field::new`, so a field keeps whatever metadata it has: the
+/// declared type [`crate::column_types`] leaves there is what decides the column's OID.
+pub(super) fn wire_labels(schema: &Schema) -> Option<Schema> {
+    if !schema
+        .fields()
+        .iter()
+        .any(|f| wire_label(f.name()).is_some())
+    {
+        return None;
+    }
+    let fields: Vec<Field> = schema
+        .fields()
+        .iter()
+        .map(|f| match wire_label(f.name()) {
+            Some(label) => f.as_ref().clone().with_name(label),
+            None => f.as_ref().clone(),
+        })
+        .collect();
+    Some(Schema::new_with_metadata(fields, schema.metadata().clone()))
 }
 
 /// `text` with every disambiguating suffix taken back out of it.
@@ -343,12 +376,6 @@ fn weak(name: String) -> PgLabel {
     }
 }
 
-/// Whether this label is one PostgreSQL derived outright, which is the only kind that
-/// survives being wrapped in a cast or a `CASE`.
-fn is_strong(label: &Option<PgLabel>) -> bool {
-    matches!(label, Some(PgLabel::Named { weak: false, .. }))
-}
-
 /// PostgreSQL's label for `expr`, or `None` if PostgreSQL has no such expression and so no
 /// label to match — a DuckDB-only form, which keeps DataFusion's own.
 ///
@@ -380,13 +407,12 @@ fn pg_label(expr: &Expr) -> Option<PgLabel> {
             expr: inner,
             data_type,
             ..
-        } => {
-            let inner_label = pg_label(inner);
-            match is_strong(&inner_label) {
-                true => inner_label?,
-                false => weak(pg_type_name(data_type)?),
-            }
-        }
+        } => match pg_label(inner) {
+            // A label PostgreSQL derived outright is the only kind that survives being
+            // wrapped: a cast's own fallback outranks the fallback of what it wraps.
+            Some(inner @ PgLabel::Named { weak: false, .. }) => inner,
+            _ => weak(pg_type_name(data_type)?),
+        },
         // `DATE '2020-01-01'` and `INTERVAL '1 day'` are casts of a literal in
         // PostgreSQL's grammar, so both land on the type-name fallback.
         Expr::TypedString(typed) => weak(pg_type_name(&typed.data_type)?),
@@ -395,13 +421,10 @@ fn pg_label(expr: &Expr) -> Option<PgLabel> {
         Expr::Nested(inner) | Expr::Collate { expr: inner, .. } => pg_label(inner)?,
         // A `CASE` is named after its `ELSE` result where that result has a name of its
         // own, and `case` otherwise — so `CASE WHEN … THEN 1 ELSE b END` is `b`.
-        Expr::Case { else_result, .. } => {
-            let else_label = else_result.as_deref().and_then(pg_label);
-            match is_strong(&else_label) {
-                true => else_label?,
-                false => weak("case".to_string()),
-            }
-        }
+        Expr::Case { else_result, .. } => match else_result.as_deref().and_then(pg_label) {
+            Some(label @ PgLabel::Named { weak: false, .. }) => label,
+            _ => weak("case".to_string()),
+        },
         Expr::Array(_) => strong("array"),
         Expr::Tuple(_) => strong("row"),
         // `NOT EXISTS` is a boolean negation of the `EXISTS`, and a negation has no name.
@@ -549,32 +572,16 @@ mod tests {
 
     use super::*;
     use crate::pgwire_handler::encoding::wire_schema;
-    use crate::sqlparser::dialect::PostgreSqlDialect;
-    use crate::sqlparser::parser::Parser;
-
-    fn parse(sql: &str) -> Statement {
-        Parser::new(&PostgreSqlDialect {})
-            .try_with_sql(sql)
-            .unwrap()
-            .parse_statements()
-            .unwrap()
-            .remove(0)
-    }
+    use crate::pgwire_handler::read_path_test_helper::parse_verbatim;
 
     fn labelled(sql: &str) -> String {
-        let mut stmt = parse(sql);
+        let mut stmt = parse_verbatim(sql);
         label_result_columns(&mut stmt);
         stmt.to_string()
     }
 
-    /// The column names of a labelled statement as **DataFusion's planner** derives them,
-    /// beside the ones a client is told.
-    ///
-    /// The pair is the point: the plan has to hold names that are unique, because
-    /// DataFusion refuses a projection that does not, and the client has to be told the
-    /// name PostgreSQL uses however often it repeats. `wire_schema` is the one place both
-    /// Describe and Execute read, so asserting on it is asserting on what goes on the wire.
-    async fn planned_and_wire_labels(sql: &str) -> (Vec<String>, Vec<String>) {
+    /// A planner with one two-column table `t` to label against.
+    fn label_context() -> SessionContext {
         let ctx = SessionContext::new();
         let schema = Arc::new(Schema::new(vec![
             Field::new("a", ArrowType::Int32, true),
@@ -589,8 +596,21 @@ mod tests {
         )
         .unwrap();
         ctx.register_batch("t", batch).unwrap();
+        ctx
+    }
 
-        let mut stmt = parse(sql);
+    /// The column names of a labelled statement as **DataFusion's planner** derives them,
+    /// beside the ones a client is told.
+    ///
+    /// The pair is the point: the plan has to hold names that are unique, because
+    /// DataFusion refuses a projection that does not, and the client has to be told the
+    /// name PostgreSQL uses however often it repeats. `wire_schema` is the one place both
+    /// Describe and Execute read, so asserting on it is asserting on what goes on the wire.
+    async fn planned_and_wire_labels(
+        ctx: &SessionContext,
+        sql: &str,
+    ) -> (Vec<String>, Vec<String>) {
+        let mut stmt = parse_verbatim(sql);
         label_result_columns(&mut stmt);
         let plan = ctx
             .state()
@@ -1095,80 +1115,64 @@ mod tests {
         }
     }
 
-    // Planned, because the whole reason the anonymous label is numbered is a rule of
-    // DataFusion's: three columns all called `?column?` would be refused outright. The plan
-    // holds the numbering and the client is told PostgreSQL's name three times.
+    /// Both halves of the scheme at once, through a real planner: the plan holds names that
+    /// are unique because DataFusion refuses a projection whose names are not, and the client
+    /// is told PostgreSQL's name however often it repeats.
     #[tokio::test]
-    async fn several_anonymous_columns_plan_and_go_out_as_one_name() {
-        let (planned, wire) = planned_and_wire_labels("SELECT a + 1, b * 2, 3 FROM t").await;
-        assert_eq!(
-            planned,
-            [
-                "?column?".to_string(),
-                format!("?column?{DISAMBIGUATOR}2"),
-                format!("?column?{DISAMBIGUATOR}3"),
-            ]
-        );
-        assert_eq!(wire, ["?column?", "?column?", "?column?"]);
-    }
-
-    // A single one needs no numbering, so nothing is collapsed and the plan already carries
-    // what the client is told.
-    #[tokio::test]
-    async fn one_anonymous_column_is_named_in_the_plan_itself() {
-        let (planned, wire) = planned_and_wire_labels("SELECT a + 1 FROM t").await;
-        assert_eq!(planned, ["?column?"]);
-        assert_eq!(wire, ["?column?"]);
-    }
-
-    // A bare name is never numbered: it goes into the plan as itself and out unchanged.
-    #[tokio::test]
-    async fn a_named_column_is_untouched_by_the_collapse() {
-        let (planned, wire) = planned_and_wire_labels("SELECT sum(a), count(*) FROM t").await;
-        assert_eq!(planned, ["sum", "count"]);
-        assert_eq!(wire, ["sum", "count"]);
-    }
-
-    // The headline, planned: PostgreSQL returns both of these as `sum`, DataFusion refuses a
-    // projection that holds `sum` twice, and both facts hold at once.
-    #[tokio::test]
-    async fn a_repeated_bare_label_plans_and_goes_out_twice_under_one_name() {
-        let (planned, wire) = planned_and_wire_labels("SELECT sum(a), sum(b) FROM t").await;
-        assert_eq!(planned, ["sum".to_string(), format!("sum{DISAMBIGUATOR}2")]);
-        assert_eq!(wire, ["sum", "sum"]);
-    }
-
-    // A label that collides with a name the projection already holds, planned: a client's
-    // alias is the client's, and the label beside it is still PostgreSQL's.
-    #[tokio::test]
-    async fn a_label_colliding_with_a_clients_alias_plans() {
-        let (planned, wire) = planned_and_wire_labels("SELECT sum(a) AS sum, sum(b) FROM t").await;
-        assert_eq!(planned, ["sum".to_string(), format!("sum{DISAMBIGUATOR}2")]);
-        assert_eq!(wire, ["sum", "sum"]);
-    }
-
-    // An anonymous column beside a named one, so the numbering is proved to count each name
-    // on its own.
-    #[tokio::test]
-    async fn the_numbering_counts_each_name_separately() {
-        let (planned, wire) = planned_and_wire_labels("SELECT abs(a), a + 1, b + 1 FROM t").await;
-        assert_eq!(
-            planned,
-            [
-                "abs".to_string(),
-                "?column?".to_string(),
-                format!("?column?{DISAMBIGUATOR}2"),
-            ]
-        );
-        assert_eq!(wire, ["abs", "?column?", "?column?"]);
-    }
-
-    // The wildcard case, planned: the suffix costs nothing where the wildcard turns out not
-    // to contain the name, because the client is told the label either way.
-    #[tokio::test]
-    async fn a_column_label_beside_a_wildcard_plans() {
-        let (planned, wire) = planned_and_wire_labels("SELECT *, abs(a) FROM t").await;
-        assert_eq!(planned, ["a", "b", "abs"]);
-        assert_eq!(wire, ["a", "b", "abs"]);
+    async fn a_repeat_is_numbered_in_the_plan_and_collapsed_on_the_way_out() {
+        assert_eq!(DISAMBIGUATOR, '\u{0}', "the plans below spell it literally");
+        let ctx = label_context();
+        for (sql, planned, wire) in [
+            // The whole reason the anonymous label is numbered is a rule of DataFusion's:
+            // three columns all called `?column?` would be refused outright.
+            (
+                "SELECT a + 1, b * 2, 3 FROM t",
+                vec!["?column?", "?column?\u{0}2", "?column?\u{0}3"],
+                vec!["?column?", "?column?", "?column?"],
+            ),
+            // A single one needs no numbering, so the plan already carries what is sent.
+            ("SELECT a + 1 FROM t", vec!["?column?"], vec!["?column?"]),
+            // A bare name is never numbered: into the plan as itself and out unchanged.
+            (
+                "SELECT sum(a), count(*) FROM t",
+                vec!["sum", "count"],
+                vec!["sum", "count"],
+            ),
+            // The headline: PostgreSQL returns both of these as `sum`, DataFusion refuses a
+            // projection that holds `sum` twice, and both facts hold at once.
+            (
+                "SELECT sum(a), sum(b) FROM t",
+                vec!["sum", "sum\u{0}2"],
+                vec!["sum", "sum"],
+            ),
+            // A client's alias is the client's, and the label beside it is PostgreSQL's.
+            (
+                "SELECT sum(a) AS sum, sum(b) FROM t",
+                vec!["sum", "sum\u{0}2"],
+                vec!["sum", "sum"],
+            ),
+            // The numbering counts each name on its own, not the select list.
+            (
+                "SELECT abs(a), a + 1, b + 1 FROM t",
+                vec!["abs", "?column?", "?column?\u{0}2"],
+                vec!["abs", "?column?", "?column?"],
+            ),
+            // The suffix costs nothing where a wildcard turns out not to hold the name,
+            // because the client is told the label either way.
+            (
+                "SELECT *, abs(a) FROM t",
+                vec!["a", "b", "abs"],
+                vec!["a", "b", "abs"],
+            ),
+        ] {
+            assert_eq!(
+                planned_and_wire_labels(&ctx, sql).await,
+                (
+                    planned.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
+                    wire.iter().map(|n| n.to_string()).collect::<Vec<_>>(),
+                ),
+                "`{sql}`"
+            );
+        }
     }
 }

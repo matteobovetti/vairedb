@@ -37,7 +37,7 @@ impl WriteRouter {
         table_meta: &TableMeta,
         params: &[ScalarValue],
     ) -> Result<Vec<ShardMeta>> {
-        let shards = self.catalog.get_shards_for_table(&table_meta.table_name)?;
+        let shards = self.catalog.shards_for_table(&table_meta.table_name)?;
         if shards.is_empty() {
             return Err(CoordinatorError::ShardNotAssigned(format!(
                 "no shards for table {}",
@@ -78,7 +78,10 @@ impl WriteRouter {
         params: &[ScalarValue],
     ) -> Result<(String, Vec<WriteParam>)> {
         let mut stmt_clone = stmt.clone();
-        let shard_suffix = format!("shard{}", shard.hash_bucket);
+        // The suffix that turns `orders` into `orders_shard3`, taken from the one
+        // definition of shard numbering rather than re-spelled here: the core node
+        // creates the table under the name this produces.
+        let shard_suffix = crate::util::logical_shard_id(shard.hash_bucket);
         write_sql_cl::rewrite_to_shard_local(&mut stmt_clone, &shard_suffix);
         write_sql_cl::transform_to_duckdb(&mut stmt_clone);
 
@@ -104,20 +107,25 @@ impl WriteRouter {
 
         Ok((write_sql_cl::statement_to_sql(&stmt_clone), write_params))
     }
+}
 
-    /// Number of acknowledgements needed for a majority quorum given the
-    /// replication factor (`floor(rf/2) + 1`).
-    pub fn compute_quorum_size(&self, replication_factor: u32) -> usize {
-        (replication_factor as usize / 2) + 1
-    }
+/// Number of acknowledgements needed for a majority quorum given the replication
+/// factor (`floor(rf/2) + 1`).
+///
+/// An even factor needs the same count as the next odd one — 2 and 3 both need 2 —
+/// which is what keeps a quorum a strict majority and so unable to overlap with a
+/// second one.
+pub fn compute_quorum_size(replication_factor: u32) -> usize {
+    (replication_factor as usize / 2) + 1
+}
 
-    /// List the node IDs that hold `shard`, with the primary first followed by
-    /// its replicas.
-    pub fn get_target_nodes(&self, shard: &ShardMeta) -> Vec<String> {
-        let mut nodes = vec![shard.primary_node_id.clone()];
-        nodes.extend(shard.replica_node_ids.clone());
-        nodes
-    }
+/// The node IDs that hold `shard`, primary first and then its replicas.
+///
+/// Borrowed rather than cloned: every caller reads the ids to look an address up
+/// and none keeps them.
+pub fn target_nodes(shard: &ShardMeta) -> impl Iterator<Item = &str> {
+    std::iter::once(shard.primary_node_id.as_str())
+        .chain(shard.replica_node_ids.iter().map(String::as_str))
 }
 
 /// Map a shard-key value to a hash bucket in `0..shard_count` via xxh3 hashing.
@@ -138,14 +146,14 @@ pub fn compute_shard_index(value: &str, shard_count: usize) -> usize {
 /// positional indexing happens to be right; from eleven on it is not, and it
 /// fails silently — every shard can execute the statement, so the row is simply
 /// written to, or looked for on, a shard that does not own its key.
-/// [`MetadataCatalog::get_shards_for_table`] now orders by bucket, but routing
+/// [`MetadataCatalog::shards_for_table`] now orders by bucket, but routing
 /// must not depend on that: the ordering is a convenience for callers that read
 /// the list in order, this is the correctness guarantee.
 ///
 /// A bucket with no shard record is an error, not something to fall back from: the
 /// layout is incomplete and any other shard would be the wrong one.
 ///
-/// [`MetadataCatalog::get_shards_for_table`]: crate::catalog::MetadataCatalog::get_shards_for_table
+/// [`MetadataCatalog::shards_for_table`]: crate::catalog::MetadataCatalog::shards_for_table
 pub fn shard_for_bucket<'a>(
     shards: &'a [ShardMeta],
     bucket: usize,

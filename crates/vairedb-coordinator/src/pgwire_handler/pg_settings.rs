@@ -53,6 +53,71 @@ use crate::pgwire_handler::session_params::Setting;
 /// The table this module owns, as `pg_catalog` spells it.
 const PG_SETTINGS: &str = "pg_settings";
 
+/// PostgreSQL's own column list and order, and where each column's value comes from.
+///
+/// One list, two derivations: [`PgSettingsTable::new`] builds the schema from it and
+/// [`PgSettingsTable::batch`] builds the rows. Written as two parallel lists — which is how
+/// this started — a column added to one and not the other fails loudly on the column count,
+/// but two same-typed columns declared in one order and filled in the other does not: the
+/// client is handed `min_val` under the name `max_val` and nothing says so.
+const COLUMNS: &[(&str, Column)] = &[
+    ("name", Column::Text(|s| s.name.to_string())),
+    ("setting", Column::Text(|s| s.setting.clone())),
+    // `unit` and `category`: see [`Setting`] for why these are not invented.
+    ("unit", Column::Unknown),
+    ("category", Column::Unknown),
+    ("short_desc", Column::Text(|s| s.short_desc.to_string())),
+    ("extra_desc", Column::Unknown),
+    ("context", Column::Text(|s| s.context.to_string())),
+    ("vartype", Column::Text(|s| s.vartype.to_string())),
+    ("source", Column::Text(|s| s.source.to_string())),
+    ("min_val", Column::Unknown),
+    ("max_val", Column::Unknown),
+    ("enumvals", Column::Unknown),
+    // `boot_val`, which is the column's name in PostgreSQL. Upstream spells it `bool_val`;
+    // a tool that reads the real name would have found nothing.
+    ("boot_val", Column::Text(|s| s.boot_val.to_string())),
+    ("reset_val", Column::Text(|s| s.reset_val.clone())),
+    ("sourcefile", Column::Unknown),
+    ("sourceline", Column::UnknownInt32),
+    ("pending_restart", Column::NeverPending),
+];
+
+/// Where one `pg_settings` column's value comes from.
+enum Column {
+    /// One field of every [`Setting`], always filled.
+    Text(fn(&Setting) -> String),
+    /// A text column PostgreSQL has and VaireDB has nothing truthful to put in.
+    Unknown,
+    /// `sourceline`, the one unknown column PostgreSQL does not type as text.
+    UnknownInt32,
+    /// `pending_restart`: nothing VaireDB accepts needs a restart to take effect, so this is
+    /// never `true` rather than never known.
+    NeverPending,
+}
+
+impl Column {
+    fn data_type(&self) -> DataType {
+        match self {
+            Self::Text(_) | Self::Unknown => DataType::Utf8,
+            Self::UnknownInt32 => DataType::Int32,
+            Self::NeverPending => DataType::Boolean,
+        }
+    }
+
+    /// This column's values for `settings`, one row each.
+    fn array(&self, settings: &[Setting]) -> ArrayRef {
+        match self {
+            Self::Text(pick) => Arc::new(StringArray::from(
+                settings.iter().map(|s| Some(pick(s))).collect::<Vec<_>>(),
+            )),
+            Self::Unknown => Arc::new(StringArray::from(vec![None::<String>; settings.len()])),
+            Self::UnknownInt32 => Arc::new(Int32Array::from(vec![None::<i32>; settings.len()])),
+            Self::NeverPending => Arc::new(BooleanArray::from(vec![Some(false); settings.len()])),
+        }
+    }
+}
+
 tokio::task_local! {
     /// The parameters of the connection whose statement is running on this task.
     static SESSION_SETTINGS: Arc<Vec<Setting>>;
@@ -118,88 +183,27 @@ struct PgSettingsTable {
 }
 
 impl PgSettingsTable {
-    /// PostgreSQL's own column list and order.
+    /// The schema [`COLUMNS`] describes.
     ///
     /// Every column is nullable, including the ones always filled: a catalog view is read by
     /// tools that were written against PostgreSQL's own, and PostgreSQL's `pg_settings` marks
     /// nothing `NOT NULL`.
     fn new() -> Self {
-        let schema = Arc::new(Schema::new(vec![
-            Field::new("name", DataType::Utf8, true),
-            Field::new("setting", DataType::Utf8, true),
-            Field::new("unit", DataType::Utf8, true),
-            Field::new("category", DataType::Utf8, true),
-            Field::new("short_desc", DataType::Utf8, true),
-            Field::new("extra_desc", DataType::Utf8, true),
-            Field::new("context", DataType::Utf8, true),
-            Field::new("vartype", DataType::Utf8, true),
-            Field::new("source", DataType::Utf8, true),
-            Field::new("min_val", DataType::Utf8, true),
-            Field::new("max_val", DataType::Utf8, true),
-            Field::new("enumvals", DataType::Utf8, true),
-            // `boot_val`, which is the column's name in PostgreSQL. Upstream spells it
-            // `bool_val`; a tool that reads the real name would have found nothing.
-            Field::new("boot_val", DataType::Utf8, true),
-            Field::new("reset_val", DataType::Utf8, true),
-            Field::new("sourcefile", DataType::Utf8, true),
-            Field::new("sourceline", DataType::Int32, true),
-            Field::new("pending_restart", DataType::Boolean, true),
-        ]));
+        let schema = Arc::new(Schema::new(
+            COLUMNS
+                .iter()
+                .map(|(name, column)| Field::new(*name, column.data_type(), true))
+                .collect::<Vec<_>>(),
+        ));
         Self { schema }
     }
 
-    /// One row per setting, in the column order [`Self::new`] declares.
+    /// One row per setting, in [`COLUMNS`] order.
     fn batch(&self, settings: &[Setting]) -> DfResult<RecordBatch> {
-        let strings =
-            |values: Vec<Option<String>>| -> ArrayRef { Arc::new(StringArray::from(values)) };
-        let nulls: Vec<Option<String>> = vec![None; settings.len()];
-        let columns: Vec<ArrayRef> = vec![
-            strings(settings.iter().map(|s| Some(s.name.to_string())).collect()),
-            strings(settings.iter().map(|s| Some(s.setting.clone())).collect()),
-            // `unit` and `category`: see [`Setting`] for why these are not invented.
-            strings(nulls.clone()),
-            strings(nulls.clone()),
-            strings(
-                settings
-                    .iter()
-                    .map(|s| Some(s.short_desc.to_string()))
-                    .collect(),
-            ),
-            strings(nulls.clone()),
-            strings(
-                settings
-                    .iter()
-                    .map(|s| Some(s.context.to_string()))
-                    .collect(),
-            ),
-            strings(
-                settings
-                    .iter()
-                    .map(|s| Some(s.vartype.to_string()))
-                    .collect(),
-            ),
-            strings(
-                settings
-                    .iter()
-                    .map(|s| Some(s.source.to_string()))
-                    .collect(),
-            ),
-            strings(nulls.clone()),
-            strings(nulls.clone()),
-            strings(nulls.clone()),
-            strings(
-                settings
-                    .iter()
-                    .map(|s| Some(s.boot_val.to_string()))
-                    .collect(),
-            ),
-            strings(settings.iter().map(|s| Some(s.reset_val.clone())).collect()),
-            strings(nulls.clone()),
-            Arc::new(Int32Array::from(vec![None::<i32>; settings.len()])),
-            // Nothing VaireDB accepts needs a restart to take effect, so this is never
-            // true rather than never known.
-            Arc::new(BooleanArray::from(vec![Some(false); settings.len()])),
-        ];
+        let columns: Vec<ArrayRef> = COLUMNS
+            .iter()
+            .map(|(_, column)| column.array(settings))
+            .collect();
         RecordBatch::try_new(Arc::clone(&self.schema), columns).map_err(Into::into)
     }
 }
@@ -260,7 +264,7 @@ mod tests {
 
     /// A context holding nothing but this table under its real name, which is all the
     /// per-session behaviour needs to be observed through.
-    async fn context() -> SessionContext {
+    fn context() -> SessionContext {
         let ctx = SessionContext::new();
         ctx.register_table("pg_settings", Arc::new(PgSettingsTable::new()))
             .expect("the table registers");
@@ -287,7 +291,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_table_reports_what_the_scanning_session_set() {
-        let ctx = context().await;
+        let ctx = context();
         let rows = with_session_settings(
             Arc::new(vec![setting("TimeZone", "UTC", "default")]),
             settings_seen(
@@ -302,7 +306,7 @@ mod tests {
     #[tokio::test]
     async fn two_sessions_reading_one_table_get_their_own_values() {
         // The point of the whole module: one registered provider, two answers.
-        let ctx = context().await;
+        let ctx = context();
         let sql = "SELECT setting FROM pg_settings WHERE name = 'application_name'";
 
         let first = with_session_settings(
@@ -322,7 +326,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_scan_outside_a_statement_reports_nothing_rather_than_failing() {
-        let ctx = context().await;
+        let ctx = context();
         let rows = settings_seen(&ctx, "SELECT name FROM pg_settings").await;
         assert!(
             rows.is_empty(),
@@ -332,7 +336,7 @@ mod tests {
 
     #[tokio::test]
     async fn every_column_postgresql_has_is_present_and_the_known_ones_are_filled() {
-        let ctx = context().await;
+        let ctx = context();
         let names: Vec<String> = settings_schema()
             .fields()
             .iter()
@@ -453,7 +457,7 @@ mod tests {
     async fn the_snapshot_is_the_one_the_statement_started_with() {
         // A projection and a filter both push down through the `MemTable`, so the rows a
         // client selects are the rows this session has and not the whole list.
-        let ctx = context().await;
+        let ctx = context();
         let rows = with_session_settings(
             Arc::new(vec![
                 setting("DateStyle", "ISO, YMD", "default"),

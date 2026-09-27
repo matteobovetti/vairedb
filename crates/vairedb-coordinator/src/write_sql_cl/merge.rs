@@ -8,7 +8,7 @@
 //! [`crate::pgwire_handler::merge`], which is where the catalog checks live.
 
 use crate::sqlparser::ast::{
-    AssignmentTarget, BinaryOperator, Expr, Ident, MergeAction, MergeClauseKind, MergeInsertKind,
+    AssignmentTarget, BinaryOperator, Expr, MergeAction, MergeClauseKind, MergeInsertKind,
     ObjectName, ObjectNamePart, Parens, Query, SetExpr, Statement, TableAlias, TableFactor, Values,
 };
 use datafusion::scalar::ScalarValue;
@@ -17,6 +17,7 @@ use crate::pgwire_handler::query_router::{canonical_table_name, canonicalize_ide
 
 use super::routing_value::{RoutedValue, expr_routing_value};
 use super::statement::assignments_target_shard_key;
+use super::{column_name_is, quoted_column_names, unnest};
 
 /// What a MERGE's `USING` clause reads.
 #[derive(Debug, Clone, PartialEq)]
@@ -53,13 +54,12 @@ pub struct MergeShape {
 /// Read the relations a MERGE joins, or `Err(message)` for a source shape VaireDB
 /// cannot place.
 ///
-/// Only two sources are recognized, because those are the two whose rows the
-/// coordinator can prove will meet the right target rows: another sharded table
-/// (checked for co-location by the caller) and an inline `VALUES` list with named
-/// columns (split per shard by the caller). A subquery source is refused rather
-/// than broadcast — its rows are unknown here, so the coordinator cannot tell
-/// which shard each one belongs on, and a broadcast `WHEN NOT MATCHED THEN
-/// INSERT` would store every row on every shard.
+/// Only two sources are recognized — the two whose rows the coordinator can prove
+/// will meet the right target rows: another sharded table (checked for co-location by
+/// the caller) and an inline `VALUES` list with named columns (split per shard by the
+/// caller). A subquery is refused rather than broadcast: its rows are unknown here, so
+/// the coordinator cannot place them, and a broadcast `WHEN NOT MATCHED THEN INSERT`
+/// would store every row on every shard.
 pub fn merge_shape(stmt: &Statement) -> std::result::Result<MergeShape, String> {
     let Statement::Merge(merge) = stmt else {
         return Err("expected a MERGE statement".to_string());
@@ -77,12 +77,7 @@ pub fn merge_shape(stmt: &Statement) -> std::result::Result<MergeShape, String> 
                 .to_string(),
         );
     };
-    let target_table = canonical_table_name(name)
-        .ok_or_else(|| "could not determine the MERGE target table".to_string())?;
-    let target_qualifier = alias
-        .as_ref()
-        .map(|a| canonicalize_ident(&a.name))
-        .unwrap_or_else(|| target_table.clone());
+    let (target_table, target_qualifier) = name_and_qualifier(name, alias.as_ref(), "target")?;
 
     let source = match &merge.source {
         TableFactor::Table {
@@ -91,16 +86,8 @@ pub fn merge_shape(stmt: &Statement) -> std::result::Result<MergeShape, String> 
             args: None,
             ..
         } => {
-            let source_name = canonical_table_name(name)
-                .ok_or_else(|| "could not determine the MERGE source table".to_string())?;
-            let qualifier = alias
-                .as_ref()
-                .map(|a| canonicalize_ident(&a.name))
-                .unwrap_or_else(|| source_name.clone());
-            MergeSource::Table {
-                name: source_name,
-                qualifier,
-            }
+            let (name, qualifier) = name_and_qualifier(name, alias.as_ref(), "source")?;
+            MergeSource::Table { name, qualifier }
         }
         TableFactor::Derived {
             lateral: false,
@@ -144,6 +131,27 @@ pub fn merge_shape(stmt: &Statement) -> std::result::Result<MergeShape, String> 
     })
 }
 
+/// Read a MERGE relation as `(canonical table name, qualifier)`.
+///
+/// The qualifier is the name the relation's columns are referred to by: its alias if
+/// it has one, and otherwise its own name — which is what makes `ON orders.id =
+/// inbox.id` resolvable in a MERGE that aliases neither side.
+///
+/// `role` names the side ("target"/"source") in the error, so a client reads which
+/// half of the statement the coordinator could not make sense of.
+fn name_and_qualifier(
+    name: &ObjectName,
+    alias: Option<&TableAlias>,
+    role: &str,
+) -> std::result::Result<(String, String), String> {
+    let table = canonical_table_name(name)
+        .ok_or_else(|| format!("could not determine the MERGE {role} table"))?;
+    let qualifier = alias
+        .map(|a| canonicalize_ident(&a.name))
+        .unwrap_or_else(|| table.clone());
+    Ok((table, qualifier))
+}
+
 /// Whether `query` is a bare `VALUES (…), (…)` with nothing that changes which
 /// rows it yields. A `LIMIT`, `ORDER BY`, `FETCH`, CTE or pipe operator would
 /// decide the row set at execution time, and the coordinator splits the rows by
@@ -160,12 +168,12 @@ fn is_plain_values(query: &Query) -> bool {
 /// Give the MERGE's target and source relations an explicit alias equal to the
 /// name they already carry, when they have none.
 ///
-/// Required before the shard-local rewrite: that rewrite renames the relation
-/// itself (`orders` → `orders_shard1`), while a `MERGE INTO orders USING inbox ON
-/// orders.id = inbox.id` refers to its columns *through* the old name. Without an
-/// alias to keep that name alive the rendered statement would reference a relation
-/// that no longer exists. The alias is the client's own identifier, quote style
-/// included, so every reference that resolved before still resolves.
+/// Required before the shard-local rewrite: that rewrite renames the relation itself
+/// (`orders` → `orders_shard1`), while `MERGE INTO orders USING inbox ON orders.id =
+/// inbox.id` refers to its columns *through* the old name. Without an alias keeping
+/// that name alive the rendered statement would reference a relation that no longer
+/// exists. The alias is the client's own identifier, quote style included, so every
+/// reference that resolved before still resolves.
 pub fn ensure_merge_relation_aliases(stmt: &mut Statement) {
     let Statement::Merge(merge) = stmt else {
         return;
@@ -194,12 +202,11 @@ fn alias_relation_by_its_own_name(factor: &mut TableFactor) {
 /// Drop the target's qualifier from the column names a MERGE clause *writes*,
 /// leaving the columns it reads untouched.
 ///
-/// `WHEN MATCHED THEN UPDATE SET t.value = s.value` is how MSSQL, Snowflake and
-/// Oracle spell it, and it is unambiguous — the left of an assignment can only be
-/// a target column. PostgreSQL and DuckDB both reject the qualifier there, so it
-/// is removed rather than passed on. A qualifier naming anything *else* is
-/// refused: it would be silently dropped, writing a column of the target the
-/// client did not name.
+/// `WHEN MATCHED THEN UPDATE SET t.value = s.value` is how MSSQL, Snowflake and Oracle
+/// spell it, and it is unambiguous — the left of an assignment can only be a target
+/// column. PostgreSQL and DuckDB both reject the qualifier there, so it is removed.
+/// A qualifier naming anything *else* is refused: dropping it silently would write a
+/// target column the client did not name.
 pub fn normalize_merge_column_qualifiers(stmt: &mut Statement) -> std::result::Result<(), String> {
     let shape = merge_shape(stmt)?;
     let target = &shape.target_qualifier;
@@ -267,16 +274,15 @@ fn strip_target_qualifier(
 /// The source column the ON clause equates to the target's shard key, or `None`
 /// when it equates nothing to it.
 ///
-/// This is the predicate the whole of MERGE's correctness under sharding rests on:
-/// equal shard keys always hash to the same shard, so an ON clause that requires
-/// `target.<shard key> = source.<column>` can only ever match rows the same shard
-/// holds. Both sides must be qualified — with the sides unlabelled there is no
-/// telling which relation a bare column belongs to, and guessing wrong would pin
-/// the fan-out on the wrong column.
+/// This predicate is what MERGE's correctness under sharding rests on: equal shard keys
+/// always hash to the same shard, so an ON clause requiring `target.<shard key> =
+/// source.<column>` can only match rows one shard holds. Both sides must be qualified —
+/// a bare column names no relation, and guessing wrong would pin the fan-out on the
+/// wrong column.
 ///
-/// Only `AND` is walked. An `OR` in the ON clause would let a target row match a
-/// source row with a *different* key, which lives on another shard, so a MERGE
-/// whose key equality sits under an `OR` finds nothing here and is refused.
+/// Only `AND` is walked. An `OR` would let a target row match a source row with a
+/// *different* key, living on another shard, so a key equality under an `OR` is not
+/// found here and the MERGE is refused.
 pub fn merge_key_column(
     stmt: &Statement,
     shape: &MergeShape,
@@ -357,33 +363,23 @@ fn qualified_column(expr: &Expr, target_qualifier: &str, source_qualifier: &str)
     }
 }
 
-/// Strip redundant parentheses so `ON (t.id = s.id)` reads like `ON t.id = s.id`.
-fn unnest(expr: &Expr) -> &Expr {
-    match expr {
-        Expr::Nested(inner) => unnest(inner),
-        other => other,
-    }
-}
-
 /// Validate every `WHEN` clause of a MERGE against the shard key, returning
 /// `Err(message)` naming what to change.
 ///
 /// What is refused, and why:
 ///
-/// - **`OUTPUT` / `RETURNING`.** The rows come back from every shard the MERGE
-///   touched; there is no one result set to return them in.
-/// - **`UPDATE SET <shard key>`.** It would move the row to a shard the router did
-///   not write it to, exactly as a plain `UPDATE` of the shard key would.
-/// - **An `INSERT` clause that does not take its shard key from
-///   `source_key_column`.** The clause runs on the shard the *source* row is on,
-///   so the row it inserts must belong there too — which is guaranteed only when
-///   the value it stores in the shard key is the very column the ON clause
-///   matched on. Any other value could hash elsewhere, and the row would be
-///   stored on a shard no lookup of it ever visits.
-/// - **`INSERT ROW`, and Oracle's per-clause `WHERE` / `DELETE WHERE`.** VaireDB
-///   would have to render them for an engine that cannot express them, so the
-///   statement would fail on the shards with a message about a node rather than
-///   about the SQL.
+/// - **`OUTPUT` / `RETURNING`.** The rows come back from every shard the MERGE touched;
+///   there is no one result set to return them in.
+/// - **`UPDATE SET <shard key>`.** It would move the row to a shard the router did not
+///   write it to, exactly as a plain `UPDATE` of the shard key would.
+/// - **An `INSERT` clause not taking its shard key from `source_key_column`.** The
+///   clause runs on the shard the *source* row is on, so the row it inserts must belong
+///   there too — guaranteed only when the value it stores is the very column the ON
+///   clause matched on. Any other value could hash elsewhere, onto a shard no lookup of
+///   that row ever visits.
+/// - **`INSERT ROW`, and Oracle's per-clause `WHERE` / `DELETE WHERE`.** Rendering them
+///   for an engine that cannot express them would fail on the shards with a message
+///   about a node rather than about the SQL.
 pub fn validate_merge(
     stmt: &Statement,
     target_shard_key: &str,
@@ -452,7 +448,7 @@ pub fn validate_merge(
                 let Some(key_idx) = insert
                     .columns
                     .iter()
-                    .position(|name| object_name_is(name, target_shard_key))
+                    .position(|name| column_name_is(name, target_shard_key))
                 else {
                     return Err(format!(
                         "the MERGE INSERT clause must supply shard key column \
@@ -475,14 +471,6 @@ pub fn validate_merge(
     }
 
     Ok(())
-}
-
-/// Whether an `ObjectName`'s final identifier is the canonical `column`.
-fn object_name_is(name: &ObjectName, column: &str) -> bool {
-    name.0
-        .last()
-        .and_then(|part| part.as_ident())
-        .is_some_and(|ident| canonicalize_ident(ident) == column)
 }
 
 /// Whether `expr` is a plain reference to `column`, qualified or not.
@@ -554,14 +542,7 @@ pub fn materialize_merge_insert_columns(
                 table_columns.len()
             ));
         }
-        insert.columns = table_columns[..row.len()]
-            .iter()
-            .map(|name| {
-                ObjectName(vec![ObjectNamePart::Identifier(Ident::with_quote(
-                    '"', *name,
-                ))])
-            })
-            .collect();
+        insert.columns = quoted_column_names(&table_columns[..row.len()]);
     }
     Ok(())
 }
@@ -637,15 +618,8 @@ pub fn split_merge_by_rows(stmt: &Statement, row_indices: &[usize]) -> Option<St
 
 #[cfg(test)]
 mod tests {
-    use super::super::{rewrite_to_shard_local, statement_to_sql, transform_to_duckdb};
+    use super::super::{parse_one, rewrite_to_shard_local, statement_to_sql, transform_to_duckdb};
     use super::*;
-    use crate::pgwire_handler::parser::parse_sql;
-
-    fn parse_one(sql: &str) -> Statement {
-        let mut stmts = parse_sql(sql).unwrap_or_else(|e| panic!("failed to parse `{sql}`: {e}"));
-        assert_eq!(stmts.len(), 1, "`{sql}` must parse to one statement");
-        stmts.remove(0)
-    }
 
     /// The canonical target/source shape of a MERGE, panicking if it is refused.
     fn shape(sql: &str) -> MergeShape {

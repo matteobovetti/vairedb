@@ -147,8 +147,11 @@ fn decided_on_the_build_side(join_type: JoinType) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use datafusion::arrow::array::{Array, Int32Array, RecordBatch};
-    use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
+    use crate::scheduler::scheduler_test_helper::{
+        L_KEYS, R_KEYS, key_schema, plan_text, sorted_keys,
+    };
+    use datafusion::arrow::array::{Int32Array, RecordBatch};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::common::JoinSide;
     use datafusion::datasource::memory::MemorySourceConfig;
     use datafusion::execution::context::SessionContext;
@@ -156,13 +159,8 @@ mod tests {
     use datafusion::physical_expr::expressions::{BinaryExpr, Column};
     use datafusion::physical_plan::joins::utils::{ColumnIndex, JoinFilter};
     use datafusion::physical_plan::repartition::RepartitionExec;
-    use datafusion::physical_plan::{Partitioning, collect, displayable};
+    use datafusion::physical_plan::{Partitioning, collect};
     use datafusion::prelude::SessionConfig;
-
-    /// `l.k = 10, 20, 30, NULL` — the build side of the cluster measurement's fixture.
-    const L_KEYS: [Option<i32>; 4] = [Some(10), Some(20), Some(30), None];
-    /// `r.k = 20, 99, 50` — the probe side.
-    const R_KEYS: [Option<i32>; 3] = [Some(20), Some(99), Some(50)];
 
     /// The five join types whose output is only known once every probe row has been seen.
     const DECIDED_ON_THE_BUILD_SIDE: [JoinType; 5] = [
@@ -180,10 +178,6 @@ mod tests {
         JoinType::RightAnti,
         JoinType::RightMark,
     ];
-
-    fn key_schema() -> SchemaRef {
-        Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, true)]))
-    }
 
     /// A one-partition scan of `keys`.
     fn scan(keys: &[Option<i32>]) -> Arc<dyn ExecutionPlan> {
@@ -265,34 +259,14 @@ mod tests {
             .expect("the rule must not fail")
     }
 
-    fn plan_text(plan: &Arc<dyn ExecutionPlan>) -> String {
-        displayable(plan.as_ref()).indent(false).to_string()
-    }
-
-    /// Every value of `plan`'s first column, sorted, with a NULL rendered as `-1` so it is
-    /// visible. Collected across all output partitions, the way a client sees the answer.
+    /// The keys `plan` answers, collected across all of its output partitions the way a
+    /// client sees the answer.
     async fn keys(plan: Arc<dyn ExecutionPlan>) -> Vec<i32> {
         let ctx = SessionContext::new();
         let batches = collect(plan, ctx.task_ctx())
             .await
             .expect("the plan must run");
-        let mut keys = Vec::new();
-        for batch in &batches {
-            let column = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .expect("an int4 column");
-            for row in 0..batch.num_rows() {
-                keys.push(if column.is_null(row) {
-                    -1
-                } else {
-                    column.value(row)
-                });
-            }
-        }
-        keys.sort_unstable();
-        keys
+        sorted_keys(&batches)
     }
 
     // The premise of the whole module: without the rule, these joins are executed across

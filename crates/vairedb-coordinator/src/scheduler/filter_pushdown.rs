@@ -80,10 +80,8 @@
 //! before pushing it. An opaque text column is still excluded, from this shape as from
 //! every other.
 //!
-//! Column references are stripped of their table qualifier first. The predicate was
-//! planned against the logical table (`orders`), and the statement it lands in scans the
-//! shard's physical table (`orders_shard0`), so a qualified `"orders"."id"` would name a
-//! relation that is not in the `FROM` clause.
+//! A shape that passes is still not rendered as the coordinator holds it — see
+//! [`prepare_for_rendering`] for the respellings that stand between the two.
 
 use std::collections::HashSet;
 
@@ -586,7 +584,7 @@ mod tests {
         );
         // Including a negative one, where the renumbering divides below zero.
         assert_eq!(
-            pushed(col("day").eq(lit(ScalarValue::Date64(Some(-1 * MILLIS_PER_DAY))))).as_deref(),
+            pushed(col("day").eq(lit(ScalarValue::Date64(Some(-MILLIS_PER_DAY))))).as_deref(),
             Some("(\"day\" = CAST('1969-12-31' AS DATE))")
         );
         // A NULL needs no day to render.

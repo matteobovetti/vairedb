@@ -518,6 +518,7 @@ fn rewrite_failed(detail: &str) -> PgWireError {
 mod tests {
     use super::*;
 
+    use crate::pgwire_handler::read_path_test_helper::parse_verbatim;
     use datafusion::arrow::array::{Array, Int32Array};
     use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
     use datafusion::arrow::record_batch::RecordBatch;
@@ -580,23 +581,10 @@ mod tests {
         ctx
     }
 
-    fn parse(sql: &str) -> Statement {
-        use crate::sqlparser::dialect::PostgreSqlDialect;
-        use crate::sqlparser::parser::Parser;
-
-        Parser::new(&PostgreSqlDialect {})
-            .try_with_sql(sql)
-            .expect("lexes")
-            .parse_statements()
-            .expect("parses")
-            .pop()
-            .expect("one statement")
-    }
-
     /// Mark `sql`, plan it, and rewrite the plan — the two passes in the order the read path
     /// runs them, with nothing else in between.
     async fn planned(ctx: &SessionContext, sql: &str) -> PgWireResult<LogicalPlan> {
-        let mut stmt = parse(sql);
+        let mut stmt = parse_verbatim(sql);
         mark_multiplicity_set_operations(&mut stmt)?;
         let plan = ctx
             .state()
@@ -660,7 +648,7 @@ mod tests {
     }
 
     /// A codec for the in-memory tables these tests register, standing in for the
-    /// [`crate::scheduler::logical_codec::VaireLogicalCodec`] the cluster ships plans with.
+    /// [`crate::scheduler::VaireLogicalCodec`] the cluster ships plans with.
     #[derive(Debug)]
     struct MemTableCodec;
 
@@ -977,7 +965,7 @@ mod tests {
     #[tokio::test]
     async fn union_all_is_untouched() {
         let sql = "SELECT a FROM l UNION ALL SELECT a FROM r";
-        let mut stmt = parse(sql);
+        let mut stmt = parse_verbatim(sql);
         let before = stmt.to_string();
         mark_multiplicity_set_operations(&mut stmt).expect("not refused");
         assert_eq!(stmt.to_string(), before);
@@ -1000,7 +988,7 @@ mod tests {
     /// to be a no-op for the plan pass to keep recognizing what it produced.
     #[tokio::test]
     async fn marking_is_idempotent() {
-        let mut stmt = parse("SELECT a FROM l INTERSECT ALL SELECT a FROM r");
+        let mut stmt = parse_verbatim("SELECT a FROM l INTERSECT ALL SELECT a FROM r");
         mark_multiplicity_set_operations(&mut stmt).expect("not refused");
         let once = stmt.to_string();
         assert!(once.contains(MARKER_RELATION), "{once}");
@@ -1014,7 +1002,7 @@ mod tests {
     /// the marker has to be there for the day either changes.
     #[tokio::test]
     async fn minus_all_is_marked_like_except_all() {
-        let mut stmt = parse("SELECT a FROM l MINUS ALL SELECT a FROM r");
+        let mut stmt = parse_verbatim("SELECT a FROM l MINUS ALL SELECT a FROM r");
         mark_multiplicity_set_operations(&mut stmt).expect("not refused");
         assert!(stmt.to_string().contains(MARKER_RELATION), "{stmt}");
     }
@@ -1070,7 +1058,7 @@ mod tests {
         ] {
             let plan = ctx
                 .state()
-                .statement_to_plan(DFStatement::Statement(Box::new(parse(sql))))
+                .statement_to_plan(DFStatement::Statement(Box::new(parse_verbatim(sql))))
                 .await
                 .expect("statement plans");
             let message = preserve_set_operation_multiplicity(plan)
@@ -1112,7 +1100,7 @@ mod tests {
         ] {
             let plan = ctx
                 .state()
-                .statement_to_plan(DFStatement::Statement(Box::new(parse(sql))))
+                .statement_to_plan(DFStatement::Statement(Box::new(parse_verbatim(sql))))
                 .await
                 .expect("statement plans");
             preserve_set_operation_multiplicity(plan).expect("not refused");

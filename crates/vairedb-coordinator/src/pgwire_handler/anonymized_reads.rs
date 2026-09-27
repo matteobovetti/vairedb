@@ -195,8 +195,7 @@ impl Guard<'_> {
     /// unordered as `email` itself, since the digest is what the expression is computed
     /// from.
     fn mentioned_in(&self, expr: &Expr) -> Option<String> {
-        let mut found = None;
-        let _ = visit_expressions(expr, |node| {
+        visit_expressions(expr, |node| {
             let name = match node {
                 Expr::Identifier(ident) => Some(&ident.value),
                 Expr::CompoundIdentifier(parts) => parts.last().map(|ident| &ident.value),
@@ -204,13 +203,12 @@ impl Guard<'_> {
             };
             match name {
                 Some(name) if self.columns.contains(&name.to_ascii_lowercase()) => {
-                    found = Some(name.clone());
-                    ControlFlow::Break(())
+                    ControlFlow::Break(name.clone())
                 }
                 _ => ControlFlow::Continue(()),
             }
-        });
-        found
+        })
+        .break_value()
     }
 
     fn check_order_by(&self, exprs: &[OrderByExpr]) -> PgWireResult<()> {
@@ -369,6 +367,7 @@ fn unsupported(what: impl std::fmt::Display, why: &str) -> PgWireError {
 
 #[cfg(test)]
 mod tests {
+    use super::super::read_path_test_helper::parse_rewritten;
     use super::*;
 
     /// A digest of the right shape, standing in for one the client hashed itself.
@@ -376,12 +375,10 @@ mod tests {
 
     /// The verdict on `sql`, with `email` the one pseudonymized column.
     fn verdict(sql: &str) -> PgWireResult<()> {
-        let stmt = crate::pgwire_handler::parser::parse_sql(sql)
-            .unwrap()
-            .into_iter()
-            .next()
-            .unwrap();
-        reject_reads_of(&stmt, &BTreeSet::from(["email".to_string()]))
+        reject_reads_of(
+            &parse_rewritten(sql),
+            &BTreeSet::from(["email".to_string()]),
+        )
     }
 
     /// The refusal message for a statement that must be refused.
@@ -519,12 +516,11 @@ mod tests {
     // which is the path every ordinary query takes.
     #[test]
     fn a_statement_with_no_pseudonymized_column_in_scope_is_untouched() {
-        let stmt = crate::pgwire_handler::parser::parse_sql("SELECT id FROM t ORDER BY email")
-            .unwrap()
-            .into_iter()
-            .next()
-            .unwrap();
-        reject_reads_of(&stmt, &BTreeSet::new()).unwrap();
+        reject_reads_of(
+            &parse_rewritten("SELECT id FROM t ORDER BY email"),
+            &BTreeSet::new(),
+        )
+        .expect("no pseudonymized column is in scope, so no rule can fire");
     }
 
     // A subquery is reached too: the visitor walks the whole statement, so a refusal

@@ -52,15 +52,15 @@ use pgwire::error::PgWireResult;
 use vairedb_common::proto::vairedb::v1::VdbErrorCode;
 
 use crate::catalog::{ShardMeta, TableMeta};
-use crate::error::CoordinatorError;
 use crate::pgwire_handler::dml::{DmlPlan, PlannedWrite, dml_tag};
 use crate::pgwire_handler::error_enrichment::{
-    ErrorContext, enrich_coordinator_error, enrich_generic_error, make_vdb_error,
+    ErrorContext, enrich_coordinator_error, enrich_generic_error, make_vdb_error, require_shards,
+    require_table,
 };
 use crate::pgwire_handler::handler::VaireDbQueryHandler;
 use crate::pgwire_handler::query_router::QueryType;
 use crate::sqlparser::ast::Statement;
-use crate::write_router::{compute_shard_index, shard_for_bucket};
+use crate::write_router::{compute_quorum_size, compute_shard_index, shard_for_bucket};
 use crate::write_sql_cl::{
     MergeSource, ensure_merge_relation_aliases, materialize_merge_insert_columns,
     merge_has_not_matched_by_source, merge_key_column, merge_row_shard_keys, merge_shape,
@@ -91,7 +91,7 @@ impl VaireDbQueryHandler {
         let shape = merge_shape(&stmt).map_err(unsupported)?;
 
         let ctx = ErrorContext::for_table(&shape.target_table);
-        let target = self.require_table(&shape.target_table, &ctx)?;
+        let target = require_table(&self.catalog, &shape.target_table, &ctx)?;
 
         // The pseudonymization rewrite covers INSERT and UPDATE statements only, so
         // a MERGE would reach the shards with the plaintext the client wrote —
@@ -136,16 +136,14 @@ impl VaireDbQueryHandler {
 
         validate_merge(&stmt, &target.shard_key, &source_key).map_err(unsupported)?;
 
-        let quorum_size = self
-            .write_router
-            .compute_quorum_size(target.replication_factor);
+        let quorum_size = compute_quorum_size(target.replication_factor);
         let ctx = ctx.with_replication(target.replication_factor);
-        let target_shards = self.shards_of(&target, &ctx)?;
+        let target_shards = require_shards(&self.catalog, &target, &ctx)?;
 
         let writes = match &shape.source {
             MergeSource::Table { name, .. } => {
-                let source = self.require_table(name, &ctx)?;
-                let source_shards = self.shards_of(&source, &ctx)?;
+                let source = require_table(&self.catalog, name, &ctx)?;
+                let source_shards = require_shards(&self.catalog, &source, &ctx)?;
                 check_table_source(
                     &target,
                     &source,
@@ -233,9 +231,7 @@ impl VaireDbQueryHandler {
         params: &[ScalarValue],
         ctx: &ErrorContext,
     ) -> PgWireResult<Vec<PlannedWrite>> {
-        let quorum_size = self
-            .write_router
-            .compute_quorum_size(target.replication_factor);
+        let quorum_size = compute_quorum_size(target.replication_factor);
 
         let mut shard_rows: BTreeMap<usize, Vec<usize>> = BTreeMap::new();
         for (row_idx, key_value) in row_keys {
@@ -252,34 +248,6 @@ impl VaireDbQueryHandler {
             writes.push(self.plan_write(shard, &split, params, quorum_size, ctx)?);
         }
         Ok(writes)
-    }
-
-    /// Look up a table the MERGE names, reporting `42P01` when it does not exist.
-    fn require_table(&self, name: &str, ctx: &ErrorContext) -> PgWireResult<TableMeta> {
-        self.catalog
-            .get_table(name)
-            .map_err(|e| enrich_coordinator_error(&e, ctx, &self.catalog))?
-            .ok_or_else(|| {
-                let err = CoordinatorError::TableNotFound(name.to_string());
-                enrich_coordinator_error(&err, ctx, &self.catalog)
-            })
-    }
-
-    /// The shards of `table`, refusing a table that has none rather than silently
-    /// merging into nothing.
-    fn shards_of(&self, table: &TableMeta, ctx: &ErrorContext) -> PgWireResult<Vec<ShardMeta>> {
-        let shards = self
-            .catalog
-            .get_shards_for_table(&table.table_name)
-            .map_err(|e| enrich_coordinator_error(&e, ctx, &self.catalog))?;
-        if shards.is_empty() {
-            let err = CoordinatorError::ShardNotAssigned(format!(
-                "no shards for table {}",
-                table.table_name
-            ));
-            return Err(enrich_coordinator_error(&err, ctx, &self.catalog));
-        }
-        Ok(shards)
     }
 }
 
@@ -382,62 +350,21 @@ fn unsupported(message: String) -> pgwire::error::PgWireError {
 
 #[cfg(test)]
 mod tests {
+    use super::super::write_path_test_helper::{parse_one, user_error};
     use super::*;
-    use crate::catalog::{ColumnDef, ShardStrategy};
-    use crate::pgwire_handler::parser::parse_sql;
-    use crate::util::logical_shard_id;
-    use pgwire::error::PgWireError;
-
-    fn parse_one(sql: &str) -> Statement {
-        let mut stmts = parse_sql(sql).unwrap_or_else(|e| panic!("failed to parse `{sql}`: {e}"));
-        assert_eq!(stmts.len(), 1, "`{sql}` must parse to one statement");
-        stmts.remove(0)
-    }
-
-    /// The SQLSTATE and message a `PgWireError` reports to the client.
-    fn user_error(err: PgWireError) -> (String, String) {
-        match err {
-            PgWireError::UserError(info) => (info.code.clone(), info.message.clone()),
-            other => panic!("expected a user-facing error, got {other:?}"),
-        }
-    }
+    use crate::catalog::catalog_test_helper::{shard_meta, table_meta};
 
     fn table(name: &str, shard_key: &str, shard_count: u32) -> TableMeta {
-        TableMeta {
-            table_name: name.to_string(),
-            columns: ["id", "amount"]
-                .into_iter()
-                .map(|column| ColumnDef {
-                    name: column.to_string(),
-                    data_type: "INTEGER".to_string(),
-                    nullable: true,
-                    default_expr: String::new(),
-                })
-                .collect(),
-            shard_strategy: ShardStrategy::Hash as i32,
-            shard_key: shard_key.to_string(),
-            shard_count,
-            replication_factor: 1,
-            created_at: None,
-            anonymized_columns: Default::default(),
-            indexes: Vec::new(),
-            constraints: Vec::new(),
-        }
+        let mut meta = table_meta(name, &["id", "amount"], shard_key);
+        meta.shard_count = shard_count;
+        meta
     }
 
     /// `shard_count` shards of `table`, shard `i` primary on `nodes[i % len]` with
     /// no replicas.
     fn shards(table: &str, shard_count: u32, nodes: &[&str]) -> Vec<ShardMeta> {
         (0..shard_count)
-            .map(|bucket| ShardMeta {
-                shard_id: logical_shard_id(bucket),
-                table_name: table.to_string(),
-                primary_node_id: nodes[bucket as usize % nodes.len()].to_string(),
-                replica_node_ids: Vec::new(),
-                hash_bucket: bucket,
-                range_lower: String::new(),
-                range_upper: String::new(),
-            })
+            .map(|bucket| shard_meta(table, bucket, nodes[bucket as usize % nodes.len()], &[]))
             .collect()
     }
 

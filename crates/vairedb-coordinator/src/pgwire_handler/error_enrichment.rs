@@ -9,14 +9,14 @@ use std::sync::Arc;
 
 use datafusion::arrow::error::ArrowError;
 use datafusion::error::DataFusionError;
-use pgwire::error::{ErrorInfo, PgWireError};
+use pgwire::error::{ErrorInfo, PgWireError, PgWireResult};
 use vairedb_common::error::{
     TransportedError, TransportedVariant, VaireDbError, code_of_tagged_message,
     recover_transported_error, sanitize_message, sqlstate_for_code,
 };
 use vairedb_common::proto::vairedb::v1::VdbErrorCode;
 
-use crate::catalog::MetadataCatalog;
+use crate::catalog::{MetadataCatalog, ShardMeta, TableMeta};
 use crate::error::CoordinatorError;
 use crate::util::node_state_str;
 
@@ -46,15 +46,40 @@ impl ErrorContext {
     }
 }
 
+/// The `ErrorInfo` every path in this module reports, before any of them adds the
+/// context it happens to hold.
+///
+/// One place decides that severity is `ERROR`, that the SQLSTATE comes from the code
+/// and that the message carries the `[VDB-NNNN]` prefix. Written out at each of the
+/// four entry points — which is how this started — the three were free to disagree,
+/// and a client reading SQLSTATE from one and the prefix from another would have been
+/// told two different things about one failure.
+fn reported(code: VdbErrorCode, message: &str) -> ErrorInfo {
+    ErrorInfo::new(
+        "ERROR".to_string(),
+        sqlstate_for_code(code).to_string(),
+        VaireDbError::new(code, message).formatted_message(),
+    )
+}
+
+/// Report `raw` under `code`, after giving [`reclassify_transported_error`] the chance
+/// to recover a truer code from the text a transported error was rendered into.
+///
+/// The classifier is the caller's, because that is the only thing the untyped and the
+/// `DataFusionError` path differ by: one infers the code from substrings, the other
+/// reads it off the variant, and everything after that — recover, sanitize, format,
+/// name the table — is the same sequence and has to stay the same sequence.
+fn enrich_classified(raw: &str, code: VdbErrorCode, ctx: &ErrorContext) -> PgWireError {
+    let (code, message) = reclassify_transported_error(raw, code);
+    let mut info = reported(code, &sanitize_message(&message));
+    info.table = ctx.table_name.clone();
+    PgWireError::UserError(Box::new(info))
+}
+
 /// Construct a pgwire `UserError` from a `VdbErrorCode` and message, formatting
 /// the message with the `[VDB-NNNN]` code prefix and the matching SQLSTATE.
 pub fn make_vdb_error(code: VdbErrorCode, message: impl Into<String>) -> PgWireError {
-    let err = VaireDbError::new(code, message);
-    PgWireError::UserError(Box::new(ErrorInfo::new(
-        "ERROR".to_string(),
-        sqlstate_for_code(code).to_string(),
-        err.formatted_message(),
-    )))
+    PgWireError::UserError(Box::new(reported(code, &message.into())))
 }
 
 /// Enrich a typed `CoordinatorError` into a full pgwire error, classifying it
@@ -66,12 +91,9 @@ pub fn enrich_coordinator_error(
     catalog: &Arc<MetadataCatalog>,
 ) -> PgWireError {
     let (code, message) = classify_error(err);
-    let sqlstate = sqlstate_for_code(code).to_string();
-
-    let vdb_error = VaireDbError::new(code, &message);
-    let formatted = vdb_error.formatted_message();
-
-    let mut info = ErrorInfo::new("ERROR".to_string(), sqlstate, formatted);
+    // `classify_error` sanitizes what it returns; this is the one path whose message
+    // was written for a client rather than recovered from engine text.
+    let mut info = reported(code, &message);
     info.table = ctx.table_name.clone();
     info.detail = try_build_detail(err, ctx, catalog);
     info.hint = build_hint(err, ctx);
@@ -79,20 +101,53 @@ pub fn enrich_coordinator_error(
     PgWireError::UserError(Box::new(info))
 }
 
+/// The metadata of table `name`, reporting `42P01` when the catalog has no such table.
+///
+/// The read and its two enrichments are one operation, and six call sites across
+/// `dml`, `merge` and `copy` had each written it out: a `get_table` whose `Err` is a
+/// catalog failure and whose `Ok(None)` is a missing relation, both routed through the
+/// same [`ErrorContext`]. It lives here rather than beside any one of them because what
+/// it adds over [`MetadataCatalog::get_table`] is precisely the enrichment this module
+/// owns — and because the half that drifts is the second one: a site that enriches the
+/// catalog failure and then lets `None` fall through to the planner hands the client
+/// DataFusion's wording for a table VaireDB knows nothing about.
+pub fn require_table(
+    catalog: &Arc<MetadataCatalog>,
+    name: &str,
+    ctx: &ErrorContext,
+) -> PgWireResult<TableMeta> {
+    catalog
+        .get_table(name)
+        .map_err(|e| enrich_coordinator_error(&e, ctx, catalog))?
+        .ok_or_else(|| {
+            let err = CoordinatorError::TableNotFound(name.to_string());
+            enrich_coordinator_error(&err, ctx, catalog)
+        })
+}
+
+/// The shards of `table`, refusing a table that has none rather than letting a write
+/// dispatch to nowhere and report success for rows no node ever received.
+pub fn require_shards(
+    catalog: &Arc<MetadataCatalog>,
+    table: &TableMeta,
+    ctx: &ErrorContext,
+) -> PgWireResult<Vec<ShardMeta>> {
+    let shards = catalog
+        .shards_for_table(&table.table_name)
+        .map_err(|e| enrich_coordinator_error(&e, ctx, catalog))?;
+    if shards.is_empty() {
+        let err =
+            CoordinatorError::ShardNotAssigned(format!("no shards for table {}", table.table_name));
+        return Err(enrich_coordinator_error(&err, ctx, catalog));
+    }
+    Ok(shards)
+}
+
 /// Enrich an untyped (string-based) error, typically from the engine, by
 /// inferring a `VdbErrorCode` from its message substrings and sanitizing it.
 pub fn enrich_generic_error(e: &dyn Display, ctx: &ErrorContext) -> PgWireError {
     let raw = e.to_string();
-    let (code, message) = reclassify_transported_error(&raw, classify_generic_error_code(&raw));
-    let sqlstate = sqlstate_for_code(code).to_string();
-    let sanitized = sanitize_message(&message);
-
-    let vdb_error = VaireDbError::new(code, &sanitized);
-    let formatted = vdb_error.formatted_message();
-
-    let mut info = ErrorInfo::new("ERROR".to_string(), sqlstate, formatted);
-    info.table = ctx.table_name.clone();
-    PgWireError::UserError(Box::new(info))
+    enrich_classified(&raw, classify_generic_error_code(&raw), ctx)
 }
 
 /// Enrich a `DataFusionError` whose type is still in hand, classifying it from its
@@ -110,15 +165,7 @@ pub fn enrich_generic_error(e: &dyn Display, ctx: &ErrorContext) -> PgWireError 
 /// [`reclassify_transported_error`] is for: when it did not, the variant is recovered
 /// from the text the scheduler rendered it into.
 pub fn enrich_datafusion_error(e: &DataFusionError, ctx: &ErrorContext) -> PgWireError {
-    let raw = e.to_string();
-    let (code, message) = reclassify_transported_error(&raw, classify_datafusion_error_code(e));
-    let sqlstate = sqlstate_for_code(code).to_string();
-    let sanitized = sanitize_message(&message);
-
-    let vdb_error = VaireDbError::new(code, &sanitized);
-    let mut info = ErrorInfo::new("ERROR".to_string(), sqlstate, vdb_error.formatted_message());
-    info.table = ctx.table_name.clone();
-    PgWireError::UserError(Box::new(info))
+    enrich_classified(&e.to_string(), classify_datafusion_error_code(e), ctx)
 }
 
 /// Classify a [`DataFusionError`] by variant, refining within a variant only where
@@ -502,6 +549,19 @@ pub(crate) fn classify_generic_error_code(msg: &str) -> VdbErrorCode {
     }
 }
 
+/// Log `detail` for an operator and return `summary` as the client's message.
+///
+/// For the failures where those are the *same* sentence: the operator needs the redb
+/// page or the endpoint that failed, the client must not see it, and both describe one
+/// failure. Written out per arm the summary appeared twice, so a reworded client
+/// message and the log line that was supposed to correspond to it could drift apart —
+/// and the field naming already had, half the arms logging under `error` and half
+/// under `detail`.
+fn logged(detail: &dyn Display, summary: &str) -> String {
+    tracing::error!(error = %detail, "{summary}");
+    summary.to_string()
+}
+
 /// Map a `CoordinatorError` to its `VdbErrorCode` and a sanitized, client-safe
 /// message. Logs the underlying detail for operator diagnosis while returning a
 /// generic message so internal specifics (node IDs, storage internals) never leak.
@@ -532,11 +592,20 @@ pub(crate) fn classify_error(err: &CoordinatorError) -> (VdbErrorCode, String) {
                 sanitize_message(status.message())
             )
         }
+        // Not `logged`: an operator is told which transport failed, a client is told
+        // only that one did, and the two sentences are deliberately different.
         CoordinatorError::GrpcTransport(e) => {
             tracing::error!(error = %e, "gRPC transport failure");
             "failed to communicate with storage node".to_string()
         }
-        CoordinatorError::SqlParse(e) => format!("SQL syntax error: {}", e),
+        // `Display` already opens with "sql parser error", so this adds no prefix of
+        // its own. No client reaches this arm: the only producer of the variant is
+        // `parser::parse_sql`, and every one of its production callers renders the
+        // failure itself — `handler.rs` with `make_vdb_error(e.vdb_error_code(), …)`,
+        // the rest by naming the query they were building. The arm exists so a future
+        // caller that does propagate it reports the same sentence rather than a second
+        // wording, which is why it must stay a bare render.
+        CoordinatorError::SqlParse(e) => e.to_string(),
         // Already written for the client, and already naming what to write instead.
         CoordinatorError::Unsupported(msg) => msg.clone(),
         // PostgreSQL's own wording for the same bad input, which is the point of the
@@ -554,38 +623,17 @@ pub(crate) fn classify_error(err: &CoordinatorError) -> (VdbErrorCode, String) {
                 sanitize_message(&node_err.message)
             )
         }
-        CoordinatorError::CatalogTransaction(e) => {
-            tracing::error!(error = %e, "catalog transaction failed");
-            "catalog transaction failed".to_string()
-        }
-        CoordinatorError::CatalogStorage(e) => {
-            tracing::error!(error = %e, "catalog storage error");
-            "catalog storage error".to_string()
-        }
-        CoordinatorError::CatalogCommit(e) => {
-            tracing::error!(error = %e, "catalog commit failed");
-            "catalog commit failed".to_string()
-        }
-        CoordinatorError::Catalog(e) => {
-            tracing::error!(error = %e, "catalog error");
-            "catalog error".to_string()
-        }
-        CoordinatorError::CatalogTable(e) => {
-            tracing::error!(error = %e, "catalog table access failed");
-            "catalog table access failed".to_string()
-        }
+        CoordinatorError::CatalogTransaction(e) => logged(e, "catalog transaction failed"),
+        CoordinatorError::CatalogStorage(e) => logged(e, "catalog storage error"),
+        CoordinatorError::CatalogCommit(e) => logged(e, "catalog commit failed"),
+        CoordinatorError::Catalog(e) => logged(e, "catalog error"),
+        CoordinatorError::CatalogTable(e) => logged(e, "catalog table access failed"),
         CoordinatorError::NoAliveNodes => {
             "no alive nodes available for shard assignment".to_string()
         }
         CoordinatorError::Anonymization(msg) => msg.clone(),
-        CoordinatorError::Serialization(s) => {
-            tracing::error!(detail = %s, "internal serialization error");
-            "internal serialization error".to_string()
-        }
-        CoordinatorError::Internal(s) => {
-            tracing::error!(detail = %s, "internal error");
-            "internal error".to_string()
-        }
+        CoordinatorError::Serialization(s) => logged(s, "internal serialization error"),
+        CoordinatorError::Internal(s) => logged(s, "internal error"),
     };
     (code, sanitize_message(&message))
 }
@@ -609,7 +657,7 @@ pub(crate) fn try_build_detail(
         }
         CoordinatorError::ShardUnavailable(pid) => {
             let table_name = ctx.table_name.as_ref()?;
-            let shards = catalog.get_shards_for_table(table_name).ok()?;
+            let shards = catalog.shards_for_table(table_name).ok()?;
             let p = shards.iter().find(|p| p.shard_id == *pid)?;
             let node = catalog.get_node(&p.primary_node_id).ok()??;
             tracing::debug!(
@@ -707,295 +755,276 @@ pub(crate) fn build_hint(err: &CoordinatorError, ctx: &ErrorContext) -> Option<S
 
 #[cfg(test)]
 mod tests {
+    use super::super::write_path_test_helper::user_error;
     use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering};
+    use crate::catalog::catalog_test_helper::scratch_catalog;
 
-    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    fn make_catalog() -> Arc<MetadataCatalog> {
+        Arc::new(scratch_catalog("error_enrichment"))
+    }
 
-    fn temp_db_path() -> String {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
+    /// A real `tonic` transport failure, which is the only kind there is: the error has
+    /// no public constructor, so it has to come from a connect that genuinely fails.
+    fn transport_error() -> CoordinatorError {
+        let endpoint = tonic::transport::Endpoint::from_static("http://[::1]:0");
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("a current-thread runtime builds");
+        let failed = runtime.block_on(async {
+            endpoint
+                .connect()
+                .await
+                .expect_err("port 0 on the loopback refuses")
+        });
+        CoordinatorError::GrpcTransport(Box::new(failed))
+    }
+
+    /// A failure a core node reported, carrying the code the *node* chose — which is the
+    /// only thing classification reads, the node id and shard being detail for the log.
+    fn node_exec_failed(code: VdbErrorCode, message: &str) -> CoordinatorError {
+        CoordinatorError::NodeExecFailed(Box::new(crate::error::NodeError {
+            message: message.to_string(),
+            error_code: code as i32,
+            shard_id: "orders_shard0".to_string(),
+            node_id: "core-node-1".to_string(),
+        }))
+    }
+
+    /// Wrap `raised` in the framing the Ballista scheduler adds to a failed task —
+    /// measured on a live five-node cluster, and the shape every transported case below
+    /// is built on.
+    fn transported_task(raised: &str) -> String {
         format!(
-            "/tmp/vairedb_test_error_enrichment_unit_{}_{}.redb",
-            std::process::id(),
-            id
+            "Job 3QdcFzH failed: Job failed due to stage 1 failed: Task failed due to \
+             runtime execution error: DataFusionError({raised})"
         )
     }
 
-    fn make_catalog() -> Arc<MetadataCatalog> {
-        Arc::new(MetadataCatalog::open(&temp_db_path()).unwrap())
+    /// The SQLSTATE and message a client is sent for `err`.
+    fn enriched(err: &DataFusionError) -> (String, String) {
+        user_error(enrich_datafusion_error(err, &ErrorContext::default()))
     }
 
-    // --- classify_error tests ---
+    // --- classify_error ---
 
+    /// One row per `CoordinatorError` variant, asserting the **code** alone.
+    ///
+    /// Wording is a separate axis with its own tests below: a table that checked both
+    /// would have to be edited every time a sentence is reworded, and the edit is where
+    /// a silently-dropped code assertion hides.
     #[test]
-    fn test_classify_table_not_found() {
-        let err = CoordinatorError::TableNotFound("orders".to_string());
-        let (code, msg) = classify_error(&err);
-        assert_eq!(code, VdbErrorCode::TableNotFound);
-        assert!(msg.contains("orders"));
+    fn each_variant_reports_its_own_code() {
+        let cases = [
+            (
+                CoordinatorError::TableNotFound("orders".into()),
+                VdbErrorCode::TableNotFound,
+            ),
+            (
+                CoordinatorError::NodeNotFound("node-1".into()),
+                VdbErrorCode::NodeNotFound,
+            ),
+            (
+                CoordinatorError::ShardNotAssigned("shard0".into()),
+                VdbErrorCode::ShardNotAssigned,
+            ),
+            (
+                CoordinatorError::ShardUnavailable("shard3".into()),
+                VdbErrorCode::ShardUnavailable,
+            ),
+            (
+                CoordinatorError::QuorumNotReached { needed: 2, got: 1 },
+                VdbErrorCode::QuorumNotReached,
+            ),
+            // A gRPC status classifies by its *status code*, not by its message.
+            (
+                CoordinatorError::Grpc(Box::new(tonic::Status::not_found("gone"))),
+                VdbErrorCode::ShardNotFound,
+            ),
+            (
+                CoordinatorError::Grpc(Box::new(tonic::Status::unavailable("down"))),
+                VdbErrorCode::NodeUnavailable,
+            ),
+            (transport_error(), VdbErrorCode::NodeCommunicationError),
+            // A node's own code is reported unchanged, which is what lets a shard-local
+            // refusal reach the client as the thing the node called it.
+            (
+                node_exec_failed(VdbErrorCode::WriteConflict, "write conflict"),
+                VdbErrorCode::WriteConflict,
+            ),
+            (
+                node_exec_failed(VdbErrorCode::ShardNotFound, "shard missing"),
+                VdbErrorCode::ShardNotFound,
+            ),
+            (
+                node_exec_failed(VdbErrorCode::NodeShuttingDown, "shutting down"),
+                VdbErrorCode::NodeShuttingDown,
+            ),
+            (CoordinatorError::NoAliveNodes, VdbErrorCode::NoAliveNodes),
+            (
+                CoordinatorError::CatalogStorage(redb::StorageError::Corrupted("disk".into())),
+                VdbErrorCode::CatalogStorageError,
+            ),
+            (
+                CoordinatorError::Serialization("bad wire type".into()),
+                VdbErrorCode::SerializationError,
+            ),
+            (
+                CoordinatorError::Internal("oops".into()),
+                VdbErrorCode::InternalError,
+            ),
+        ];
+
+        for (err, expected) in cases {
+            assert_eq!(classify_error(&err).0, expected, "for {err:?}");
+        }
     }
 
+    /// The variants whose message is the answer: what the client asked about has to
+    /// survive into it, or the error names nothing.
     #[test]
-    fn test_classify_node_not_found() {
-        let err = CoordinatorError::NodeNotFound("node-1".to_string());
-        let (code, _) = classify_error(&err);
-        assert_eq!(code, VdbErrorCode::NodeNotFound);
-    }
-
-    #[test]
-    fn test_classify_shard_not_assigned() {
-        let err = CoordinatorError::ShardNotAssigned("shard0".to_string());
-        let (code, _) = classify_error(&err);
-        assert_eq!(code, VdbErrorCode::ShardNotAssigned);
-    }
-
-    #[test]
-    fn test_classify_quorum_not_reached() {
-        let err = CoordinatorError::QuorumNotReached { needed: 2, got: 1 };
-        let (code, msg) = classify_error(&err);
-        assert_eq!(code, VdbErrorCode::QuorumNotReached);
-        assert!(msg.contains("1/2"));
-    }
-
-    #[test]
-    fn test_classify_shard_unavailable() {
-        let err = CoordinatorError::ShardUnavailable("shard3".to_string());
-        let (code, _) = classify_error(&err);
-        assert_eq!(code, VdbErrorCode::ShardUnavailable);
-    }
-
-    #[test]
-    fn test_classify_grpc_not_found() {
-        let status = tonic::Status::not_found("gone");
-        let err = CoordinatorError::Grpc(Box::new(status));
-        let (code, _) = classify_error(&err);
-        assert_eq!(code, VdbErrorCode::ShardNotFound);
-    }
-
-    #[test]
-    fn test_classify_grpc_unavailable() {
-        let status = tonic::Status::unavailable("down");
-        let err = CoordinatorError::Grpc(Box::new(status));
-        let (code, _) = classify_error(&err);
-        assert_eq!(code, VdbErrorCode::NodeUnavailable);
-    }
-
-    #[test]
-    fn test_classify_grpc_transport() {
-        let endpoint = tonic::transport::Endpoint::from_static("http://[::1]:0");
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let transport_err = rt.block_on(async { endpoint.connect().await.unwrap_err() });
-        let err = CoordinatorError::GrpcTransport(Box::new(transport_err));
-        let (code, _) = classify_error(&err);
-        assert_eq!(code, VdbErrorCode::NodeCommunicationError);
-    }
-
-    #[test]
-    fn test_classify_node_exec_failed_write_conflict() {
-        use crate::error::NodeError;
-        let node_err = NodeError {
-            message: "write conflict".to_string(),
-            error_code: VdbErrorCode::WriteConflict as i32,
-            shard_id: "shard0".to_string(),
-            node_id: "node-1".to_string(),
-        };
-        let err = CoordinatorError::NodeExecFailed(Box::new(node_err));
-        let (code, _) = classify_error(&err);
-        assert_eq!(code, VdbErrorCode::WriteConflict);
-    }
-
-    #[test]
-    fn test_classify_node_exec_failed_shard_not_found() {
-        use crate::error::NodeError;
-        let node_err = NodeError {
-            message: "shard missing".to_string(),
-            error_code: VdbErrorCode::ShardNotFound as i32,
-            shard_id: "shard0".to_string(),
-            node_id: "node-1".to_string(),
-        };
-        let err = CoordinatorError::NodeExecFailed(Box::new(node_err));
-        let (code, _) = classify_error(&err);
-        assert_eq!(code, VdbErrorCode::ShardNotFound);
-    }
-
-    #[test]
-    fn test_classify_node_exec_failed_shutting_down() {
-        use crate::error::NodeError;
-        let node_err = NodeError {
-            message: "shutting down".to_string(),
-            error_code: VdbErrorCode::NodeShuttingDown as i32,
-            shard_id: "shard0".to_string(),
-            node_id: "node-1".to_string(),
-        };
-        let err = CoordinatorError::NodeExecFailed(Box::new(node_err));
-        let (code, _) = classify_error(&err);
-        assert_eq!(code, VdbErrorCode::NodeShuttingDown);
-    }
-
-    #[test]
-    fn test_classify_internal() {
-        let err = CoordinatorError::Internal("oops".to_string());
-        let (code, _) = classify_error(&err);
-        assert_eq!(code, VdbErrorCode::InternalError);
-    }
-
-    #[test]
-    fn test_classify_catalog_storage() {
-        let err = CoordinatorError::CatalogStorage(redb::StorageError::Corrupted(
-            "disk full".to_string(),
-        ));
-        let (code, msg) = classify_error(&err);
-        assert_eq!(code, VdbErrorCode::CatalogStorageError);
-        assert!(msg.contains("catalog storage error"));
-        assert!(!msg.contains("disk full"));
-    }
-
-    #[test]
-    fn test_classify_catalog_does_not_leak_redb_details() {
-        let err = CoordinatorError::CatalogStorage(redb::StorageError::Corrupted(
-            "metadata invalid".to_string(),
-        ));
-        let (code, msg) = classify_error(&err);
-        assert_eq!(code, VdbErrorCode::CatalogStorageError);
-        assert!(!msg.contains("metadata invalid"));
-        assert!(msg.contains("catalog storage error"));
-    }
-
-    #[test]
-    fn test_classify_no_alive_nodes() {
-        let err = CoordinatorError::NoAliveNodes;
-        let (code, msg) = classify_error(&err);
-        assert_eq!(code, VdbErrorCode::NoAliveNodes);
-        assert!(msg.contains("no alive nodes"));
-    }
-
-    #[test]
-    fn test_classify_grpc_transport_does_not_leak_details() {
-        let endpoint = tonic::transport::Endpoint::from_static("http://[::1]:0");
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let transport_err = rt.block_on(async { endpoint.connect().await.unwrap_err() });
-        let err = CoordinatorError::GrpcTransport(Box::new(transport_err));
-        let (_, msg) = classify_error(&err);
-        assert_eq!(msg, "failed to communicate with storage node");
-        assert!(!msg.contains("::1"));
-    }
-
-    #[test]
-    fn test_classify_node_exec_failed_does_not_leak_node_id() {
-        use crate::error::NodeError;
-        let node_err = NodeError {
-            message: "table 'orders_shard0' not found".to_string(),
-            error_code: VdbErrorCode::ShardNotFound as i32,
-            shard_id: "orders_shard0".to_string(),
-            node_id: "core-node-secret-1".to_string(),
-        };
-        let err = CoordinatorError::NodeExecFailed(Box::new(node_err));
-        let (_, msg) = classify_error(&err);
-        assert!(!msg.contains("core-node-secret-1"));
-        assert!(msg.contains("node execution failed"));
-    }
-
-    #[test]
-    fn test_classify_serialization_does_not_leak_prost_details() {
-        let err = CoordinatorError::Serialization(
-            "failed to decode: invalid wire type 6 at offset 42".to_string(),
+    fn a_message_names_what_the_client_asked_about() {
+        let named = |err: CoordinatorError| classify_error(&err).1;
+        assert!(named(CoordinatorError::TableNotFound("orders".into())).contains("orders"));
+        assert!(
+            named(CoordinatorError::QuorumNotReached { needed: 2, got: 1 }).contains("1/2"),
+            "the quorum message reports got/needed"
         );
-        let (code, msg) = classify_error(&err);
-        assert_eq!(code, VdbErrorCode::SerializationError);
-        assert!(!msg.contains("wire type"));
-        assert!(!msg.contains("offset 42"));
-        assert!(msg.contains("internal serialization error"));
+        assert!(named(CoordinatorError::NoAliveNodes).contains("no alive nodes"));
     }
 
-    // --- try_build_detail tests ---
-
+    /// The internal half of a classified error stays in the log. One row per producer of
+    /// detail a client must not be shown — a redb message, the endpoint that refused, a
+    /// node id, a prost wire offset — paired with the sentence it is replaced by.
     #[test]
-    fn test_try_build_detail_empty_catalog() {
+    fn a_message_reports_the_summary_and_never_the_internal_detail() {
+        let cases: [(CoordinatorError, &str, &[&str]); 4] = [
+            (
+                CoordinatorError::CatalogStorage(redb::StorageError::Corrupted(
+                    "metadata invalid".into(),
+                )),
+                "catalog storage error",
+                &["metadata invalid"],
+            ),
+            (
+                transport_error(),
+                "failed to communicate with storage node",
+                &["::1"],
+            ),
+            (
+                node_exec_failed(VdbErrorCode::ShardNotFound, "table 'orders' not found"),
+                "node execution failed",
+                &["core-node-1"],
+            ),
+            (
+                CoordinatorError::Serialization(
+                    "failed to decode: invalid wire type 6 at offset 42".into(),
+                ),
+                "internal serialization error",
+                &["wire type", "offset 42"],
+            ),
+        ];
+
+        for (err, summary, leaks) in cases {
+            let (_, message) = classify_error(&err);
+            assert!(message.contains(summary), "for {err:?}: {message}");
+            for leaked in leaks {
+                assert!(
+                    !message.contains(leaked),
+                    "{leaked:?} survived for {err:?}: {message}"
+                );
+            }
+        }
+    }
+
+    /// The one wording a parse failure is reported with, wherever it is reported from.
+    ///
+    /// No client reaches this arm today — see the comment beside it — but it used to
+    /// prefix `"SQL syntax error: "` onto a `Display` that already opened with
+    /// `"sql parser error"`, so the first caller to propagate one would have shown the
+    /// client the same thing twice. It now renders exactly what `handler.rs` sends.
+    #[test]
+    fn a_parse_failure_is_described_once() {
+        let err = CoordinatorError::SqlParse(crate::sqlparser::parser::ParserError::ParserError(
+            "Expected: an expression, found: FROM".into(),
+        ));
+        let (code, message) = classify_error(&err);
+        assert_eq!(code, VdbErrorCode::SqlSyntaxError);
+        assert_eq!(message, err.to_string());
+        assert_eq!(message.matches("parser error").count(), 1, "{message}");
+    }
+
+    // --- try_build_detail ---
+
+    /// Which errors get a `DETAIL` line, against a catalog with nothing registered.
+    ///
+    /// The zero counts are the point: the line is built from the *catalog*, not from the
+    /// error, so an empty cluster has to produce a truthful sentence rather than none.
+    #[test]
+    fn a_detail_is_built_only_where_the_catalog_has_something_to_add() {
         let catalog = make_catalog();
-        let err = CoordinatorError::QuorumNotReached { needed: 2, got: 1 };
-        let ctx = ErrorContext::default();
-        let detail = try_build_detail(&err, &ctx, &catalog);
-        assert!(detail.is_some());
-        assert!(detail.unwrap().contains("Alive nodes in cluster: 0"));
+        let cases: [(CoordinatorError, Option<&str>); 4] = [
+            (
+                CoordinatorError::QuorumNotReached { needed: 2, got: 1 },
+                Some("Alive nodes in cluster: 0"),
+            ),
+            (
+                CoordinatorError::NodeNotFound("node-x".into()),
+                Some("No alive nodes"),
+            ),
+            (CoordinatorError::TableNotFound("t".into()), None),
+            (transport_error(), None),
+        ];
+
+        for (err, expected) in cases {
+            let detail = try_build_detail(&err, &ErrorContext::default(), &catalog);
+            match expected {
+                Some(phrase) => assert!(
+                    detail.as_deref().is_some_and(|d| d.contains(phrase)),
+                    "for {err:?}: {detail:?}"
+                ),
+                None => assert!(detail.is_none(), "for {err:?}: {detail:?}"),
+            }
+        }
     }
 
-    #[test]
-    fn test_try_build_detail_node_not_found_empty() {
-        let catalog = make_catalog();
-        let err = CoordinatorError::NodeNotFound("node-x".to_string());
-        let ctx = ErrorContext::default();
-        let detail = try_build_detail(&err, &ctx, &catalog);
-        assert!(detail.is_some());
-        assert!(detail.unwrap().contains("No alive nodes"));
-    }
+    // --- build_hint ---
 
+    /// One row per hint branch: the error, the replication factor the context carries,
+    /// and the phrase the hint has to name so it tells someone what to do next.
     #[test]
-    fn test_try_build_detail_table_not_found_returns_none() {
-        let catalog = make_catalog();
-        let err = CoordinatorError::TableNotFound("t".to_string());
-        let ctx = ErrorContext::default();
-        let detail = try_build_detail(&err, &ctx, &catalog);
-        assert!(detail.is_none());
-    }
+    fn a_hint_names_something_actionable() {
+        let cases: [(CoordinatorError, Option<u32>, &str); 4] = [
+            (
+                CoordinatorError::TableNotFound("t".into()),
+                None,
+                "vairedb_catalog.tables",
+            ),
+            (
+                CoordinatorError::QuorumNotReached { needed: 2, got: 1 },
+                Some(3),
+                "Replication factor is 3",
+            ),
+            (
+                CoordinatorError::CatalogStorage(redb::StorageError::Corrupted("bad".into())),
+                None,
+                "metadata storage issue",
+            ),
+            (
+                CoordinatorError::NoAliveNodes,
+                None,
+                "Register at least one storage node",
+            ),
+        ];
 
-    #[test]
-    fn test_try_build_detail_grpc_transport_returns_none() {
-        let endpoint = tonic::transport::Endpoint::from_static("http://[::1]:0");
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        let transport_err = rt.block_on(async { endpoint.connect().await.unwrap_err() });
-        let err = CoordinatorError::GrpcTransport(Box::new(transport_err));
-        let catalog = make_catalog();
-        let ctx = ErrorContext::default();
-        let detail = try_build_detail(&err, &ctx, &catalog);
-        assert!(detail.is_none());
-    }
-
-    // --- build_hint tests ---
-
-    #[test]
-    fn test_build_hint_table_not_found() {
-        let err = CoordinatorError::TableNotFound("t".to_string());
-        let ctx = ErrorContext::default();
-        let hint = build_hint(&err, &ctx);
-        assert!(hint.is_some());
-        assert!(hint.unwrap().contains("vairedb_catalog.tables"));
-    }
-
-    #[test]
-    fn test_build_hint_quorum_with_rf() {
-        let err = CoordinatorError::QuorumNotReached { needed: 2, got: 1 };
-        let ctx = ErrorContext::default().with_replication(3);
-        let hint = build_hint(&err, &ctx);
-        assert!(hint.is_some());
-        assert!(hint.unwrap().contains("Replication factor is 3"));
-    }
-
-    #[test]
-    fn test_build_hint_catalog_errors() {
-        let err =
-            CoordinatorError::CatalogStorage(redb::StorageError::Corrupted("bad".to_string()));
-        let ctx = ErrorContext::default();
-        let hint = build_hint(&err, &ctx);
-        assert!(hint.is_some());
-        assert!(hint.unwrap().contains("metadata storage issue"));
-    }
-
-    #[test]
-    fn test_build_hint_no_alive_nodes() {
-        let err = CoordinatorError::NoAliveNodes;
-        let ctx = ErrorContext::default();
-        let hint = build_hint(&err, &ctx);
-        assert!(hint.is_some());
-        assert!(hint.unwrap().contains("Register at least one storage node"));
+        for (err, replication, expected) in cases {
+            let ctx = match replication {
+                Some(factor) => ErrorContext::default().with_replication(factor),
+                None => ErrorContext::default(),
+            };
+            let hint = build_hint(&err, &ctx).unwrap_or_else(|| panic!("{err:?} should hint"));
+            assert!(hint.contains(expected), "for {err:?}: {hint}");
+        }
     }
 
     // --- classify_generic_error_code tests ---
@@ -1004,7 +1033,7 @@ mod tests {
     /// `VdbErrorCode` its substring rules should produce. One row per branch of
     /// `classify_generic_error_code`; add a row when a branch is added.
     #[test]
-    fn test_classify_generic_error_code_mapping() {
+    fn each_substring_rule_classifies_the_text_it_was_written_for() {
         let cases: &[(&str, VdbErrorCode)] = &[
             ("table 'orders' not found", VdbErrorCode::TableNotFound),
             (
@@ -1108,63 +1137,43 @@ mod tests {
         }
     }
 
-    // --- ErrorContext builder tests ---
+    // --- ErrorContext ---
 
     #[test]
-    fn test_error_context_builder() {
+    fn a_context_carries_the_table_and_the_replication_factor() {
         let ctx = ErrorContext::for_table("orders").with_replication(3);
         assert_eq!(ctx.table_name.as_deref(), Some("orders"));
         assert_eq!(ctx.replication_factor, Some(3));
     }
 
-    // --- enrich tests ---
+    // --- enrich ---
 
+    /// Everything the typed path adds on top of the classification: the SQLSTATE, the
+    /// `[VDB-NNNN]` prefix, and the relation — which is the whole reason `ErrorContext`
+    /// is threaded this far, and which nothing used to check.
     #[test]
-    fn test_enrich_coordinator_error_produces_user_error() {
-        let catalog = make_catalog();
+    fn enriching_a_coordinator_error_reports_the_code_the_state_and_the_table() {
         let err = CoordinatorError::TableNotFound("orders".to_string());
-        let ctx = ErrorContext::for_table("orders");
-        let pgwire_err = enrich_coordinator_error(&err, &ctx, &catalog);
-        match pgwire_err {
-            pgwire::error::PgWireError::UserError(_) => {}
-            other => panic!("expected UserError, got: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_enrich_coordinator_error_contains_vdb_code() {
-        let catalog = make_catalog();
-        let err = CoordinatorError::TableNotFound("orders".to_string());
-        let ctx = ErrorContext::for_table("orders");
-        let pgwire_err = enrich_coordinator_error(&err, &ctx, &catalog);
-        match pgwire_err {
-            pgwire::error::PgWireError::UserError(info) => {
-                assert!(info.message.contains("[VDB-1000]"));
+        match enrich_coordinator_error(&err, &ErrorContext::for_table("orders"), &make_catalog()) {
+            PgWireError::UserError(info) => {
+                assert_eq!(info.code, "42P01");
+                assert!(info.message.contains("[VDB-1000]"), "{}", info.message);
+                assert_eq!(info.table.as_deref(), Some("orders"));
             }
-            other => panic!("expected UserError, got: {:?}", other),
+            other => panic!("expected UserError, got: {other:?}"),
         }
     }
 
+    /// An error with no recognizable substring is internal, and says so with the state a
+    /// driver reads as "the server, not your statement".
     #[test]
-    fn test_enrich_generic_error_produces_user_error() {
-        let ctx = ErrorContext::for_table("orders");
-        let pgwire_err = enrich_generic_error(&"something failed", &ctx);
-        match pgwire_err {
-            pgwire::error::PgWireError::UserError(_) => {}
-            other => panic!("expected UserError, got: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_enrich_generic_error_contains_vdb_code() {
-        let ctx = ErrorContext::for_table("orders");
-        let pgwire_err = enrich_generic_error(&"something failed", &ctx);
-        match pgwire_err {
-            pgwire::error::PgWireError::UserError(info) => {
-                assert!(info.message.contains("[VDB-5001]"));
-            }
-            other => panic!("expected UserError, got: {:?}", other),
-        }
+    fn enriching_an_unrecognized_error_reports_it_as_internal() {
+        let (sqlstate, message) = user_error(enrich_generic_error(
+            &"something failed",
+            &ErrorContext::default(),
+        ));
+        assert_eq!(sqlstate, "XX000");
+        assert!(message.contains("[VDB-5001]"), "{message}");
     }
 
     // --- enrich_datafusion_error / classify_datafusion_error_code ---
@@ -1329,24 +1338,17 @@ mod tests {
              volatility: Immutable }"
                 .into(),
         );
-        match enrich_datafusion_error(&err, &ErrorContext::for_table("t")) {
-            pgwire::error::PgWireError::UserError(info) => {
-                assert_eq!(info.code, "0A000");
-                assert!(!info.message.contains("type_signature"), "{}", info.message);
-                assert!(info.message.contains("Signature { … }"), "{}", info.message);
-            }
-            other => panic!("expected UserError, got: {other:?}"),
-        }
+        let (reported, message) = enriched(&err);
+        assert_eq!(reported, "0A000");
+        assert!(!message.contains("type_signature"), "{message}");
+        assert!(message.contains("Signature { … }"), "{message}");
     }
 
     /// A division by zero used to reach clients as `XX000`, which says the server broke.
     #[test]
     fn a_division_by_zero_reports_the_data_error_sqlstate() {
         let err = DataFusionError::ArrowError(Box::new(ArrowError::DivideByZero), None);
-        match enrich_datafusion_error(&err, &ErrorContext::default()) {
-            pgwire::error::PgWireError::UserError(info) => assert_eq!(info.code, "22012"),
-            other => panic!("expected UserError, got: {other:?}"),
-        }
+        assert_eq!(enriched(&err).0, "22012");
     }
 
     /// The same division by zero, but as it actually arrives from a five-node cluster:
@@ -1358,33 +1360,26 @@ mod tests {
     /// rather than trusting the wrapper it arrived under.
     #[test]
     fn a_transported_division_by_zero_reports_the_data_error_sqlstate() {
-        const BALLISTA: &str = "Job 3QdcFzH failed: Job failed due to stage 1 failed: Task \
-                                failed due to runtime execution error: \
-                                DataFusionError(Execution(\"ArrowError(DivideByZero)\"))";
+        let ballista = transported_task("Execution(\"ArrowError(DivideByZero)\")");
 
         for err in [
-            DataFusionError::Execution(BALLISTA.into()),
-            DataFusionError::Internal(BALLISTA.into()),
+            DataFusionError::Execution(ballista.clone()),
+            DataFusionError::Internal(ballista.clone()),
             DataFusionError::Context(
                 "collect".into(),
-                Box::new(DataFusionError::Execution(BALLISTA.into())),
+                Box::new(DataFusionError::Execution(ballista.clone())),
             ),
-            DataFusionError::External(Box::new(std::io::Error::other(BALLISTA))),
+            DataFusionError::External(Box::new(std::io::Error::other(ballista.clone()))),
         ] {
-            match enrich_datafusion_error(&err, &ErrorContext::default()) {
-                pgwire::error::PgWireError::UserError(info) => {
-                    assert_eq!(info.code, "22012", "for {err:?}");
-                    // `ArrowError::DivideByZero` carries no payload, so recovering it
-                    // leaves the bare Rust variant name where a message should be.
-                    assert!(
-                        info.message.ends_with("division by zero"),
-                        "for {err:?}: {}",
-                        info.message
-                    );
-                    assert!(!info.message.contains("Job "), "{}", info.message);
-                }
-                other => panic!("expected UserError, got: {other:?}"),
-            }
+            let (reported, message) = enriched(&err);
+            assert_eq!(reported, "22012", "for {err:?}");
+            // `ArrowError::DivideByZero` carries no payload, so recovering it leaves the
+            // bare Rust variant name where a message should be.
+            assert!(
+                message.ends_with("division by zero"),
+                "for {err:?}: {message}"
+            );
+            assert!(!message.contains("Job "), "{message}");
         }
     }
 
@@ -1399,17 +1394,9 @@ mod tests {
             ("invalid hexadecimal data: odd number of digits", "22023"),
             ("invalid input syntax for type bytea", "22P02"),
         ] {
-            let ballista = format!(
-                "Job 3QdcFzH failed: Job failed due to stage 1 failed: Task failed due to \
-                 runtime execution error: DataFusionError(Execution(\"{raised}\"))"
-            );
-            let err = DataFusionError::Internal(ballista);
-            match enrich_datafusion_error(&err, &ErrorContext::default()) {
-                pgwire::error::PgWireError::UserError(info) => {
-                    assert_eq!(info.code, want, "for {raised}");
-                }
-                other => panic!("expected UserError, got: {other:?}"),
-            }
+            let err =
+                DataFusionError::Internal(transported_task(&format!("Execution(\"{raised}\")")));
+            assert_eq!(enriched(&err).0, want, "for {raised}");
         }
     }
 
@@ -1420,10 +1407,7 @@ mod tests {
     #[test]
     fn a_transported_non_positive_nth_value_offset_reports_postgresqls_sqlstate() {
         const RAISED: &str = "argument of nth_value must be greater than zero";
-        let ballista = format!(
-            "Job 3QdcFzH failed: Job failed due to stage 1 failed: Task failed due to \
-             runtime execution error: DataFusionError(Execution(\"{RAISED}\"))"
-        );
+        let ballista = transported_task(&format!("Execution(\"{RAISED}\")"));
         for err in [
             DataFusionError::Execution(RAISED.into()),
             DataFusionError::Execution(ballista.clone()),
@@ -1432,31 +1416,9 @@ mod tests {
                 "collect".into(),
                 Box::new(DataFusionError::Execution(ballista.clone())),
             ),
-            DataFusionError::External(Box::new(std::io::Error::other(ballista))),
+            DataFusionError::External(Box::new(std::io::Error::other(ballista.clone()))),
         ] {
-            match enrich_datafusion_error(&err, &ErrorContext::default()) {
-                pgwire::error::PgWireError::UserError(info) => {
-                    assert_eq!(info.code, "22016", "for {err:?}");
-                }
-                other => panic!("expected UserError, got: {other:?}"),
-            }
-        }
-    }
-
-    /// Wrap `raised` in the framing the Ballista scheduler adds to a failed task —
-    /// measured on a live five-node cluster, and the shape every test below is built on.
-    fn transported_task(raised: &str) -> String {
-        format!(
-            "Job 3QdcFzH failed: Job failed due to stage 1 failed: Task failed due to \
-             runtime execution error: DataFusionError({raised})"
-        )
-    }
-
-    /// The SQLSTATE and message a client is sent for `err`.
-    fn enriched(err: &DataFusionError) -> (String, String) {
-        match enrich_datafusion_error(err, &ErrorContext::default()) {
-            pgwire::error::PgWireError::UserError(info) => (info.code, info.message),
-            other => panic!("expected UserError, got: {other:?}"),
+            assert_eq!(enriched(&err).0, "22016", "for {err:?}");
         }
     }
 
@@ -1597,65 +1559,35 @@ mod tests {
             VdbErrorCode::FeatureNotSupported,
             "percentile_disc with an array of fractions is not supported",
         );
-        match enrich_generic_error(
+        let (reported, message) = user_error(enrich_generic_error(
             &transported_task(&format!("Plan({raised:?})")),
             &ErrorContext::default(),
-        ) {
-            pgwire::error::PgWireError::UserError(info) => {
-                assert_eq!(info.code, "0A000");
-                assert!(
-                    info.message
-                        .ends_with("percentile_disc with an array of fractions is not supported"),
-                    "{}",
-                    info.message
-                );
-            }
-            other => panic!("expected UserError, got: {other:?}"),
-        }
-    }
-
-    // --- make_vdb_error tests ---
-
-    #[test]
-    fn test_make_vdb_error_formats_code_in_message() {
-        let err = make_vdb_error(VdbErrorCode::TableNotFound, "table 'orders' does not exist");
-        match err {
-            pgwire::error::PgWireError::UserError(info) => {
-                assert!(info.message.contains("[VDB-1000]"));
-                assert!(info.message.contains("orders"));
-                assert_eq!(info.code, "42P01");
-            }
-            other => panic!("expected UserError, got: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn test_make_vdb_error_table_already_exists() {
-        let err = make_vdb_error(
-            VdbErrorCode::TableAlreadyExists,
-            "table 'orders' already exists",
+        ));
+        assert_eq!(reported, "0A000");
+        assert!(
+            message.ends_with("percentile_disc with an array of fractions is not supported"),
+            "{message}"
         );
-        match err {
-            pgwire::error::PgWireError::UserError(info) => {
-                assert!(info.message.contains("[VDB-1005]"));
-                assert_eq!(info.code, "42P07");
-            }
-            other => panic!("expected UserError, got: {:?}", other),
-        }
     }
 
+    // --- make_vdb_error ---
+
+    /// The code reaches the client twice, as a message prefix and as a SQLSTATE, and
+    /// both have to be *that* code's: a client branching on one while a human reads the
+    /// other must not be shown two different failures. The caller's sentence is passed
+    /// through untouched, which is what makes this the path for a refusal the
+    /// coordinator worded itself.
     #[test]
-    fn test_make_vdb_error_column_already_exists() {
-        let err = make_vdb_error(
-            VdbErrorCode::ColumnAlreadyExists,
-            "column \"age\" already exists",
-        );
-        match err {
-            pgwire::error::PgWireError::UserError(info) => {
-                assert!(info.message.contains("[VDB-1006]"));
-                assert_eq!(info.code, "42701");
-            }
-            other => panic!("expected UserError, got: {:?}", other),
+    fn make_vdb_error_reports_the_code_as_both_a_prefix_and_a_sqlstate() {
+        for (code, prefix, sqlstate) in [
+            (VdbErrorCode::TableNotFound, "[VDB-1000]", "42P01"),
+            (VdbErrorCode::TableAlreadyExists, "[VDB-1005]", "42P07"),
+            (VdbErrorCode::ColumnAlreadyExists, "[VDB-1006]", "42701"),
+        ] {
+            let (reported, message) = user_error(make_vdb_error(code, "the client's sentence"));
+            assert_eq!(reported, sqlstate, "for {code:?}");
+            assert!(message.starts_with(prefix), "for {code:?}: {message}");
+            assert!(message.ends_with("the client's sentence"), "{message}");
         }
     }
 }

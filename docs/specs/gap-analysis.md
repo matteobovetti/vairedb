@@ -34,13 +34,13 @@ measured.
 
 | Axis | 🟡 | ⛔ | ❌ | 🚫 |
 |---|---:|---:|---:|---:|
-| Statements (§ 2.1) | 15 | — | 9 | 8 |
+| Statements (§ 2.1) | 15 | — | 10 | 8 |
 | Data types (§ 2.2) | 6 | — | — | 8 |
 | Aggregate functions (§ 2.3) | 2 | — | 3 | — |
 | Window functions (§ 2.4) | 1 | — | 5 | 1 |
 | Operators, literals, casts (§ 2.5) | 12 | — | 19 | — |
 | Joins and set operations (§ 2.6) | 2 | — | 4 | — |
-| **Total** | **38** | **—** | **40** | **17** |
+| **Total** | **38** | **—** | **41** | **17** |
 
 The read path's expression surface and type layer are closed, including live predicate and
 `LIMIT` push-down to the shards. § 2.2 has no ❌ left either: no value a shard can store is
@@ -86,7 +86,7 @@ nor settled, because the check simply does not exist.
 The same fragment therefore has two verdicts, and every expression fix has to be checked on
 both. Read-path rewrites live at **E2** (`pgwire_handler/pg_operators.rs`, `compat_rewrite.rs`,
 `pg_aggregate_widening.rs`, `pg_param_types.rs`, `column_labels.rs`, `anonymized_reads.rs`);
-write-path ones at **W3** (`write_sql_cl/dialect.rs`, `reject.rs`).
+write-path ones at **W3** (`write_sql_cl/duckdb_compat.rs`).
 
 Two invariants constrain every fix:
 
@@ -144,6 +144,7 @@ the gap; each is refused by name rather than silently under-applied.
 | `CREATE INDEX` / `DROP INDEX` | `UNIQUE` off the shard key; a `UNIQUE` index narrowed by `WHERE` or `NULLS NOT DISTINCT`; an unnamed index (nothing for `DROP` to resolve); an index over an expression. |
 | `CREATE SCHEMA` / `ALTER SCHEMA` / `DROP SCHEMA` | `CASCADE`, `AUTHORIZATION`; dropping `public` or a metadata schema. `sales.t` and `sales_t` cannot coexist (`42P07`), since the qualifier folds into the physical name. `ALTER SCHEMA`: every action but `RENAME TO` (`0A000`, a schema carries no properties of its own); renaming `public` or a metadata schema; renaming a schema that still holds a relation (`2BP01`) — the qualifier is part of each shard table's physical name, so moving the relations is the client's call. |
 | `CREATE VIEW` | `MATERIALIZED`; the dialect decorations (`TEMPORARY`, `WITH (…)`, `SECURE`, `CLUSTER BY`, `TO`, `COMMENT`, a typed column); a view over a metadata schema or named after a `pg_catalog` table; a cyclic definition. Views are read-only (`42809`). |
+| `UPDATE` | On a table with **anonymized** columns: a multi-column `SET (a, b) = (…)` naming one of them, and any assignment target that is not a bare column name. PostgreSQL has both forms; the coordinator hashes an anonymized value before the statement leaves it, and neither form offers a single value to hash — so each is refused by column name rather than passed over. It used to be passed over, which shipped the plaintext (§ 2.7 row 9). A single-column `SET` of the same column answers, and the multi-column form answers over columns the table does not anonymize. |
 | `MERGE INTO` | Any source but a co-located table sharded by the join column or an inline `VALUES` list; an `ON` that does not pin the shard key; `UPDATE SET <shard key>`; an `INSERT` that omits or contradicts it; `RETURNING`; per-action `WHERE`; `NOT MATCHED BY SOURCE` over a `VALUES` source; a merge into a table with anonymized columns. |
 | Transactions | Inside a block: `UPDATE`/`DELETE` (unknowable row count), DDL, and reads of a table the block has written. Writes buffer in the coordinator and ship at `COMMIT` as one atomic batch per node set. Isolation levels are accepted and ignored. A block spanning node sets is refused at `COMMIT` unless `allow_cross_shard_transactions`; a partial multi-shard write reports `40003` with how much was written. |
 | `SET` | `search_path` **by name** (`0A000`); `SET LOCAL`, `SET ROLE`, `SET SESSION AUTHORIZATION`, `SET TRANSACTION`, `SET NAMES`. A value outside the set the coordinator's behaviour already matches is refused **by value** (`22023`) naming what VaireDB does instead. Unknown parameter `42704`, startup-fixed `55P02`. |
@@ -330,13 +331,19 @@ answer.
 | ❌ The `USING` shapes three names cannot fit in two fields | `0A000`. A `FULL`/`RIGHT JOIN … USING (c)` reached by a qualifier is respelled so each side reports its own key, which leaves two shapes refused, each naming the spelling that answers: a wildcard beside a qualified key, and the merged key beside the same key per side under **one** name — PostgreSQL answers that with two result columns both called `c`, and a `DFSchema` holds neither two fields of a name nor an unqualified `c` beside a qualified `l.c`. |
 | ❌ A bare `USING` / `NATURAL` key in `WHERE` over a side a rewrite cannot read | `42703`. The bare key is rewritten into the expression PostgreSQL's merged column *is*, which needs to know which side to name. Three shapes it cannot: a left side that is itself a join, two joins in one query block sharing a key name, and a key reached from a nested block. PostgreSQL resolves all three; the qualified spelling answers here. |
 
-### 2.7 Silently wrong (⛔) — all eight, all closed
+### 2.7 Silently wrong (⛔) — all nine, all closed
 
 The dangerous class: a plausible answer that is not PostgreSQL's, with no error and no
-warning. This list was the whole of it, and **all eight rows are now closed** — each fix is in
-the code and pinned by its own test. Row 7's last
-shape, the correlated `NOT IN`, is closed as the refusal now listed in § 2.6; everything else
-answers what PostgreSQL answers.
+warning. **All nine rows are now closed** — each fix is in the code and pinned by its own test.
+Row 7's last shape, the correlated `NOT IN`, is closed as the refusal now listed in § 2.6; row 9
+as the one in § 2.1; everything else answers what PostgreSQL answers.
+
+Rows 1–8 were the whole of the class as first measured on the six axes. Row 9 was not: it was
+found later, by reading a module rather than by running a query, and it sat on an axis the
+census does not enumerate — what a *write* does to a column the table declares anonymized. That
+is the standing lesson of this section. A ⛔ row is invisible by construction, so the census
+bounds only what was looked at; a rule stated in one branch of a function and not the other is
+where the next one will be.
 
 The table is kept as the census **as first measured**, and deliberately not deleted: a row's
 shape is the record of why it was invisible, which is what § 5's rule for a ⛔ test is derived
@@ -354,6 +361,7 @@ a write is rendered back to SQL text and executed verbatim by a shard.
 | 6 | `nth_value(x, 0)` | **NULL for every row** | `22016 argument of nth_value must be greater than zero` | One guard upstream, and the narrowest row here. Correct for `n ≥ 1`; negative `n` is a deliberate superset (§ 4). |
 | 7 | `HAVING max(k) NOT IN (SELECT …)`, and `WHERE k NOT IN (<correlated subquery>)` | **one row too many** — the one whose key is NULL | the NULL-keyed row excluded | The two shapes the null-aware `NOT IN` respelling cannot enter: DataFusion will not plan a correlated subquery whose outer reference is an aggregate of the group, and a derived table cannot see the outer row without `LATERAL`. Everywhere else — `WHERE`, `HAVING`, `QUALIFY`, `ON`, through `AND`/`OR`, under a `NOT` — `NOT IN` is null-correct. `NOT EXISTS` expresses both correctly today. |
 | 8 | `SELECT a.id, b.id FROM a FULL JOIN b USING (id)` — the key reached by an **explicit qualifier** | the merged `COALESCE` value under *both* qualifiers | the raw `a.id` and `b.id`, NULL where unmatched | The unqualified `id` and `SELECT *` are correct. PostgreSQL's join output has three addressable names (`id`, `a.id`, `b.id`) where a DataFusion schema has two fields, so the merged value has to occupy whichever fields every other consumer reads. Rare and expert; the `ON` spelling with the client's own `COALESCE` answers all three exactly. |
+| 9 | `UPDATE t SET (email, name) = ('a@x.com', 'Alice')` where `email` is **anonymized** | the row written, with `email` holding the **plaintext** | — (PostgreSQL has no anonymization; the contract here is VaireDB's own: an anonymized column is stored as a digest) | Not a wrong *answer* but a wrong *write*, and the only row of this class that breaches a confidentiality property rather than a semantic one: the plaintext reaches a storage node and persists there. The multi-column assignment target was skipped by the rewrite, which hashes per assignment and found no single column name to match. The single-column `SET` of the same column was, and is, hashed correctly — which is why it was invisible. Closed as a refusal (§ 2.1); the rule the other branch of the same function already stated is now shared by both. |
 
 ---
 
@@ -480,7 +488,7 @@ no error occurred — a silent-wrong-answer gap is invisible to an error-shape a
 | `sql_command_unsupported.rs` | Every 🚫 and ❌ statement row, plus `COPY`'s streaming pair and its Parquet round trip |
 | `sql_join_gaps.rs` | § 2.6 and § 2.7 rows 7–8 |
 | `data_types_round_trips.rs`, `data_types_dialect_gaps.rs` | § 2.2, both wire formats |
-| `anonymization.rs` | The refusals in § 2.4 and § 2.6, beside the reads that must keep answering |
+| `anonymization.rs` | The refusals in § 2.1, § 2.4 and § 2.6, beside the reads and writes that must keep answering |
 | `errors.rs` | The rejection points of § 1.2 and the classes of § 1.3, including a refusal raised on a core node |
 | `extended_protocol.rs` | `Describe`-time result and parameter OIDs — what § 2.4's bind-parameter row is measured over |
 | `shard_key_hazards.rs`, `identifier_rewrite.rs`, `concurrency.rs`, `sharding.rs`, `shard_routing.rs`, `replication_fault_tolerance.rs` | The sharding rules in § 3.4 |

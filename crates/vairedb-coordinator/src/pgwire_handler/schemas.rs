@@ -41,6 +41,7 @@ use pgwire::error::PgWireResult;
 use vairedb_common::proto::vairedb::v1::VdbErrorCode;
 
 use crate::catalog::SchemaMeta;
+use crate::pgwire_handler::ddl::one_object_at_a_time;
 use crate::pgwire_handler::error_enrichment::{
     ErrorContext, enrich_coordinator_error, make_vdb_error,
 };
@@ -336,6 +337,36 @@ fn reserved_schema(name: &str) -> bool {
     name == DEFAULT_SCHEMA || METADATA_SCHEMAS.contains(&name)
 }
 
+/// Refuse a [`reserved_schema`], saying which kind it is and why that blocks `verb`.
+///
+/// `DROP SCHEMA` and `ALTER SCHEMA ... RENAME` both have to refuse these, and for the
+/// same two reasons: `public` is a premise of the namespace rather than a record in it,
+/// and a metadata schema is VaireDB's own catalog. Only the past participle differed
+/// between the two copies of this check — pass `"dropped"` or `"renamed"`.
+///
+/// Separate from [`reserved_schema`] because a client told only "reserved" learns
+/// nothing about which of the two it hit, and separate from
+/// [`VaireDbQueryHandler::require_schema_exists`] because that one is not this check:
+/// creating a relation *in* `public` is allowed, so `public` passes there and fails here.
+fn reject_reserved_schema(name: &str, verb: &str) -> PgWireResult<()> {
+    if name == DEFAULT_SCHEMA {
+        return Err(make_vdb_error(
+            VdbErrorCode::FeatureNotSupported,
+            format!(
+                "schema \"{DEFAULT_SCHEMA}\" is the default namespace and cannot be {verb}: \
+                 every relation with no schema qualifier lives in it"
+            ),
+        ));
+    }
+    if METADATA_SCHEMAS.contains(&name) {
+        return Err(make_vdb_error(
+            VdbErrorCode::FeatureNotSupported,
+            format!("schema \"{name}\" holds VaireDB's own metadata and cannot be {verb}"),
+        ));
+    }
+    Ok(())
+}
+
 fn schema_already_exists(name: &str) -> pgwire::error::PgWireError {
     make_vdb_error(
         VdbErrorCode::SchemaAlreadyExists,
@@ -460,11 +491,7 @@ fn plan_drop_schema(stmt: &Statement) -> PgWireResult<DropSchemaRequest> {
     }
 
     if names.len() > 1 {
-        return Err(make_vdb_error(
-            VdbErrorCode::FeatureNotSupported,
-            "DROP SCHEMA with more than one schema is not supported by VaireDB; drop them one at \
-             a time",
-        ));
+        return Err(one_object_at_a_time("DROP SCHEMA", "schema"));
     }
 
     let name = names.first().ok_or_else(|| {
@@ -472,21 +499,7 @@ fn plan_drop_schema(stmt: &Statement) -> PgWireResult<DropSchemaRequest> {
     })?;
     let name = single_schema_ident(name, "DROP SCHEMA")?;
 
-    if name == DEFAULT_SCHEMA {
-        return Err(make_vdb_error(
-            VdbErrorCode::FeatureNotSupported,
-            format!(
-                "schema \"{DEFAULT_SCHEMA}\" is the default namespace and cannot be dropped: \
-                 every relation with no schema qualifier lives in it"
-            ),
-        ));
-    }
-    if METADATA_SCHEMAS.contains(&name.as_str()) {
-        return Err(make_vdb_error(
-            VdbErrorCode::FeatureNotSupported,
-            format!("schema \"{name}\" holds VaireDB's own metadata and cannot be dropped"),
-        ));
-    }
+    reject_reserved_schema(&name, "dropped")?;
 
     Ok(DropSchemaRequest {
         name,
@@ -566,21 +579,7 @@ fn plan_alter_schema(stmt: &Statement) -> PgWireResult<AlterSchemaRequest> {
     };
 
     let name = single_schema_ident(&alter.name, "ALTER SCHEMA")?;
-    if name == DEFAULT_SCHEMA {
-        return Err(make_vdb_error(
-            VdbErrorCode::FeatureNotSupported,
-            format!(
-                "schema \"{DEFAULT_SCHEMA}\" is the default namespace and cannot be renamed: \
-                 every relation with no schema qualifier lives in it"
-            ),
-        ));
-    }
-    if METADATA_SCHEMAS.contains(&name.as_str()) {
-        return Err(make_vdb_error(
-            VdbErrorCode::FeatureNotSupported,
-            format!("schema \"{name}\" holds VaireDB's own metadata and cannot be renamed"),
-        ));
-    }
+    reject_reserved_schema(&name, "renamed")?;
 
     Ok(AlterSchemaRequest {
         name,
@@ -742,12 +741,8 @@ pub(super) fn rename_within_schema(key: &str, new_relation: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    use super::super::write_path_test_helper::parse_one;
     use super::*;
-    use crate::pgwire_handler::parser::parse_sql;
-
-    fn parse_one(sql: &str) -> Statement {
-        parse_sql(sql).unwrap().into_iter().next().unwrap()
-    }
 
     fn create_error(sql: &str) -> String {
         plan_create_schema(&parse_one(sql))

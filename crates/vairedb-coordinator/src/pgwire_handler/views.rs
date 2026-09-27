@@ -40,7 +40,7 @@ use pgwire::error::PgWireResult;
 use vairedb_common::proto::vairedb::v1::VdbErrorCode;
 
 use crate::catalog::{MetadataCatalog, ViewMeta};
-use crate::pgwire_handler::ddl::already_exists;
+use crate::pgwire_handler::ddl::{already_exists, no_referential_actions, one_object_at_a_time};
 use crate::pgwire_handler::error_enrichment::{
     ErrorContext, enrich_coordinator_error, make_vdb_error,
 };
@@ -702,17 +702,11 @@ fn plan_drop_view(stmt: &Statement) -> PgWireResult<DropViewRequest> {
     };
 
     if names.len() > 1 {
-        return Err(make_vdb_error(
-            VdbErrorCode::FeatureNotSupported,
-            "DROP VIEW with more than one view is not supported by VaireDB; drop each view with its own statement",
-        ));
+        return Err(one_object_at_a_time("DROP VIEW", "view"));
     }
 
     if *cascade || *restrict {
-        return Err(make_vdb_error(
-            VdbErrorCode::FeatureNotSupported,
-            "DROP VIEW ... CASCADE/RESTRICT is not supported by VaireDB; the catalog tracks no dependent objects",
-        ));
+        return Err(no_referential_actions("DROP VIEW"));
     }
 
     let name = names
@@ -731,37 +725,29 @@ fn plan_drop_view(stmt: &Statement) -> PgWireResult<DropViewRequest> {
     })
 }
 
-/// `0A000` for a `CREATE VIEW` form the coordinator will not honor, used by the
-/// tests to name the refusal they expect.
-#[cfg(test)]
-fn refusal_message(sql: &str) -> String {
-    let stmt = parse_one(sql);
-    let Statement::CreateView(create) = &stmt else {
-        panic!("`{sql}` is not a CREATE VIEW");
-    };
-    plan_create_view(create)
-        .err()
-        .unwrap_or_else(|| panic!("`{sql}` should be refused"))
-        .to_string()
-}
-
-#[cfg(test)]
-fn parse_one(sql: &str) -> Statement {
-    crate::pgwire_handler::parser::parse_sql(sql)
-        .unwrap_or_else(|e| panic!("`{sql}` should parse: {e}"))
-        .into_iter()
-        .next()
-        .unwrap_or_else(|| panic!("`{sql}` parsed to no statement"))
-}
-
 #[cfg(test)]
 mod tests {
+    use super::super::write_path_test_helper::{parse_one, user_error};
     use super::*;
+    use crate::catalog::catalog_test_helper::table_meta;
+
+    /// `0A000` for a `CREATE VIEW` form the coordinator will not honor, used by the
+    /// tests to name the refusal they expect.
+    fn refusal_message(sql: &str) -> String {
+        let stmt = parse_one(sql);
+        let Statement::CreateView(create) = &stmt else {
+            panic!("`{sql}` is not a CREATE VIEW");
+        };
+        plan_create_view(create)
+            .err()
+            .unwrap_or_else(|| panic!("`{sql}` should be refused"))
+            .to_string()
+    }
 
     /// A catalog in a temp file, for the expansion tests: they need real stored
     /// views, and the point lookups are what expansion actually does.
     fn catalog_with(views: &[(&str, &str)]) -> Arc<MetadataCatalog> {
-        let catalog = crate::pgwire_handler::test_catalog::scratch_catalog("views");
+        let catalog = crate::catalog::catalog_test_helper::scratch_catalog("views");
         for (name, definition) in views {
             catalog
                 .put_view(&ViewMeta {
@@ -966,16 +952,7 @@ mod tests {
 
     // --- the handlers, against a real catalog ---
 
-    use crate::catalog::TableMeta;
     use crate::pgwire_handler::handler::VaireDbQueryHandler;
-    use pgwire::error::PgWireError;
-
-    fn reported(err: PgWireError) -> (String, String) {
-        match err {
-            PgWireError::UserError(info) => (info.code.clone(), info.message.clone()),
-            other => panic!("expected a user-facing error, got {other:?}"),
-        }
-    }
 
     /// Run a view statement the way the simple-query path does: classify it, then
     /// dispatch. Returns the SQLSTATE and message of whatever it refused.
@@ -990,7 +967,7 @@ mod tests {
     }
 
     async fn refusal(handler: &VaireDbQueryHandler, sql: &str) -> (String, String) {
-        reported(
+        user_error(
             run(handler, sql)
                 .await
                 .err()
@@ -1008,13 +985,7 @@ mod tests {
     fn register_table(handler: &VaireDbQueryHandler, name: &str) {
         handler
             .catalog
-            .put_table(&TableMeta {
-                table_name: name.to_string(),
-                shard_key: "id".to_string(),
-                shard_count: 2,
-                replication_factor: 1,
-                ..Default::default()
-            })
+            .put_table(&table_meta(name, &["id"], "id"))
             .unwrap();
     }
 
@@ -1259,7 +1230,7 @@ mod tests {
             ("TRUNCATE v", "no rows of its own"),
             ("CREATE INDEX idx ON v (id)", "only be created on a table"),
         ] {
-            let (code, message) = reported(
+            let (code, message) = user_error(
                 view_as_table(&handler, sql)
                     .err()
                     .unwrap_or_else(|| panic!("`{sql}` should be refused")),
@@ -1288,7 +1259,7 @@ mod tests {
             .await
             .unwrap();
 
-        let (code, message) = reported(
+        let (code, message) = user_error(
             handler
                 .handle_drop_index(&parse_one("DROP INDEX v"))
                 .await
@@ -1311,13 +1282,7 @@ mod tests {
 
         let claimed = handler
             .catalog
-            .create_table_if_absent(&TableMeta {
-                table_name: "v".to_string(),
-                shard_key: "id".to_string(),
-                shard_count: 1,
-                replication_factor: 1,
-                ..Default::default()
-            })
+            .create_table_if_absent(&table_meta("v", &["id"], "id"))
             .unwrap();
         assert!(!claimed, "a view already holds the name \"v\"");
     }

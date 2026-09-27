@@ -47,7 +47,10 @@ use pgwire::error::PgWireResult;
 use vairedb_common::proto::vairedb::v1::VdbErrorCode;
 
 use crate::catalog::{IndexMeta, TableMeta};
-use crate::pgwire_handler::ddl::{already_exists, fail_if_unreachable};
+use crate::pgwire_handler::ddl::{
+    already_exists, fail_if_unreachable, no_referential_actions, no_table_name,
+    one_object_at_a_time,
+};
 use crate::pgwire_handler::error_enrichment::{
     ErrorContext, enrich_coordinator_error, make_vdb_error,
 };
@@ -79,12 +82,7 @@ impl VaireDbQueryHandler {
             ));
         };
 
-        let table_name = canonical_table_name(&create.table_name).ok_or_else(|| {
-            make_vdb_error(
-                VdbErrorCode::SqlSyntaxError,
-                "could not determine table name",
-            )
-        })?;
+        let table_name = canonical_table_name(&create.table_name).ok_or_else(no_table_name)?;
         let ctx = ErrorContext::for_table(&table_name);
 
         let mut table_meta = match self.catalog.get_table(&table_name) {
@@ -120,12 +118,12 @@ impl VaireDbQueryHandler {
 
         let shards = self
             .catalog
-            .get_shards_for_table(&table_name)
+            .shards_for_table(&table_name)
             .map_err(|e| enrich_coordinator_error(&e, &ctx, &self.catalog))?;
 
         let node_addresses = self
             .catalog
-            .get_node_address_map()
+            .node_address_map()
             .map_err(|e| enrich_coordinator_error(&e, &ctx, &self.catalog))?;
 
         let failed = self
@@ -230,12 +228,12 @@ impl VaireDbQueryHandler {
 
         let shards = self
             .catalog
-            .get_shards_for_table(&table_name)
+            .shards_for_table(&table_name)
             .map_err(|e| enrich_coordinator_error(&e, &ctx, &self.catalog))?;
 
         let node_addresses = self
             .catalog
-            .get_node_address_map()
+            .node_address_map()
             .map_err(|e| enrich_coordinator_error(&e, &ctx, &self.catalog))?;
 
         let failed = self
@@ -436,19 +434,11 @@ fn plan_drop_index(stmt: &Statement) -> PgWireResult<DropIndexRequest> {
     };
 
     if names.len() > 1 {
-        return Err(make_vdb_error(
-            VdbErrorCode::FeatureNotSupported,
-            "DROP INDEX with more than one index is not supported by VaireDB; \
-             drop each index with its own statement",
-        ));
+        return Err(one_object_at_a_time("DROP INDEX", "index"));
     }
 
     if *cascade || *restrict {
-        return Err(make_vdb_error(
-            VdbErrorCode::FeatureNotSupported,
-            "DROP INDEX ... CASCADE/RESTRICT is not supported by VaireDB; \
-             the catalog tracks no dependent objects",
-        ));
+        return Err(no_referential_actions("DROP INDEX"));
     }
 
     if table.is_some() {
@@ -605,18 +595,11 @@ fn shard_local_create_index_sql(
 
 #[cfg(test)]
 mod tests {
+    use super::super::write_path_test_helper::{parse_one, user_error};
     use super::*;
-    use crate::catalog::{ColumnDef, ShardStrategy};
-    use crate::pgwire_handler::parser::parse_sql;
-    use pgwire::error::PgWireError;
+    use crate::catalog::catalog_test_helper::table_meta;
 
     /// Parse a single statement, panicking on anything else.
-    fn parse_one(sql: &str) -> Statement {
-        let mut stmts = parse_sql(sql).unwrap_or_else(|e| panic!("failed to parse `{sql}`: {e}"));
-        assert_eq!(stmts.len(), 1, "`{sql}` must parse to one statement");
-        stmts.remove(0)
-    }
-
     /// The `CreateIndex` of a single `CREATE INDEX`, panicking on anything else.
     fn parse_create_index(sql: &str) -> CreateIndex {
         match parse_one(sql) {
@@ -625,34 +608,10 @@ mod tests {
         }
     }
 
-    /// The SQLSTATE and message a `PgWireError` reports to the client.
-    fn user_error(err: PgWireError) -> (String, String) {
-        match err {
-            PgWireError::UserError(info) => (info.code.clone(), info.message.clone()),
-            other => panic!("expected a user-facing error, got {other:?}"),
-        }
-    }
-
     /// A three-column table sharded on `customer_id`, so a UNIQUE index on the
     /// shard key and one off it are both expressible.
     fn sample_table() -> TableMeta {
-        TableMeta {
-            table_name: "orders".to_string(),
-            columns: ["id", "customer_id", "amount"]
-                .into_iter()
-                .map(|name| ColumnDef {
-                    name: name.to_string(),
-                    data_type: "INTEGER".to_string(),
-                    nullable: true,
-                    default_expr: String::new(),
-                })
-                .collect(),
-            shard_strategy: ShardStrategy::Hash as i32,
-            shard_key: "customer_id".to_string(),
-            shard_count: 2,
-            replication_factor: 1,
-            ..Default::default()
-        }
+        table_meta("orders", &["id", "customer_id", "amount"], "customer_id")
     }
 
     /// The index metadata a `CREATE INDEX` on [`sample_table`] would record.

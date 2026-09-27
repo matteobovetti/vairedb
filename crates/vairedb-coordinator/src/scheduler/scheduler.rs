@@ -23,6 +23,7 @@ use datafusion::common::TableReference;
 use datafusion::datasource::{TableProvider, TableType};
 use datafusion::execution::SessionState;
 use datafusion::execution::context::SessionContext;
+use datafusion::execution::session_state::SessionStateBuilder;
 use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion::prelude::SessionConfig;
@@ -36,9 +37,8 @@ use crate::column_types::column_field;
 use crate::error::{CoordinatorError, Result};
 use crate::pgwire_handler::query_router;
 
-use super::codec::VairePhysicalCodec;
 use super::filter_pushdown::OpaqueTextColumns;
-use super::logical_codec::VaireLogicalCodec;
+use super::plan_codec::{VaireLogicalCodec, VairePhysicalCodec};
 use super::remote_scan_exec::RemoteDuckDbScanExec;
 
 /// Handle to a running embedded Ballista scheduler, holding its bound address
@@ -62,21 +62,14 @@ pub async fn start_scheduler(
     catalog: Arc<MetadataCatalog>,
     listen_addr: &str,
 ) -> Result<BallistaSchedulerHandle> {
-    let session_config = with_postgres_sql_options(
-        SessionConfig::new_with_ballista()
-            .with_ballista_logical_extension_codec(Arc::new(VaireLogicalCodec))
-            .with_ballista_physical_extension_codec(Arc::new(VairePhysicalCodec::new())),
-    );
-
     // Use a regular DataFusion session for the scheduler's internal planning.
     // new_ballista_state installs a distributed query planner that wraps plans in
     // DistributedQueryExec — the scheduler must plan locally so that
     // SchedulerTableProvider.scan() produces RemoteDuckDbScanExec instead.
     let session_state = {
-        use datafusion::execution::session_state::SessionStateBuilder;
         let mut state = SessionStateBuilder::new()
             .with_default_features()
-            .with_config(session_config)
+            .with_config(ballista_session_config())
             // Both appended after the defaults, so they see the distribution and the
             // ordering the built-in rules settled on, and both repair a shape that is
             // valid as one plan and wrong once Ballista cuts it into stages — see
@@ -97,17 +90,10 @@ pub async fn start_scheduler(
     let addr = start_scheduler_on_addr(&session_state, listen_addr).await?;
 
     let scheduler_url = format!("http://{}", addr);
-    let client_config = with_postgres_sql_options(
-        SessionConfig::new_with_ballista()
-            .with_ballista_logical_extension_codec(Arc::new(VaireLogicalCodec))
-            .with_ballista_physical_extension_codec(Arc::new(VairePhysicalCodec::new()))
-            .with_information_schema(true),
-    );
     let client_state = {
-        use datafusion::execution::session_state::SessionStateBuilder;
         let base = SessionStateBuilder::new()
             .with_default_features()
-            .with_config(client_config)
+            .with_config(ballista_session_config().with_information_schema(true))
             // Not for correctness — this state does not plan the distributed read, it ships
             // the logical plan to the scheduler, which plans it with the state above. It is
             // for `EXPLAIN`, which *is* planned here and would otherwise show a probe side
@@ -159,6 +145,21 @@ pub async fn start_scheduler(
     })
 }
 
+/// The config both Ballista-aware sessions are built from: the pair of plan codecs plus
+/// the PostgreSQL session settings.
+///
+/// One function because the two sessions are the two ends of the same wire. The scheduler
+/// encodes a plan with its codecs and the client decodes with its own; a codec installed on
+/// one and not the other is a plan that serializes and then fails to come back, so the two
+/// lists may not be written twice. See [`super::plan_codec`] for what they carry.
+fn ballista_session_config() -> SessionConfig {
+    with_postgres_sql_options(
+        SessionConfig::new_with_ballista()
+            .with_ballista_logical_extension_codec(Arc::new(VaireLogicalCodec))
+            .with_ballista_physical_extension_codec(Arc::new(VairePhysicalCodec::new())),
+    )
+}
+
 /// Apply the session settings that make DataFusion answer the way PostgreSQL does.
 ///
 /// `parse_float_as_decimal` is the one a client can observe directly. DataFusion reads
@@ -193,7 +194,7 @@ pub async fn start_scheduler(
 /// anti join with **no equijoin key** returns no rows at all, so the respelling may only
 /// use an anti join on a bare equality and has to ask the two NULL questions as
 /// uncorrelated aggregates instead.
-fn with_postgres_sql_options(config: SessionConfig) -> SessionConfig {
+pub(crate) fn with_postgres_sql_options(config: SessionConfig) -> SessionConfig {
     let mut config = config;
     config.options_mut().sql_parser.parse_float_as_decimal = true;
     config
@@ -345,23 +346,19 @@ pub fn refresh_catalog_tables(ctx: &SessionContext, catalog: &MetadataCatalog) -
 
         let schema = Arc::new(Schema::new(fields));
 
-        let shards = catalog.get_shards_for_table(&table_meta.table_name)?;
+        let shards = catalog.shards_for_table(&table_meta.table_name)?;
 
         // The declared type strings are only in hand here, at the one place the schema is
         // built from the catalog, so this is where the text-in-name-only columns are named.
-        let opaque_text_columns = OpaqueTextColumns::from_declared_types(
-            table_meta
-                .columns
-                .iter()
-                .map(|col| (col.name.as_str(), col.data_type.as_str())),
+        let provider = Arc::new(
+            SchedulerTableProvider::new(table_meta.table_name.clone(), shards, schema)
+                .with_opaque_text_columns(OpaqueTextColumns::from_declared_types(
+                    table_meta
+                        .columns
+                        .iter()
+                        .map(|col| (col.name.as_str(), col.data_type.as_str())),
+                )),
         );
-
-        let provider = Arc::new(SchedulerTableProvider {
-            table_name: table_meta.table_name.clone(),
-            shards,
-            schema,
-            opaque_text_columns,
-        });
 
         ctx.register_table(table_ref, provider).map_err(|e| {
             CoordinatorError::Internal(format!(
@@ -450,28 +447,6 @@ impl SchedulerTableProvider {
     pub fn shards(&self) -> &[ShardMeta] {
         &self.shards
     }
-
-    /// Build a `RemoteDuckDbScanExec` for one shard: its physical table name plus
-    /// primary/replica node affinity. Shared by the single-shard and per-shard
-    /// (UnionExec child) branches of `scan` so the construction lives in one place.
-    fn scan_exec_for_shard(
-        &self,
-        shard: &ShardMeta,
-        projected_schema: &Arc<Schema>,
-        projection: Option<&Vec<usize>>,
-        filter_exprs: &[String],
-        limit: Option<usize>,
-    ) -> RemoteDuckDbScanExec {
-        RemoteDuckDbScanExec::new(
-            crate::util::shard_table_name(&self.table_name, shard.hash_bucket),
-            Arc::clone(projected_schema),
-            projection.cloned(),
-            filter_exprs.to_vec(),
-            Some(shard.primary_node_id.clone()),
-            shard.replica_node_ids.clone(),
-        )
-        .with_limit(limit)
-    }
 }
 
 #[async_trait::async_trait]
@@ -523,18 +498,31 @@ impl TableProvider for SchedulerTableProvider {
             filters,
         );
 
-        if self.shards.len() <= 1 {
-            let scan = match self.shards.first() {
-                Some(shard) => self.scan_exec_for_shard(
-                    shard,
-                    &projected_schema,
-                    projection,
-                    &filter_exprs,
-                    limit,
-                ),
-                // A table with no assigned shards scans its bare (un-suffixed)
-                // name with no node affinity — there is no shard to target.
-                None => RemoteDuckDbScanExec::new(
+        // One scan per shard: its physical table name plus primary/replica node affinity,
+        // which is what lets the scheduler route the task to a node already holding the data.
+        let mut scans: Vec<Arc<dyn ExecutionPlan>> = self
+            .shards
+            .iter()
+            .map(|shard| {
+                Arc::new(
+                    RemoteDuckDbScanExec::new(
+                        crate::util::shard_table_name(&self.table_name, shard.hash_bucket),
+                        Arc::clone(&projected_schema),
+                        projection.cloned(),
+                        filter_exprs.clone(),
+                        Some(shard.primary_node_id.clone()),
+                        shard.replica_node_ids.clone(),
+                    )
+                    .with_limit(limit),
+                ) as Arc<dyn ExecutionPlan>
+            })
+            .collect();
+
+        match scans.len() {
+            // A table with no assigned shards scans its bare (un-suffixed) name with no
+            // node affinity — there is no shard to target.
+            0 => Ok(Arc::new(
+                RemoteDuckDbScanExec::new(
                     self.table_name.clone(),
                     projected_schema,
                     projection.cloned(),
@@ -543,25 +531,11 @@ impl TableProvider for SchedulerTableProvider {
                     Vec::new(),
                 )
                 .with_limit(limit),
-            };
-            return Ok(Arc::new(scan));
+            )),
+            // Unioning one child would add a node that only forwards its input.
+            1 => Ok(scans.remove(0)),
+            _ => datafusion::physical_plan::union::UnionExec::try_new(scans),
         }
-
-        let children: Vec<Arc<dyn ExecutionPlan>> = self
-            .shards
-            .iter()
-            .map(|shard| {
-                Arc::new(self.scan_exec_for_shard(
-                    shard,
-                    &projected_schema,
-                    projection,
-                    &filter_exprs,
-                    limit,
-                )) as Arc<dyn ExecutionPlan>
-            })
-            .collect();
-
-        datafusion::physical_plan::union::UnionExec::try_new(children)
     }
 }
 
@@ -630,6 +604,8 @@ mod tests {
     use datafusion::arrow::datatypes::DataType;
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::datasource::MemTable;
+
+    use super::super::scheduler_test_helper::{L_KEYS, R_KEYS, key_schema, sorted_keys};
 
     /// A context registered the way every read-path context is, holding `t(i integer)`
     /// with one partition per element of `partitions`.
@@ -818,7 +794,7 @@ mod tests {
     fn join_context(config: SessionConfig, l: &[Option<i32>], r: &[Option<i32>]) -> SessionContext {
         let ctx = SessionContext::new_with_config(config.with_target_partitions(4));
         for (name, values) in [("l", l), ("r", r)] {
-            let schema = Arc::new(Schema::new(vec![Field::new("k", DataType::Int32, true)]));
+            let schema = key_schema();
             let (head, tail) = values.split_at(values.len() / 2);
             let batches: Vec<Vec<RecordBatch>> = [head, tail]
                 .iter()
@@ -839,7 +815,7 @@ mod tests {
         ctx
     }
 
-    /// The keys `sql` answers, sorted, with a NULL rendered as `-1` so it is visible.
+    /// The keys `sql` answers.
     async fn keys(ctx: &SessionContext, sql: &str) -> Vec<i32> {
         let batches = ctx
             .sql(sql)
@@ -848,29 +824,8 @@ mod tests {
             .collect()
             .await
             .unwrap_or_else(|e| panic!("`{sql}` must run: {e}"));
-        let mut keys = Vec::new();
-        for batch in &batches {
-            let column = batch
-                .column(0)
-                .as_any()
-                .downcast_ref::<Int32Array>()
-                .expect("an int4 column");
-            for row in 0..batch.num_rows() {
-                keys.push(if column.is_null(row) {
-                    -1
-                } else {
-                    column.value(row)
-                });
-            }
-        }
-        keys.sort_unstable();
-        keys
+        sorted_keys(&batches)
     }
-
-    /// `l.k = 10, 20, 30, NULL` and `r.k = 20, 99, 50` — the fixture the cluster
-    /// measurement used.
-    const L_KEYS: [Option<i32>; 4] = [Some(10), Some(20), Some(30), None];
-    const R_KEYS: [Option<i32>; 3] = [Some(20), Some(99), Some(50)];
 
     // Why `with_postgres_sql_options` leaves `prefer_hash_join` alone, kept as a test so
     // the measurement cannot be lost. Under Ballista's own value the anti join behind

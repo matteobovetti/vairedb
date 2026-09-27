@@ -1,6 +1,13 @@
+//! What a caller of `ReplicationManager` can observe against real nodes: which
+//! acknowledgements make a write succeed, what a failure says, and what the retry
+//! loop does with the nodes that missed it.
+//!
+//! Every test runs its own mock nodes over a real gRPC channel, because the
+//! properties under test are about what actually reached the wire.
+
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::time::Duration;
 
 use tokio::sync::Mutex;
 use tonic::{Request, Response, Status, transport::Server};
@@ -11,37 +18,65 @@ use vairedb_common::proto::vairedb::v1::{
 };
 use vairedb_coordinator::catalog::{MetadataCatalog, NodeMeta, NodeState, ShardMeta};
 use vairedb_coordinator::channel_pool::ChannelPool;
+use vairedb_coordinator::error::Result;
 use vairedb_coordinator::replication::{BatchStatement, ReplicationManager, RetryConfig};
 
-static COUNTER: AtomicU32 = AtomicU32::new(0);
-
-fn temp_db_path() -> String {
-    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!(
-        "/tmp/vairedb_test_replication_{}_{}.redb",
-        std::process::id(),
-        id
-    )
-}
-
-fn make_catalog() -> MetadataCatalog {
-    MetadataCatalog::open(&temp_db_path()).unwrap()
-}
+mod common;
+use common::temp_catalog;
 
 // ---------------------------------------------------------------------------
-// Mock WriteService implementations
+// Mock nodes
 // ---------------------------------------------------------------------------
 
-struct SuccessWriteService {
+/// A node that refuses its first `fail_until_call` requests and then answers
+/// normally, counting every request it received.
+///
+/// `fail_until_call: 0` is a node that simply works, which is why there is no
+/// separate always-succeeds mock: "did it work" and "how many times was it asked"
+/// are the same question once a retry loop is involved.
+struct FlakyWriteService {
+    calls: Arc<Mutex<u32>>,
+    fail_until_call: u32,
     rows_affected: i64,
 }
 
+impl FlakyWriteService {
+    /// A node that always answers, reporting `rows_affected` for the statement.
+    fn healthy(rows_affected: i64) -> Self {
+        Self {
+            calls: Arc::new(Mutex::new(0)),
+            fail_until_call: 0,
+            rows_affected,
+        }
+    }
+
+    /// A node that refuses `failures` requests before it starts answering.
+    fn refusing(failures: u32) -> Self {
+        Self {
+            calls: Arc::new(Mutex::new(0)),
+            fail_until_call: failures,
+            rows_affected: 1,
+        }
+    }
+
+    /// Handle on the request counter, held by the test after the service moves
+    /// into its server.
+    fn calls(&self) -> Arc<Mutex<u32>> {
+        Arc::clone(&self.calls)
+    }
+}
+
 #[tonic::async_trait]
-impl WriteService for SuccessWriteService {
+impl WriteService for FlakyWriteService {
     async fn execute_write(
         &self,
         _request: Request<ExecuteWriteRequest>,
     ) -> std::result::Result<Response<ExecuteWriteResponse>, Status> {
+        let mut calls = self.calls.lock().await;
+        *calls += 1;
+        if *calls <= self.fail_until_call {
+            return Err(Status::unavailable("not ready yet"));
+        }
         Ok(Response::new(ExecuteWriteResponse {
             results: vec![WriteResult {
                 success: true,
@@ -52,6 +87,7 @@ impl WriteService for SuccessWriteService {
     }
 }
 
+/// A node that is down: the transport itself refuses.
 struct FailingWriteService;
 
 #[tonic::async_trait]
@@ -64,6 +100,7 @@ impl WriteService for FailingWriteService {
     }
 }
 
+/// A node that answers, but reports the write as failed — the engine refused it.
 struct ErrorResultWriteService {
     message: String,
 }
@@ -87,6 +124,7 @@ impl WriteService for ErrorResultWriteService {
     }
 }
 
+/// A node whose response carries no result at all, which no correct node sends.
 struct EmptyResultWriteService;
 
 #[tonic::async_trait]
@@ -96,30 +134,6 @@ impl WriteService for EmptyResultWriteService {
         _request: Request<ExecuteWriteRequest>,
     ) -> std::result::Result<Response<ExecuteWriteResponse>, Status> {
         Ok(Response::new(ExecuteWriteResponse { results: vec![] }))
-    }
-}
-
-/// Success service that records how many writes it received, so a test can prove
-/// a per-shard write actually committed before a later shard failed.
-struct CountingSuccessWriteService {
-    call_count: Arc<Mutex<u32>>,
-    rows_affected: i64,
-}
-
-#[tonic::async_trait]
-impl WriteService for CountingSuccessWriteService {
-    async fn execute_write(
-        &self,
-        _request: Request<ExecuteWriteRequest>,
-    ) -> std::result::Result<Response<ExecuteWriteResponse>, Status> {
-        *self.call_count.lock().await += 1;
-        Ok(Response::new(ExecuteWriteResponse {
-            results: vec![WriteResult {
-                success: true,
-                rows_affected: self.rows_affected,
-                error: None,
-            }],
-        }))
     }
 }
 
@@ -178,32 +192,9 @@ impl WriteService for RolledBackBatchWriteService {
     }
 }
 
-struct ToggleWriteService {
-    call_count: Arc<Mutex<u32>>,
-    fail_until_call: u32,
-    rows_affected: i64,
-}
-
-#[tonic::async_trait]
-impl WriteService for ToggleWriteService {
-    async fn execute_write(
-        &self,
-        _request: Request<ExecuteWriteRequest>,
-    ) -> std::result::Result<Response<ExecuteWriteResponse>, Status> {
-        let mut count = self.call_count.lock().await;
-        *count += 1;
-        if *count <= self.fail_until_call {
-            return Err(Status::unavailable("not ready yet"));
-        }
-        Ok(Response::new(ExecuteWriteResponse {
-            results: vec![WriteResult {
-                success: true,
-                rows_affected: self.rows_affected,
-                error: None,
-            }],
-        }))
-    }
-}
+// ---------------------------------------------------------------------------
+// Fixtures
+// ---------------------------------------------------------------------------
 
 async fn start_mock_server<S: WriteService>(svc: S) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -218,710 +209,344 @@ async fn start_mock_server<S: WriteService>(svc: S) -> SocketAddr {
             .unwrap();
     });
 
-    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    tokio::time::sleep(Duration::from_millis(50)).await;
     addr
 }
 
-fn setup_catalog_with_nodes(catalog: &MetadataCatalog, nodes: &[(&str, &str)]) {
-    for (node_id, addr) in nodes {
+/// A catalog holding `nodes`, all Alive, at the addresses their mock servers are
+/// listening on.
+fn catalog_with(nodes: &[(&str, SocketAddr)]) -> Arc<MetadataCatalog> {
+    let catalog = temp_catalog();
+    for (node_id, address) in nodes {
         catalog
             .put_node(&NodeMeta {
                 node_id: node_id.to_string(),
-                advertised_address: addr.to_string(),
+                advertised_address: address.to_string(),
                 state: NodeState::Alive as i32,
                 last_heartbeat: None,
                 registered_at: None,
             })
             .unwrap();
     }
+    Arc::new(catalog)
 }
 
-// ---------------------------------------------------------------------------
-// ReplicationManager — quorum success (all nodes ack)
-// ---------------------------------------------------------------------------
+/// A manager whose retry loop ticks fast enough that a test can watch a resend
+/// happen instead of waiting out the production backoff.
+fn manager(catalog: &Arc<MetadataCatalog>) -> ReplicationManager {
+    ReplicationManager::new(
+        Arc::clone(catalog),
+        Arc::new(ChannelPool::new()),
+        RetryConfig {
+            initial_retry_ms: 50,
+            max_retry_ms: 200,
+        },
+    )
+}
 
-#[tokio::test]
-async fn test_quorum_write_all_nodes_ack() {
-    let addr = start_mock_server(SuccessWriteService { rows_affected: 1 }).await;
-    let addr_str = addr.to_string();
-
-    let catalog = Arc::new(make_catalog());
-    setup_catalog_with_nodes(&catalog, &[("node-1", &addr_str), ("node-2", &addr_str)]);
-
-    let pool = Arc::new(ChannelPool::new());
-    let config = RetryConfig {
-        initial_retry_ms: 50,
-        max_retry_ms: 200,
-    };
-    let manager = ReplicationManager::new(catalog, pool, config);
-
-    let shard = ShardMeta {
+/// Bucket 0 of `orders`, held by `primary` with `replicas`.
+fn shard(primary: &str, replicas: &[&str]) -> ShardMeta {
+    ShardMeta {
         shard_id: "shard0".to_string(),
         table_name: "orders".to_string(),
-        primary_node_id: "node-1".to_string(),
-        replica_node_ids: vec!["node-2".to_string()],
+        primary_node_id: primary.to_string(),
+        replica_node_ids: replicas.iter().map(|id| id.to_string()).collect(),
         hash_bucket: 0,
         range_lower: String::new(),
         range_upper: String::new(),
-    };
+    }
+}
 
-    let result = manager
-        .execute_write_with_quorum(&shard, "INSERT INTO orders VALUES (1)", &[], "write-1", 2)
-        .await;
+/// The single-statement write used wherever only the outcome is under test.
+async fn insert(manager: &ReplicationManager, shard: &ShardMeta, quorum: usize) -> Result<u64> {
+    manager
+        .execute_write_with_quorum(shard, "INSERT INTO orders VALUES (1)", &[], "w1", quorum)
+        .await
+}
 
-    assert!(result.is_ok());
-    assert_eq!(result.unwrap(), 1);
+fn statement(sql: &str, shard_id: &str) -> BatchStatement {
+    BatchStatement {
+        sql: sql.to_string(),
+        params: vec![],
+        shard_id: shard_id.to_string(),
+    }
+}
+
+/// Wait for a node's request count to reach `target`, failing if it never does.
+///
+/// The retry loop is driven by wall-clock sleeps, so a test that slept a guessed
+/// interval and then asserted would be asserting on the scheduler's luck.
+async fn await_calls(calls: &Arc<Mutex<u32>>, target: u32) {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while *calls.lock().await < target {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "node was asked {} times, expected {target}",
+            *calls.lock().await
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 // ---------------------------------------------------------------------------
-// ReplicationManager — quorum met with primary only
+// Quorum
 // ---------------------------------------------------------------------------
 
+/// The row count reported is the largest any acking node reported, not the
+/// primary's: a replica that applied more rows means the primary under-reported,
+/// and the client is told the number of rows the write actually touched.
 #[tokio::test]
-async fn test_quorum_write_primary_only_quorum_one() {
-    let success_addr = start_mock_server(SuccessWriteService { rows_affected: 3 }).await;
-    let failing_addr = start_mock_server(FailingWriteService).await;
+async fn a_write_every_node_acks_reports_the_highest_row_count() {
+    let primary = start_mock_server(FlakyWriteService::healthy(3)).await;
+    let replica = start_mock_server(FlakyWriteService::healthy(5)).await;
+    let catalog = catalog_with(&[("node-1", primary), ("node-2", replica)]);
 
-    let catalog = Arc::new(make_catalog());
-    setup_catalog_with_nodes(
-        &catalog,
-        &[
-            ("node-1", &success_addr.to_string()),
-            ("node-2", &failing_addr.to_string()),
-        ],
-    );
+    let rows = insert(&manager(&catalog), &shard("node-1", &["node-2"]), 2)
+        .await
+        .expect("both nodes acked");
 
-    let pool = Arc::new(ChannelPool::new());
-    let config = RetryConfig {
-        initial_retry_ms: 50,
-        max_retry_ms: 200,
-    };
-    let manager = ReplicationManager::new(catalog, pool, config);
-
-    let shard = ShardMeta {
-        shard_id: "shard0".to_string(),
-        table_name: "orders".to_string(),
-        primary_node_id: "node-1".to_string(),
-        replica_node_ids: vec!["node-2".to_string()],
-        hash_bucket: 0,
-        range_lower: String::new(),
-        range_upper: String::new(),
-    };
-
-    let result = manager
-        .execute_write_with_quorum(&shard, "INSERT INTO orders VALUES (1)", &[], "write-2", 1)
-        .await;
-
-    assert!(result.is_ok());
-    assert_eq!(result.unwrap(), 3);
+    assert_eq!(rows, 5);
 }
 
-// ---------------------------------------------------------------------------
-// ReplicationManager — primary failure returns ShardUnavailable
-// ---------------------------------------------------------------------------
-
+/// A replica that is down does not fail the write. Durability is the primary's
+/// job and the quorum's; the replica is tailed the write later.
 #[tokio::test]
-async fn test_quorum_write_primary_fails() {
-    let failing_addr = start_mock_server(FailingWriteService).await;
-    let success_addr = start_mock_server(SuccessWriteService { rows_affected: 1 }).await;
+async fn a_failed_replica_does_not_fail_a_write_whose_quorum_is_still_met() {
+    let healthy = start_mock_server(FlakyWriteService::healthy(1)).await;
+    let down = start_mock_server(FailingWriteService).await;
+    let catalog = catalog_with(&[("node-1", healthy), ("node-2", healthy), ("node-3", down)]);
 
-    let catalog = Arc::new(make_catalog());
-    setup_catalog_with_nodes(
-        &catalog,
-        &[
-            ("node-1", &failing_addr.to_string()),
-            ("node-2", &success_addr.to_string()),
-        ],
-    );
+    let rows = insert(
+        &manager(&catalog),
+        &shard("node-1", &["node-2", "node-3"]),
+        2,
+    )
+    .await
+    .expect("the primary and one replica are quorum enough");
 
-    let pool = Arc::new(ChannelPool::new());
-    let config = RetryConfig {
-        initial_retry_ms: 50,
-        max_retry_ms: 200,
-    };
-    let manager = ReplicationManager::new(catalog, pool, config);
-
-    let shard = ShardMeta {
-        shard_id: "shard0".to_string(),
-        table_name: "orders".to_string(),
-        primary_node_id: "node-1".to_string(),
-        replica_node_ids: vec!["node-2".to_string()],
-        hash_bucket: 0,
-        range_lower: String::new(),
-        range_upper: String::new(),
-    };
-
-    let result = manager
-        .execute_write_with_quorum(&shard, "INSERT INTO orders VALUES (1)", &[], "write-3", 2)
-        .await;
-
-    assert!(result.is_err());
-    let err = result.unwrap_err();
-    let err_str = err.to_string();
-    assert!(
-        err_str.contains("node execution failed") || err_str.contains("shard0"),
-        "expected NodeExecFailed or ShardUnavailable error, got: {}",
-        err_str
-    );
+    assert_eq!(rows, 1);
 }
 
-// ---------------------------------------------------------------------------
-// ReplicationManager — quorum not reached
-// ---------------------------------------------------------------------------
-
+/// A write the primary refused is not durable anywhere, so it fails — and it
+/// fails with the node's own reason, since "which node, on which shard, why" is
+/// the whole of what the client can act on.
 #[tokio::test]
-async fn test_quorum_not_reached() {
-    let success_addr = start_mock_server(SuccessWriteService { rows_affected: 1 }).await;
-    let failing_addr = start_mock_server(FailingWriteService).await;
+async fn a_write_the_primary_refuses_fails_with_that_nodes_reason() {
+    let down = start_mock_server(FailingWriteService).await;
+    let healthy = start_mock_server(FlakyWriteService::healthy(1)).await;
+    let catalog = catalog_with(&[("node-1", down), ("node-2", healthy)]);
 
-    let catalog = Arc::new(make_catalog());
-    setup_catalog_with_nodes(
-        &catalog,
-        &[
-            ("node-1", &success_addr.to_string()),
-            ("node-2", &failing_addr.to_string()),
-            ("node-3", &failing_addr.to_string()),
-        ],
-    );
+    let error = insert(&manager(&catalog), &shard("node-1", &["node-2"]), 2)
+        .await
+        .expect_err("a write the primary did not take cannot be reported as done")
+        .to_string();
 
-    let pool = Arc::new(ChannelPool::new());
-    let config = RetryConfig {
-        initial_retry_ms: 50,
-        max_retry_ms: 200,
-    };
-    let manager = ReplicationManager::new(catalog, pool, config);
-
-    let shard = ShardMeta {
-        shard_id: "shard0".to_string(),
-        table_name: "orders".to_string(),
-        primary_node_id: "node-1".to_string(),
-        replica_node_ids: vec!["node-2".to_string(), "node-3".to_string()],
-        hash_bucket: 0,
-        range_lower: String::new(),
-        range_upper: String::new(),
-    };
-
-    let result = manager
-        .execute_write_with_quorum(&shard, "INSERT INTO orders VALUES (1)", &[], "write-4", 3)
-        .await;
-
-    assert!(result.is_err());
-    let err_str = result.unwrap_err().to_string();
-    assert!(
-        err_str.contains("quorum") || err_str.contains("Quorum"),
-        "expected QuorumNotReached error, got: {}",
-        err_str
-    );
+    assert!(error.contains("node-1"), "{error}");
+    assert!(error.contains("orders_shard0"), "{error}");
+    assert!(error.contains("node down"), "{error}");
 }
 
-// ---------------------------------------------------------------------------
-// ReplicationManager — rows_affected takes max across nodes
-// ---------------------------------------------------------------------------
-
+/// The primary acked, so the write is durable — and it still fails, because the
+/// configured quorum is the durability the client was promised.
 #[tokio::test]
-async fn test_quorum_write_rows_affected_takes_max() {
-    let addr_5 = start_mock_server(SuccessWriteService { rows_affected: 5 }).await;
-    let addr_3 = start_mock_server(SuccessWriteService { rows_affected: 3 }).await;
+async fn a_write_short_of_quorum_fails_even_though_the_primary_acked() {
+    let healthy = start_mock_server(FlakyWriteService::healthy(1)).await;
+    let down = start_mock_server(FailingWriteService).await;
+    let catalog = catalog_with(&[("node-1", healthy), ("node-2", down), ("node-3", down)]);
 
-    let catalog = Arc::new(make_catalog());
-    setup_catalog_with_nodes(
-        &catalog,
-        &[
-            ("node-1", &addr_5.to_string()),
-            ("node-2", &addr_3.to_string()),
-        ],
-    );
+    let error = insert(
+        &manager(&catalog),
+        &shard("node-1", &["node-2", "node-3"]),
+        3,
+    )
+    .await
+    .expect_err("one ack out of three cannot satisfy a quorum of three")
+    .to_string();
 
-    let pool = Arc::new(ChannelPool::new());
-    let config = RetryConfig {
-        initial_retry_ms: 50,
-        max_retry_ms: 200,
-    };
-    let manager = ReplicationManager::new(catalog, pool, config);
-
-    let shard = ShardMeta {
-        shard_id: "shard0".to_string(),
-        table_name: "orders".to_string(),
-        primary_node_id: "node-1".to_string(),
-        replica_node_ids: vec!["node-2".to_string()],
-        hash_bucket: 0,
-        range_lower: String::new(),
-        range_upper: String::new(),
-    };
-
-    let result = manager
-        .execute_write_with_quorum(&shard, "INSERT INTO orders VALUES (1)", &[], "write-5", 1)
-        .await;
-
-    assert!(result.is_ok());
-    assert_eq!(result.unwrap(), 5);
+    assert!(error.contains("quorum not reached"), "{error}");
 }
 
-// ---------------------------------------------------------------------------
-// ReplicationManager — shard with no primary in address map
-// ---------------------------------------------------------------------------
-
+/// A primary the catalog has no address for makes the shard unwritable: there is
+/// no node that could take the write, and no replica may stand in for it.
 #[tokio::test]
-async fn test_quorum_write_primary_not_in_catalog() {
-    let addr = start_mock_server(SuccessWriteService { rows_affected: 1 }).await;
+async fn a_shard_whose_primary_the_catalog_forgot_cannot_be_written() {
+    let healthy = start_mock_server(FlakyWriteService::healthy(1)).await;
+    let catalog = catalog_with(&[("node-2", healthy)]);
 
-    let catalog = Arc::new(make_catalog());
-    setup_catalog_with_nodes(&catalog, &[("node-2", &addr.to_string())]);
+    let error = insert(&manager(&catalog), &shard("node-1", &["node-2"]), 1)
+        .await
+        .expect_err("a shard with no reachable primary is unavailable")
+        .to_string();
 
-    let pool = Arc::new(ChannelPool::new());
-    let config = RetryConfig {
-        initial_retry_ms: 50,
-        max_retry_ms: 200,
+    assert!(error.contains("shard0"), "{error}");
+}
+
+/// A replica the catalog has no address for is simply not a target — it holds no
+/// current data to keep current, so it must not count against the write the way a
+/// known-but-unreachable node does.
+#[tokio::test]
+async fn a_replica_the_catalog_forgot_is_not_a_target() {
+    let healthy = start_mock_server(FlakyWriteService::healthy(1)).await;
+    let catalog = catalog_with(&[("node-1", healthy)]);
+
+    let rows = insert(&manager(&catalog), &shard("node-1", &["node-2"]), 1)
+        .await
+        .expect("the primary alone meets a quorum of one");
+
+    assert_eq!(rows, 1);
+}
+
+/// A node that answers but reports the write as failed, and a node that answers
+/// with no result at all, both fail the write. The first must carry the node's
+/// reason to the client; the second has none to carry, and a malformed response
+/// must not be read as a successful write of zero rows.
+#[tokio::test]
+async fn a_node_that_does_not_apply_the_write_fails_it() {
+    let refused = start_mock_server(ErrorResultWriteService {
+        message: "disk full".to_string(),
+    })
+    .await;
+    let catalog = catalog_with(&[("node-1", refused)]);
+
+    let error = insert(&manager(&catalog), &shard("node-1", &[]), 1)
+        .await
+        .expect_err("a write the engine refused is not a write")
+        .to_string();
+    assert!(error.contains("disk full"), "{error}");
+
+    let silent = start_mock_server(EmptyResultWriteService).await;
+    let catalog = catalog_with(&[("node-1", silent)]);
+
+    let error = insert(&manager(&catalog), &shard("node-1", &[]), 1)
+        .await
+        .expect_err("a response with no result says nothing was applied")
+        .to_string();
+    assert!(error.contains("no results returned"), "{error}");
+}
+
+/// Multi-shard DML is not atomic. `pgwire_handler::handle_dml` writes the target
+/// shards in sequence with no cross-shard rollback, which this drives directly:
+/// shard0 commits, shard1's primary is down, and shard0's write stays applied.
+/// That partially-applied statement is the documented behaviour, pinned here so
+/// it cannot change silently.
+#[tokio::test]
+async fn a_multi_shard_write_leaves_the_earlier_shard_committed_when_a_later_one_fails() {
+    let node0 = FlakyWriteService::healthy(1);
+    let shard0_calls = node0.calls();
+    let shard0_addr = start_mock_server(node0).await;
+    let down = start_mock_server(FailingWriteService).await;
+    let catalog = catalog_with(&[("node-0", shard0_addr), ("node-1", down)]);
+    let manager = manager(&catalog);
+
+    let shard0 = shard("node-0", &[]);
+    let shard1 = ShardMeta {
+        shard_id: "shard1".to_string(),
+        hash_bucket: 1,
+        ..shard("node-1", &[])
     };
-    let manager = ReplicationManager::new(catalog, pool, config);
 
-    let shard = ShardMeta {
-        shard_id: "shard0".to_string(),
-        table_name: "orders".to_string(),
-        primary_node_id: "node-1".to_string(),
-        replica_node_ids: vec!["node-2".to_string()],
-        hash_bucket: 0,
-        range_lower: String::new(),
-        range_upper: String::new(),
-    };
+    manager
+        .execute_write_with_quorum(&shard0, "DELETE FROM orders_shard0", &[], "ms-0", 1)
+        .await
+        .expect("the first shard commits");
+    manager
+        .execute_write_with_quorum(&shard1, "DELETE FROM orders_shard1", &[], "ms-1", 1)
+        .await
+        .expect_err("the second shard's primary is down");
 
-    let result = manager
-        .execute_write_with_quorum(&shard, "INSERT INTO orders VALUES (1)", &[], "write-6", 1)
-        .await;
-
-    assert!(result.is_err());
-    let err_str = result.unwrap_err().to_string();
-    assert!(
-        err_str.contains("shard0"),
-        "expected ShardUnavailable error, got: {}",
-        err_str
+    assert_eq!(
+        *shard0_calls.lock().await,
+        1,
+        "shard0 committed its write before the statement failed, and nothing rolls it back"
     );
 }
 
 // ---------------------------------------------------------------------------
-// ReplicationManager — single node, no replicas
+// Retry loop
 // ---------------------------------------------------------------------------
 
+/// A replica that missed the write is sent it again once it recovers, without the
+/// client being told anything: that is the whole point of acking on quorum.
 #[tokio::test]
-async fn test_quorum_write_single_node_no_replicas() {
-    let addr = start_mock_server(SuccessWriteService { rows_affected: 2 }).await;
+async fn a_replica_that_missed_a_write_is_sent_it_again() {
+    let primary = start_mock_server(FlakyWriteService::healthy(1)).await;
+    let lagging = FlakyWriteService::refusing(1);
+    let lagging_calls = lagging.calls();
+    let lagging_addr = start_mock_server(lagging).await;
+    let catalog = catalog_with(&[("node-1", primary), ("node-2", lagging_addr)]);
 
-    let catalog = Arc::new(make_catalog());
-    setup_catalog_with_nodes(&catalog, &[("node-1", &addr.to_string())]);
+    insert(&manager(&catalog), &shard("node-1", &["node-2"]), 1)
+        .await
+        .expect("the primary meets a quorum of one");
 
-    let pool = Arc::new(ChannelPool::new());
-    let config = RetryConfig {
-        initial_retry_ms: 50,
-        max_retry_ms: 200,
-    };
-    let manager = ReplicationManager::new(catalog, pool, config);
-
-    let shard = ShardMeta {
-        shard_id: "shard0".to_string(),
-        table_name: "orders".to_string(),
-        primary_node_id: "node-1".to_string(),
-        replica_node_ids: vec![],
-        hash_bucket: 0,
-        range_lower: String::new(),
-        range_upper: String::new(),
-    };
-
-    let result = manager
-        .execute_write_with_quorum(&shard, "INSERT INTO orders VALUES (1)", &[], "write-7", 1)
-        .await;
-
-    assert!(result.is_ok());
-    assert_eq!(result.unwrap(), 2);
+    // One refused attempt during the write, then the resend from the retry loop.
+    await_calls(&lagging_calls, 2).await;
 }
 
-// ---------------------------------------------------------------------------
-// ReplicationManager — lagging nodes get retried
-// ---------------------------------------------------------------------------
-
+/// A node still marked Dead is skipped rather than retried, and its queue is left
+/// intact: the write waits for the node to rejoin instead of being spent on a
+/// machine that cannot take it, and instead of being dropped.
 #[tokio::test]
-async fn test_lagging_node_gets_retried() {
-    let call_count = Arc::new(Mutex::new(0u32));
+async fn a_dead_node_keeps_its_queued_write_until_it_rejoins() {
+    let primary = start_mock_server(FlakyWriteService::healthy(1)).await;
+    // Never stops refusing, so every resend re-queues and the count only ever
+    // reflects how many times the loop was willing to try.
+    let lagging = FlakyWriteService::refusing(u32::MAX);
+    let lagging_calls = lagging.calls();
+    let lagging_addr = start_mock_server(lagging).await;
+    let catalog = catalog_with(&[("node-1", primary), ("node-2", lagging_addr)]);
 
-    let success_addr = start_mock_server(SuccessWriteService { rows_affected: 1 }).await;
-
-    let toggle_svc = ToggleWriteService {
-        call_count: Arc::clone(&call_count),
-        fail_until_call: 1,
-        rows_affected: 1,
-    };
-    let toggle_addr = start_mock_server(toggle_svc).await;
-
-    let catalog = Arc::new(make_catalog());
-    setup_catalog_with_nodes(
-        &catalog,
-        &[
-            ("node-1", &success_addr.to_string()),
-            ("node-2", &toggle_addr.to_string()),
-        ],
-    );
-
-    let pool = Arc::new(ChannelPool::new());
-    let config = RetryConfig {
-        initial_retry_ms: 50,
-        max_retry_ms: 200,
-    };
-    let manager = ReplicationManager::new(Arc::clone(&catalog), pool, config);
-
-    let shard = ShardMeta {
-        shard_id: "shard0".to_string(),
-        table_name: "orders".to_string(),
-        primary_node_id: "node-1".to_string(),
-        replica_node_ids: vec!["node-2".to_string()],
-        hash_bucket: 0,
-        range_lower: String::new(),
-        range_upper: String::new(),
-    };
-
-    let result = manager
-        .execute_write_with_quorum(&shard, "INSERT INTO orders VALUES (1)", &[], "write-8", 1)
-        .await;
-
-    assert!(result.is_ok());
-
-    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
-
-    let count = *call_count.lock().await;
-    assert!(
-        count >= 2,
-        "expected at least 2 calls (1 initial + 1 retry), got {}",
-        count
-    );
-}
-
-// ---------------------------------------------------------------------------
-// ReplicationManager — dead node queues are cleared
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn test_dead_node_retries_are_cleared() {
-    let success_addr = start_mock_server(SuccessWriteService { rows_affected: 1 }).await;
-    let failing_addr = start_mock_server(FailingWriteService).await;
-
-    let catalog = Arc::new(make_catalog());
-    setup_catalog_with_nodes(
-        &catalog,
-        &[
-            ("node-1", &success_addr.to_string()),
-            ("node-2", &failing_addr.to_string()),
-        ],
-    );
-
-    let pool = Arc::new(ChannelPool::new());
-    let config = RetryConfig {
-        initial_retry_ms: 50,
-        max_retry_ms: 200,
-    };
-    let manager = ReplicationManager::new(Arc::clone(&catalog), pool, config);
-
-    let shard = ShardMeta {
-        shard_id: "shard0".to_string(),
-        table_name: "orders".to_string(),
-        primary_node_id: "node-1".to_string(),
-        replica_node_ids: vec!["node-2".to_string()],
-        hash_bucket: 0,
-        range_lower: String::new(),
-        range_upper: String::new(),
-    };
-
-    let result = manager
-        .execute_write_with_quorum(&shard, "INSERT INTO orders VALUES (1)", &[], "write-9", 1)
-        .await;
-    assert!(result.is_ok());
-
-    // Mark node-2 as dead — retry loop should drop its queue
+    insert(&manager(&catalog), &shard("node-1", &["node-2"]), 1)
+        .await
+        .expect("the primary meets a quorum of one");
     catalog
         .update_node_state("node-2", NodeState::Dead)
         .unwrap();
 
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-}
-
-// ---------------------------------------------------------------------------
-// ReplicationManager — error result from write service
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn test_quorum_write_error_result_from_service() {
-    let error_addr = start_mock_server(ErrorResultWriteService {
-        message: "disk full".to_string(),
-    })
-    .await;
-
-    let catalog = Arc::new(make_catalog());
-    setup_catalog_with_nodes(&catalog, &[("node-1", &error_addr.to_string())]);
-
-    let pool = Arc::new(ChannelPool::new());
-    let config = RetryConfig {
-        initial_retry_ms: 50,
-        max_retry_ms: 200,
-    };
-    let manager = ReplicationManager::new(catalog, pool, config);
-
-    let shard = ShardMeta {
-        shard_id: "shard0".to_string(),
-        table_name: "orders".to_string(),
-        primary_node_id: "node-1".to_string(),
-        replica_node_ids: vec![],
-        hash_bucket: 0,
-        range_lower: String::new(),
-        range_upper: String::new(),
-    };
-
-    let result = manager
-        .execute_write_with_quorum(&shard, "INSERT INTO orders VALUES (1)", &[], "write-10", 1)
-        .await;
-
-    assert!(result.is_err());
-}
-
-// ---------------------------------------------------------------------------
-// ReplicationManager — empty result from write service
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn test_quorum_write_empty_result_from_service() {
-    let empty_addr = start_mock_server(EmptyResultWriteService).await;
-
-    let catalog = Arc::new(make_catalog());
-    setup_catalog_with_nodes(&catalog, &[("node-1", &empty_addr.to_string())]);
-
-    let pool = Arc::new(ChannelPool::new());
-    let config = RetryConfig {
-        initial_retry_ms: 50,
-        max_retry_ms: 200,
-    };
-    let manager = ReplicationManager::new(catalog, pool, config);
-
-    let shard = ShardMeta {
-        shard_id: "shard0".to_string(),
-        table_name: "orders".to_string(),
-        primary_node_id: "node-1".to_string(),
-        replica_node_ids: vec![],
-        hash_bucket: 0,
-        range_lower: String::new(),
-        range_upper: String::new(),
-    };
-
-    let result = manager
-        .execute_write_with_quorum(&shard, "INSERT INTO orders VALUES (1)", &[], "write-11", 1)
-        .await;
-
-    assert!(result.is_err());
-}
-
-// ---------------------------------------------------------------------------
-// ReplicationManager — multiple replicas, quorum of 2 with 3 nodes
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn test_quorum_write_partial_replica_failure_quorum_met() {
-    let success_addr = start_mock_server(SuccessWriteService { rows_affected: 1 }).await;
-    let failing_addr = start_mock_server(FailingWriteService).await;
-
-    let catalog = Arc::new(make_catalog());
-    setup_catalog_with_nodes(
-        &catalog,
-        &[
-            ("node-1", &success_addr.to_string()),
-            ("node-2", &success_addr.to_string()),
-            ("node-3", &failing_addr.to_string()),
-        ],
-    );
-
-    let pool = Arc::new(ChannelPool::new());
-    let config = RetryConfig {
-        initial_retry_ms: 50,
-        max_retry_ms: 200,
-    };
-    let manager = ReplicationManager::new(catalog, pool, config);
-
-    let shard = ShardMeta {
-        shard_id: "shard0".to_string(),
-        table_name: "orders".to_string(),
-        primary_node_id: "node-1".to_string(),
-        replica_node_ids: vec!["node-2".to_string(), "node-3".to_string()],
-        hash_bucket: 0,
-        range_lower: String::new(),
-        range_upper: String::new(),
-    };
-
-    let result = manager
-        .execute_write_with_quorum(&shard, "INSERT INTO orders VALUES (1)", &[], "write-12", 2)
-        .await;
-
-    assert!(result.is_ok());
-    assert_eq!(result.unwrap(), 1);
-}
-
-// ---------------------------------------------------------------------------
-// ReplicationManager — replica not in address map is skipped
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn test_quorum_write_replica_not_in_catalog_skipped() {
-    let addr = start_mock_server(SuccessWriteService { rows_affected: 1 }).await;
-
-    let catalog = Arc::new(make_catalog());
-    setup_catalog_with_nodes(&catalog, &[("node-1", &addr.to_string())]);
-
-    let pool = Arc::new(ChannelPool::new());
-    let config = RetryConfig {
-        initial_retry_ms: 50,
-        max_retry_ms: 200,
-    };
-    let manager = ReplicationManager::new(catalog, pool, config);
-
-    let shard = ShardMeta {
-        shard_id: "shard0".to_string(),
-        table_name: "orders".to_string(),
-        primary_node_id: "node-1".to_string(),
-        replica_node_ids: vec!["node-2".to_string()],
-        hash_bucket: 0,
-        range_lower: String::new(),
-        range_upper: String::new(),
-    };
-
-    let result = manager
-        .execute_write_with_quorum(&shard, "INSERT INTO orders VALUES (1)", &[], "write-13", 1)
-        .await;
-
-    assert!(result.is_ok());
-    assert_eq!(result.unwrap(), 1);
-}
-
-// ---------------------------------------------------------------------------
-// Multi-shard DML is non-atomic. The coordinator (pgwire_handler::handle_dml /
-// handle_insert_with_split) writes shards sequentially via repeated
-// execute_write_with_quorum calls with NO cross-shard rollback. This test drives
-// that loop directly: shard0 commits, then shard1's primary fails. It documents
-// that the first shard's write is already durable when the statement errors —
-// i.e. a partially-applied multi-shard statement.
-// ---------------------------------------------------------------------------
-
-#[tokio::test]
-async fn test_multi_shard_write_partial_failure_leaves_first_shard_committed() {
-    let shard0_calls = Arc::new(Mutex::new(0u32));
-    let shard0_addr = start_mock_server(CountingSuccessWriteService {
-        call_count: Arc::clone(&shard0_calls),
-        rows_affected: 1,
-    })
-    .await;
-    let failing_addr = start_mock_server(FailingWriteService).await;
-
-    let catalog = Arc::new(make_catalog());
-    setup_catalog_with_nodes(
-        &catalog,
-        &[
-            ("node-0", &shard0_addr.to_string()),
-            ("node-1", &failing_addr.to_string()),
-        ],
-    );
-
-    let pool = Arc::new(ChannelPool::new());
-    let config = RetryConfig {
-        initial_retry_ms: 50,
-        max_retry_ms: 200,
-    };
-    let manager = ReplicationManager::new(catalog, pool, config);
-
-    let shard0 = ShardMeta {
-        shard_id: "shard0".to_string(),
-        table_name: "orders".to_string(),
-        primary_node_id: "node-0".to_string(),
-        replica_node_ids: vec![],
-        hash_bucket: 0,
-        range_lower: String::new(),
-        range_upper: String::new(),
-    };
-    let shard1 = ShardMeta {
-        shard_id: "shard1".to_string(),
-        table_name: "orders".to_string(),
-        primary_node_id: "node-1".to_string(),
-        replica_node_ids: vec![],
-        hash_bucket: 1,
-        range_lower: String::new(),
-        range_upper: String::new(),
-    };
-
-    // Sequential per-shard writes, exactly as handle_dml loops over target shards.
-    let r0 = manager
-        .execute_write_with_quorum(&shard0, "DELETE FROM orders_shard0", &[], "write-ms-0", 1)
-        .await;
-    assert!(r0.is_ok(), "first shard write should commit");
-
-    let r1 = manager
-        .execute_write_with_quorum(&shard1, "DELETE FROM orders_shard1", &[], "write-ms-1", 1)
-        .await;
-    assert!(r1.is_err(), "second shard write should fail (primary down)");
-
-    // The statement errored, yet shard0's write was already applied and is NOT
-    // rolled back — the documented non-atomic behavior for v0.1.
+    // Several retry ticks' worth of time, during which a Dead node is skipped.
+    tokio::time::sleep(Duration::from_millis(400)).await;
     assert_eq!(
-        *shard0_calls.lock().await,
+        *lagging_calls.lock().await,
         1,
-        "shard0 received and committed its write before the statement failed"
+        "only the original attempt: a Dead node must not be retried"
     );
+
+    catalog
+        .update_node_state("node-2", NodeState::Alive)
+        .unwrap();
+
+    // The queue survived being skipped, so rejoining is what replays the write.
+    await_calls(&lagging_calls, 2).await;
 }
 
 // ---------------------------------------------------------------------------
-// ReplicationManager — transaction batches (execute_transaction_with_quorum).
-// This is what COMMIT ships for a buffered transaction block: every statement
-// of the block that shares a node set travels in ONE request marked atomic, so
-// the node applies all of them or none. These tests pin the two properties the
-// coordinator's transaction semantics rest on — the request really is one atomic
-// batch, and a node that rolls it back fails the whole commit.
+// Transaction batches
+//
+// This is what COMMIT ships for a buffered transaction block: every statement of
+// the block that shares a node set travels in ONE request marked atomic, so the
+// node applies all of them or none.
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn test_transaction_batch_reaches_every_node_as_one_atomic_request() {
+async fn a_transaction_batch_reaches_every_node_as_one_atomic_request() {
     let requests = Arc::new(Mutex::new(Vec::new()));
     let addr = start_mock_server(RecordingBatchWriteService {
         requests: Arc::clone(&requests),
     })
     .await;
-    let addr_str = addr.to_string();
-
-    let catalog = Arc::new(make_catalog());
-    setup_catalog_with_nodes(&catalog, &[("node-1", &addr_str), ("node-2", &addr_str)]);
-
-    let pool = Arc::new(ChannelPool::new());
-    let config = RetryConfig {
-        initial_retry_ms: 50,
-        max_retry_ms: 200,
-    };
-    let manager = ReplicationManager::new(catalog, pool, config);
-
-    let shard = ShardMeta {
-        shard_id: "shard0".to_string(),
-        table_name: "orders".to_string(),
-        primary_node_id: "node-1".to_string(),
-        replica_node_ids: vec!["node-2".to_string()],
-        hash_bucket: 0,
-        range_lower: String::new(),
-        range_upper: String::new(),
-    };
+    let catalog = catalog_with(&[("node-1", addr), ("node-2", addr)]);
 
     // Two tables on the same node set, exactly what a block writing both buffers.
     let statements = vec![
-        BatchStatement {
-            sql: "INSERT INTO orders_shard0 VALUES (1)".to_string(),
-            params: vec![],
-            shard_id: "orders_shard0".to_string(),
-        },
-        BatchStatement {
-            sql: "INSERT INTO customers_shard0 VALUES (2)".to_string(),
-            params: vec![],
-            shard_id: "customers_shard0".to_string(),
-        },
+        statement("INSERT INTO orders_shard0 VALUES (1)", "orders_shard0"),
+        statement(
+            "INSERT INTO customers_shard0 VALUES (2)",
+            "customers_shard0",
+        ),
     ];
 
-    let rows = manager
-        .execute_transaction_with_quorum(&shard, statements, "txn-1", 2)
+    let rows = manager(&catalog)
+        .execute_transaction_with_quorum(&shard("node-1", &["node-2"]), statements, "txn-1", 2)
         .await
         .expect("both nodes ack the batch");
 
@@ -959,107 +584,54 @@ async fn test_transaction_batch_reaches_every_node_as_one_atomic_request() {
     }
 }
 
+/// The node reported the first statement as applied and the second as failed.
+/// Because the batch was atomic, nothing was applied, so the caller must see an
+/// error rather than a partial success it might report as a commit.
 #[tokio::test]
-async fn test_transaction_batch_rolled_back_by_the_primary_fails_the_commit() {
+async fn a_transaction_batch_the_primary_rolled_back_fails_the_commit() {
     let addr = start_mock_server(RolledBackBatchWriteService).await;
-
-    let catalog = Arc::new(make_catalog());
-    setup_catalog_with_nodes(&catalog, &[("node-1", &addr.to_string())]);
-
-    let pool = Arc::new(ChannelPool::new());
-    let config = RetryConfig {
-        initial_retry_ms: 50,
-        max_retry_ms: 200,
-    };
-    let manager = ReplicationManager::new(catalog, pool, config);
-
-    let shard = ShardMeta {
-        shard_id: "shard0".to_string(),
-        table_name: "orders".to_string(),
-        primary_node_id: "node-1".to_string(),
-        replica_node_ids: vec![],
-        hash_bucket: 0,
-        range_lower: String::new(),
-        range_upper: String::new(),
-    };
+    let catalog = catalog_with(&[("node-1", addr)]);
 
     let statements = vec![
-        BatchStatement {
-            sql: "INSERT INTO orders_shard0 VALUES (1)".to_string(),
-            params: vec![],
-            shard_id: "orders_shard0".to_string(),
-        },
-        BatchStatement {
-            sql: "INSERT INTO orders_shard0 VALUES (1)".to_string(),
-            params: vec![],
-            shard_id: "orders_shard0".to_string(),
-        },
+        statement("INSERT INTO orders_shard0 VALUES (1)", "orders_shard0"),
+        statement("INSERT INTO orders_shard0 VALUES (1)", "orders_shard0"),
     ];
 
-    let result = manager
-        .execute_transaction_with_quorum(&shard, statements, "txn-2", 1)
-        .await;
-
-    // The node reported the first statement as applied and the second as failed.
-    // Because the batch was atomic, nothing was applied, so the caller must see
-    // an error rather than a partial success it might report as a commit.
-    let err_str = result
+    let error = manager(&catalog)
+        .execute_transaction_with_quorum(&shard("node-1", &[]), statements, "txn-2", 1)
+        .await
         .expect_err("a rolled-back batch cannot be reported as committed")
         .to_string();
+
     assert!(
-        err_str.contains("constraint violation"),
-        "the node's reason should reach the client, got: {err_str}"
+        error.contains("constraint violation"),
+        "the node's reason should reach the client, got: {error}"
     );
 }
 
-// A lagging replica does not fail the commit: the primary plus quorum decide,
-// and the replica is queued to receive the same batch — still as one
-// transaction — from the retry loop.
+/// A lagging replica does not fail the commit: the primary plus quorum decide,
+/// and the replica is queued to receive the same batch — still as one
+/// transaction — from the retry loop.
 #[tokio::test]
-async fn test_transaction_batch_commits_on_primary_when_a_replica_lags() {
+async fn a_transaction_batch_commits_on_the_primary_when_a_replica_lags() {
     let requests = Arc::new(Mutex::new(Vec::new()));
-    let primary_addr = start_mock_server(RecordingBatchWriteService {
+    let primary = start_mock_server(RecordingBatchWriteService {
         requests: Arc::clone(&requests),
     })
     .await;
-    let replica_addr = start_mock_server(FailingWriteService).await;
+    let down = start_mock_server(FailingWriteService).await;
+    let catalog = catalog_with(&[("node-1", primary), ("node-2", down)]);
 
-    let catalog = Arc::new(make_catalog());
-    setup_catalog_with_nodes(
-        &catalog,
-        &[
-            ("node-1", &primary_addr.to_string()),
-            ("node-2", &replica_addr.to_string()),
-        ],
-    );
+    let statements = vec![statement(
+        "INSERT INTO orders_shard0 VALUES (1)",
+        "orders_shard0",
+    )];
 
-    let pool = Arc::new(ChannelPool::new());
-    let config = RetryConfig {
-        initial_retry_ms: 50,
-        max_retry_ms: 200,
-    };
-    let manager = ReplicationManager::new(catalog, pool, config);
-
-    let shard = ShardMeta {
-        shard_id: "shard0".to_string(),
-        table_name: "orders".to_string(),
-        primary_node_id: "node-1".to_string(),
-        replica_node_ids: vec!["node-2".to_string()],
-        hash_bucket: 0,
-        range_lower: String::new(),
-        range_upper: String::new(),
-    };
-
-    let statements = vec![BatchStatement {
-        sql: "INSERT INTO orders_shard0 VALUES (1)".to_string(),
-        params: vec![],
-        shard_id: "orders_shard0".to_string(),
-    }];
-
-    let rows = manager
-        .execute_transaction_with_quorum(&shard, statements, "txn-3", 1)
+    let rows = manager(&catalog)
+        .execute_transaction_with_quorum(&shard("node-1", &["node-2"]), statements, "txn-3", 1)
         .await
         .expect("quorum of one is met by the primary alone");
+
     assert_eq!(rows, vec![1]);
     assert_eq!(
         requests.lock().await.len(),

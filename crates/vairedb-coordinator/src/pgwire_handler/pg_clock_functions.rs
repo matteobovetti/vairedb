@@ -150,13 +150,10 @@ fn arguments_mut(function: &mut Function) -> Option<&mut Vec<FunctionArg>> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sqlparser::dialect::PostgreSqlDialect;
-    use crate::sqlparser::parser::Parser;
+    use crate::pgwire_handler::read_path_test_helper::parse_verbatim;
 
     fn rewritten(sql: &str) -> String {
-        let mut stmt = Parser::parse_sql(&PostgreSqlDialect {}, sql)
-            .expect("parsed")
-            .remove(0);
+        let mut stmt = parse_verbatim(sql);
         resolve_clock_functions(&mut stmt);
         stmt.to_string()
     }

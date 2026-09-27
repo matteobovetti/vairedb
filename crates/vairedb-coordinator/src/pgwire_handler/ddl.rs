@@ -44,6 +44,7 @@ use crate::pgwire_handler::table_meta_ops::{
 };
 use crate::scheduler;
 use crate::util::{now_unix_secs, shard_table_name};
+use crate::write_router::target_nodes;
 use crate::write_sql_cl;
 
 /// The duplicate-relation error, worded like PostgreSQL's. Raised from three
@@ -53,6 +54,63 @@ pub(super) fn already_exists(table_name: &str) -> PgWireError {
     make_vdb_error(
         VdbErrorCode::TableAlreadyExists,
         format!("relation \"{table_name}\" already exists"),
+    )
+}
+
+/// The refusal for a statement whose table name the router would not resolve.
+///
+/// Four call sites read a name out of an already-classified statement — `DROP TABLE`,
+/// `TRUNCATE`, `ALTER TABLE`, `CREATE INDEX` — and each has to answer for the `None`
+/// that classification makes unlikely rather than impossible. One owner so the four
+/// cannot start telling a client four things about the same unresolvable name.
+pub(super) fn no_table_name() -> PgWireError {
+    make_vdb_error(
+        VdbErrorCode::SqlSyntaxError,
+        "could not determine table name",
+    )
+}
+
+/// The refusal for a statement naming more than one `noun`, where only the first would
+/// ever be acted on.
+///
+/// Five statements refuse this — `DROP TABLE`, `TRUNCATE`, `DROP INDEX`, `DROP VIEW`,
+/// `DROP SCHEMA` — and it is one claim about the coordinator rather than five: accepting
+/// the multi-object form would report success for objects nothing touched. The five had
+/// already drifted in the telling, `DROP SCHEMA` advising "drop them one at a time" where
+/// the others named the statement to repeat. The advice verb is the statement's own first
+/// word, so a sixth caller cannot invent a sixth phrasing.
+pub(super) fn one_object_at_a_time(statement: &str, noun: &str) -> PgWireError {
+    let verb = statement
+        .split_whitespace()
+        .next()
+        .unwrap_or(statement)
+        .to_lowercase();
+    make_vdb_error(
+        VdbErrorCode::FeatureNotSupported,
+        format!(
+            "{statement} with more than one {noun} is not supported by VaireDB; \
+             {verb} each {noun} with its own statement"
+        ),
+    )
+}
+
+/// The refusal for a referential action the catalog cannot honor.
+///
+/// `CASCADE` and `RESTRICT` mean something only against a dependency graph, and the
+/// catalog keeps none — so honoring either silently would be a lie about what was
+/// checked. Four statements say exactly this.
+///
+/// `DROP SCHEMA` is not one of them and keeps its own wording: its `CASCADE` is
+/// refused because dropping the relations inside would be one shard fan-out per table
+/// with no way to undo a partial run, which is a different reason and a different thing
+/// for a client to do about it.
+pub(super) fn no_referential_actions(statement: &str) -> PgWireError {
+    make_vdb_error(
+        VdbErrorCode::FeatureNotSupported,
+        format!(
+            "{statement} ... CASCADE/RESTRICT is not supported by VaireDB; \
+             the catalog tracks no dependent objects"
+        ),
     )
 }
 
@@ -104,12 +162,8 @@ impl VaireDbQueryHandler {
         // become a table that accepts rows it can never return.
         reject_unserviceable_column_types(create)?;
 
-        let table_name = query_router::canonical_table_name(&create.name).ok_or_else(|| {
-            make_vdb_error(
-                VdbErrorCode::SqlSyntaxError,
-                "could not determine table name",
-            )
-        })?;
+        let table_name =
+            query_router::canonical_table_name(&create.name).ok_or_else(no_table_name)?;
 
         let ddl_ctx = ErrorContext::for_table(&table_name);
 
@@ -207,7 +261,7 @@ impl VaireDbQueryHandler {
 
         let node_addresses = self
             .catalog
-            .get_node_address_map()
+            .node_address_map()
             .map_err(|e| enrich_coordinator_error(&e, &ddl_ctx, &self.catalog))?;
 
         let mut successful_sends: Vec<(String, String, String)> = Vec::new();
@@ -220,7 +274,7 @@ impl VaireDbQueryHandler {
 
                 let write_id = uuid::Uuid::new_v4().to_string();
 
-                for node_id in &self.write_router.get_target_nodes(shard) {
+                for node_id in target_nodes(shard) {
                     if let Some(address) = node_addresses.get(node_id) {
                         let channel = self.pool.get(address).await.map_err(|_| {
                             make_vdb_error(
@@ -318,12 +372,8 @@ impl VaireDbQueryHandler {
             ));
         };
 
-        let table_name = query_router::canonical_table_name(&create.name).ok_or_else(|| {
-            make_vdb_error(
-                VdbErrorCode::SqlSyntaxError,
-                "could not determine table name",
-            )
-        })?;
+        let table_name =
+            query_router::canonical_table_name(&create.name).ok_or_else(no_table_name)?;
 
         // Reported before the query runs, for the same reason an existing name is:
         // a destination in a namespace that does not exist, or whose physical name
@@ -524,12 +574,7 @@ impl VaireDbQueryHandler {
     /// every other object kind is refused rather than resolved against the table
     /// namespace — `DROP VIEW t` naming a table used to drop it.
     pub(super) async fn handle_drop_table(&self, stmt: &Statement) -> PgWireResult<Response> {
-        let table_name = query_router::extract_table_name(stmt).ok_or_else(|| {
-            make_vdb_error(
-                VdbErrorCode::SqlSyntaxError,
-                "could not determine table name",
-            )
-        })?;
+        let table_name = query_router::extract_table_name(stmt).ok_or_else(no_table_name)?;
         let drop_ctx = ErrorContext::for_table(&table_name);
 
         let table_exists = self
@@ -545,12 +590,12 @@ impl VaireDbQueryHandler {
 
         let shards = self
             .catalog
-            .get_shards_for_table(&table_name)
+            .shards_for_table(&table_name)
             .map_err(|e| enrich_coordinator_error(&e, &drop_ctx, &self.catalog))?;
 
         let node_addresses = self
             .catalog
-            .get_node_address_map()
+            .node_address_map()
             .map_err(|e| enrich_coordinator_error(&e, &drop_ctx, &self.catalog))?;
 
         let failed = self
@@ -590,12 +635,7 @@ impl VaireDbQueryHandler {
     /// why TRUNCATE can be honored at all while cross-shard atomicity is still
     /// missing — unlike a multi-statement write, retrying converges.
     pub(super) async fn handle_truncate(&self, stmt: &Statement) -> PgWireResult<Response> {
-        let table_name = query_router::extract_table_name(stmt).ok_or_else(|| {
-            make_vdb_error(
-                VdbErrorCode::SqlSyntaxError,
-                "could not determine table name",
-            )
-        })?;
+        let table_name = query_router::extract_table_name(stmt).ok_or_else(no_table_name)?;
         let truncate_ctx = ErrorContext::for_table(&table_name);
 
         let table_exists = self
@@ -611,12 +651,12 @@ impl VaireDbQueryHandler {
 
         let shards = self
             .catalog
-            .get_shards_for_table(&table_name)
+            .shards_for_table(&table_name)
             .map_err(|e| enrich_coordinator_error(&e, &truncate_ctx, &self.catalog))?;
 
         let node_addresses = self
             .catalog
-            .get_node_address_map()
+            .node_address_map()
             .map_err(|e| enrich_coordinator_error(&e, &truncate_ctx, &self.catalog))?;
 
         // Emitted from the shard name rather than rendered from the parsed
@@ -649,12 +689,7 @@ impl VaireDbQueryHandler {
         let (table_name, operations, if_exists) = match stmt {
             Statement::AlterTable(alter) => {
                 let table_name =
-                    query_router::canonical_table_name(&alter.name).ok_or_else(|| {
-                        make_vdb_error(
-                            VdbErrorCode::SqlSyntaxError,
-                            "could not determine table name",
-                        )
-                    })?;
+                    query_router::canonical_table_name(&alter.name).ok_or_else(no_table_name)?;
                 (table_name, &alter.operations, alter.if_exists)
             }
             _ => {
@@ -737,12 +772,12 @@ impl VaireDbQueryHandler {
 
         let shards = self
             .catalog
-            .get_shards_for_table(&table_name)
+            .shards_for_table(&table_name)
             .map_err(|e| enrich_coordinator_error(&e, &alter_ctx, &self.catalog))?;
 
         let node_addresses = self
             .catalog
-            .get_node_address_map()
+            .node_address_map()
             .map_err(|e| enrich_coordinator_error(&e, &alter_ctx, &self.catalog))?;
 
         // An index is a dependency on the whole table for the shards' engine, so a
@@ -855,12 +890,12 @@ impl VaireDbQueryHandler {
 
         let shards = self
             .catalog
-            .get_shards_for_table(&old_name)
+            .shards_for_table(&old_name)
             .map_err(|e| enrich_coordinator_error(&e, &rename_ctx, &self.catalog))?;
 
         let node_addresses = self
             .catalog
-            .get_node_address_map()
+            .node_address_map()
             .map_err(|e| enrich_coordinator_error(&e, &rename_ctx, &self.catalog))?;
 
         // Claim the destination the way CREATE TABLE does, so a rename and a
@@ -942,7 +977,7 @@ impl VaireDbQueryHandler {
             let undo_sql = format!("ALTER TABLE {to} RENAME TO {from}");
             let write_id = uuid::Uuid::new_v4().to_string();
 
-            for node_id in &self.write_router.get_target_nodes(shard) {
+            for node_id in target_nodes(shard) {
                 let Some(address) = node_addresses.get(node_id) else {
                     continue;
                 };
@@ -950,7 +985,7 @@ impl VaireDbQueryHandler {
                     Ok(ch) => ch,
                     Err(e) => {
                         tracing::error!("RENAME TO connection to node {node_id} failed: {e}");
-                        failed_nodes.push(node_id.clone());
+                        failed_nodes.push(node_id.to_string());
                         continue;
                     }
                 };
@@ -959,7 +994,7 @@ impl VaireDbQueryHandler {
                         .await
                 {
                     tracing::error!("RENAME TO broadcast to node {node_id} failed: {e}");
-                    failed_nodes.push(node_id.clone());
+                    failed_nodes.push(node_id.to_string());
                     continue;
                 }
                 applied.push((address.clone(), undo_sql.clone(), to.clone()));
@@ -1030,7 +1065,7 @@ impl VaireDbQueryHandler {
             let shard_id = shard_table_name(table_name, shard.hash_bucket);
             let write_id = uuid::Uuid::new_v4().to_string();
 
-            for node_id in &self.write_router.get_target_nodes(shard) {
+            for node_id in target_nodes(shard) {
                 let Some(address) = node_addresses.get(node_id) else {
                     continue;
                 };
@@ -1038,13 +1073,13 @@ impl VaireDbQueryHandler {
                     Ok(ch) => ch,
                     Err(e) => {
                         tracing::error!("{op_label} connection to node {node_id} failed: {e}");
-                        failed_nodes.push(node_id.clone());
+                        failed_nodes.push(node_id.to_string());
                         continue;
                     }
                 };
                 if let Err(e) = send_ddl_to_node(channel, &write_id, &shard_sql, &shard_id).await {
                     tracing::error!("{op_label} broadcast to node {node_id} failed: {e}");
-                    failed_nodes.push(node_id.clone());
+                    failed_nodes.push(node_id.to_string());
                 }
             }
         }
@@ -1303,24 +1338,12 @@ fn plan_drop(stmt: &Statement, table_name: &str, table_exists: bool) -> PgWireRe
         ));
     }
 
-    // Only the first name is ever acted on, so accepting a multi-object DROP
-    // would report success for objects that were never touched.
     if names.len() > 1 {
-        return Err(make_vdb_error(
-            VdbErrorCode::FeatureNotSupported,
-            "DROP TABLE with more than one table is not supported by VaireDB; \
-             drop each table with its own statement",
-        ));
+        return Err(one_object_at_a_time("DROP TABLE", "table"));
     }
 
-    // Referential actions have no meaning while the catalog models no dependent
-    // objects; honoring them silently would be a lie.
     if *cascade || *restrict {
-        return Err(make_vdb_error(
-            VdbErrorCode::FeatureNotSupported,
-            "DROP TABLE ... CASCADE/RESTRICT is not supported by VaireDB; \
-             the catalog tracks no dependent objects",
-        ));
+        return Err(no_referential_actions("DROP TABLE"));
     }
 
     if !table_exists {
@@ -1371,25 +1394,15 @@ fn plan_truncate(
         ));
     };
 
-    // Only the first name is ever acted on, and PostgreSQL's guarantee for the
-    // multi-table form is that all of them are emptied together — which is exactly
-    // what a per-shard broadcast cannot give.
+    // Beyond the shared reason: PostgreSQL's guarantee for the multi-table form is that
+    // all of them are emptied together, which is exactly what a per-shard broadcast
+    // cannot give.
     if truncate.table_names.len() > 1 {
-        return Err(make_vdb_error(
-            VdbErrorCode::FeatureNotSupported,
-            "TRUNCATE with more than one table is not supported by VaireDB; \
-             truncate each table with its own statement",
-        ));
+        return Err(one_object_at_a_time("TRUNCATE", "table"));
     }
 
-    // Referential actions have no meaning while the catalog models no dependent
-    // objects; honoring them silently would be a lie.
     if truncate.cascade.is_some() {
-        return Err(make_vdb_error(
-            VdbErrorCode::FeatureNotSupported,
-            "TRUNCATE ... CASCADE/RESTRICT is not supported by VaireDB; \
-             the catalog tracks no dependent objects",
-        ));
+        return Err(no_referential_actions("TRUNCATE"));
     }
 
     // CONTINUE IDENTITY is the default and is what a truncate without sequences
@@ -1517,31 +1530,11 @@ async fn send_ddl_to_node(
 
 #[cfg(test)]
 mod tests {
+    use super::super::write_path_test_helper::{
+        parse_alter, parse_alter_ops, parse_one, user_error,
+    };
     use super::*;
-    use crate::pgwire_handler::parser::parse_sql;
-
-    /// Parse a single statement, panicking on anything else.
-    fn parse_one(sql: &str) -> Statement {
-        let mut stmts = parse_sql(sql).unwrap_or_else(|e| panic!("failed to parse `{sql}`: {e}"));
-        assert_eq!(stmts.len(), 1, "`{sql}` must parse to one statement");
-        stmts.remove(0)
-    }
-
-    /// The SQLSTATE and message a `PgWireError` reports to the client.
-    fn user_error(err: PgWireError) -> (String, String) {
-        match err {
-            PgWireError::UserError(info) => (info.code.clone(), info.message.clone()),
-            other => panic!("expected a user-facing error, got {other:?}"),
-        }
-    }
-
-    /// The operation list of a single `ALTER TABLE`, panicking on anything else.
-    fn parse_alter_ops(sql: &str) -> Vec<AlterTableOperation> {
-        match parse_one(sql) {
-            Statement::AlterTable(alter) => alter.operations,
-            other => panic!("expected ALTER TABLE, got {other:?}"),
-        }
-    }
+    use crate::catalog::catalog_test_helper::table_meta;
 
     /// The SQLSTATE and message a rejected `DROP` plan reports to the client.
     fn rejection(sql: &str, table_name: &str, table_exists: bool) -> (String, String) {
@@ -1729,25 +1722,23 @@ mod tests {
     /// The canonical target name and operation list of a parsed `ALTER TABLE`. The
     /// name is needed because a schema-qualified `RENAME TO` destination is read
     /// against it.
-    fn parse_alter(sql: &str) -> (String, Vec<AlterTableOperation>) {
-        match parse_one(sql) {
-            Statement::AlterTable(alter) => (
-                query_router::canonical_table_name(&alter.name).expect("a plain table name"),
-                alter.operations,
-            ),
-            other => panic!("expected ALTER TABLE, got {other:?}"),
-        }
+    fn named_alter(sql: &str) -> (String, Vec<AlterTableOperation>) {
+        let alter = parse_alter(sql);
+        (
+            query_router::canonical_table_name(&alter.name).expect("a plain table name"),
+            alter.operations,
+        )
     }
 
     /// The plan a `ALTER TABLE` operation list produces.
     fn alter_plan(sql: &str) -> AlterPlan {
-        let (name, ops) = parse_alter(sql);
+        let (name, ops) = named_alter(sql);
         plan_alter(&ops, &name).unwrap_or_else(|e| panic!("`{sql}` must plan: {e}"))
     }
 
     /// The SQLSTATE and message a rejected `ALTER TABLE` plan reports.
     fn alter_rejection(sql: &str) -> (String, String) {
-        let (name, ops) = parse_alter(sql);
+        let (name, ops) = named_alter(sql);
         user_error(plan_alter(&ops, &name).expect_err("`{sql}` must be rejected"))
     }
 
@@ -2136,19 +2127,7 @@ mod tests {
     fn register_test_table(handler: &VaireDbQueryHandler, name: &str) {
         handler
             .catalog
-            .put_table(&TableMeta {
-                table_name: name.to_string(),
-                columns: vec![crate::catalog::ColumnDef {
-                    name: "id".to_string(),
-                    data_type: "INTEGER".to_string(),
-                    nullable: true,
-                    default_expr: String::new(),
-                }],
-                shard_key: "id".to_string(),
-                shard_count: 1,
-                replication_factor: 1,
-                ..Default::default()
-            })
+            .put_table(&table_meta(name, &["id"], "id"))
             .unwrap();
     }
 }

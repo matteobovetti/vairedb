@@ -43,9 +43,11 @@ use datafusion_pg_catalog::sql::rules::{
 
 use vairedb_common::not_in::NOT_IN_UDF_NAME;
 
+use super::parser;
+
 use crate::sqlparser::ast::{
     BinaryOperator, Expr, FunctionArg, FunctionArgExpr, FunctionArguments, Join, JoinConstraint,
-    JoinOperator, Query, Select, SelectItem, SetExpr, Statement, TableFactor, Value,
+    JoinOperator, Query, Select, SelectItem, SetExpr, Statement, TableFactor, Value, Visit,
     visit_expressions, visit_expressions_mut,
 };
 
@@ -367,9 +369,6 @@ fn join_constraint_mut(join: &mut Join) -> Option<&mut JoinConstraint> {
 /// bump, and an operand whose `Display` does not round-trip returns `None` here — which
 /// leaves the statement as the client wrote it instead of corrupting it.
 fn null_aware_not_in(expr: &Expr, subquery: &Query, nth: usize, grouped: Grouped) -> Option<Expr> {
-    use crate::sqlparser::dialect::PostgreSqlDialect;
-    use crate::sqlparser::parser::Parser;
-
     if !projects_one_named_column(subquery) || !subquery_is_self_contained(subquery) {
         return None;
     }
@@ -400,12 +399,7 @@ fn null_aware_not_in(expr: &Expr, subquery: &Query, nth: usize, grouped: Grouped
              WHERE {rel}.{key} = ({expr}))))"
         )
     };
-    let mut statements = Parser::new(&PostgreSqlDialect {})
-        .try_with_sql(&sql)
-        .ok()?
-        .parse_statements()
-        .ok()?;
-    let Statement::Query(query) = statements.pop()? else {
+    let Statement::Query(query) = parser::parse_verbatim(&sql).ok()?.pop()? else {
         return None;
     };
     let SetExpr::Select(select) = *query.body else {
@@ -447,11 +441,20 @@ fn projects_one_named_column(query: &Query) -> bool {
 /// [`rewrite_not_in_subqueries`]. Deliberately blunter than "is an aggregate": the name
 /// list that question needs would have to track two engines' function registries, and
 /// declining a scalar call in a `HAVING` leaves it exactly as the client wrote it.
-fn holds_a_function_call(expr: &Expr) -> bool {
-    use crate::sqlparser::ast::visit_expressions;
+fn holds_a_function_call(node: &Expr) -> bool {
+    any_expression(node, |expr| matches!(expr, Expr::Function(_)))
+}
 
-    visit_expressions(expr, |node| {
-        if matches!(node, Expr::Function(_)) {
+/// Whether any expression anywhere under `node` satisfies `predicate`.
+///
+/// The one way this module asks that question. Four of these walks had been written by
+/// hand and three of them kept going after the answer was known, accumulating into a
+/// `bool` the visitor could have returned — a full traversal of the statement per call,
+/// and three of them run on the parse path as *cheap guards* deciding whether the text is
+/// worth a second parse. Breaking is the point of `ControlFlow`.
+fn any_expression<V: Visit>(node: &V, mut predicate: impl FnMut(&Expr) -> bool) -> bool {
+    visit_expressions(node, |expr| {
+        if predicate(expr) {
             ControlFlow::Break(())
         } else {
             ControlFlow::Continue(())
@@ -525,17 +528,15 @@ fn subquery_is_self_contained(query: &Query) -> bool {
         return false;
     }
 
-    let mut local = true;
-    let _ = visit_expressions(query, |expr| {
+    !any_expression(query, |expr| {
         if let Expr::CompoundIdentifier(parts) = expr
             && let Some(qualifier) = parts.first()
-            && !declared.names.contains(&fold(&qualifier.value))
         {
-            local = false;
+            !declared.names.contains(&fold(&qualifier.value))
+        } else {
+            false
         }
-        ControlFlow::<()>::Continue(())
-    });
-    local
+    })
 }
 
 /// Whether `stmt` — a *compat* AST — carries the `array_contains` call over a subquery
@@ -548,19 +549,21 @@ fn subquery_is_self_contained(query: &Query) -> bool {
 /// because the decision is then taken by [`mentions_any_all_subquery`] against that
 /// parse — where its statement has no `ANY`/`ALL` at all and is left alone.
 pub(super) fn holds_a_mangled_any_all(stmt: &Statement) -> bool {
-    let mut found = false;
-    let _ = visit_expressions(stmt, |expr| {
+    any_expression(stmt, |expr| {
         if let Expr::Function(func) = expr
             && func.name.to_string().eq_ignore_ascii_case("array_contains")
             && let FunctionArguments::List(args) = &func.args
-            && let Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Subquery(_)))) =
-                args.args.first()
         {
-            found = true;
+            matches!(
+                args.args.first(),
+                Some(FunctionArg::Unnamed(FunctionArgExpr::Expr(Expr::Subquery(
+                    _
+                ))))
+            )
+        } else {
+            false
         }
-        ControlFlow::<()>::Continue(())
-    });
-    found
+    })
 }
 
 /// Whether `stmt` carries one of the shapes [`normalize_any_all_subqueries`] fixes.
@@ -568,14 +571,7 @@ pub(super) fn holds_a_mangled_any_all(stmt: &Statement) -> bool {
 /// Separate from the rewrite so the caller can decide whether to take the statement
 /// over before cloning it.
 pub(super) fn mentions_any_all_subquery(stmt: &Statement) -> bool {
-    let mut found = false;
-    let _ = visit_expressions(stmt, |expr| {
-        if any_all_subquery_as_in(expr).is_some() {
-            found = true;
-        }
-        ControlFlow::<()>::Continue(())
-    });
-    found
+    any_expression(stmt, |expr| any_all_subquery_as_in(expr).is_some())
 }
 
 /// Whether the upstream chain would replace a projection subquery of `stmt` with
@@ -610,64 +606,46 @@ fn subquery_count(stmt: &Statement) -> usize {
 /// worth parsing a second time, not whether anything is wrong. A client that writes
 /// `SELECT NULL` matches too and pays one extra parse, because the decision is then
 /// taken by [`upstream_would_null_a_subquery`] against that parse.
-pub(super) fn projects_a_bare_null(stmt: &Statement) -> bool {
-    let mut found = false;
-    visit_queries(stmt, &mut |query| {
-        if let SetExpr::Select(select) = &*query.body {
-            for item in &select.projection {
-                let expr = match item {
-                    SelectItem::UnnamedExpr(expr) => expr,
-                    SelectItem::ExprWithAlias { expr, .. } => expr,
-                    _ => continue,
-                };
-                if let Expr::Value(v) = expr
-                    && matches!(v.value, Value::Null)
-                {
-                    found = true;
-                }
-            }
-        }
-    });
-    found
-}
-
-/// Call `f` on every `Query` in `stmt`, outer first.
 ///
-/// sqlparser's visitor is derived over the whole AST, so this reaches a subquery in a
-/// projection, a CTE body and a derived table alike — which is where the folded
-/// projections can be.
-fn visit_queries(stmt: &Statement, f: &mut impl FnMut(&Query)) {
-    use crate::sqlparser::ast::{Visit, Visitor};
+/// Visits `Query` nodes rather than expressions: sqlparser's derived visitor reaches a
+/// subquery in a projection, a CTE body and a derived table alike, which is where the
+/// folded projections can be, and the question is about a *projection list* — an
+/// expression walk would also match the `NULL` in `WHERE x = NULL`.
+pub(super) fn projects_a_bare_null(stmt: &Statement) -> bool {
+    use crate::sqlparser::ast::Visitor;
 
-    struct QueryVisitor<'a, F: FnMut(&Query)>(&'a mut F);
+    struct BareNull;
 
-    impl<F: FnMut(&Query)> Visitor for QueryVisitor<'_, F> {
+    impl Visitor for BareNull {
         type Break = ();
 
         fn pre_visit_query(&mut self, query: &Query) -> ControlFlow<Self::Break> {
-            (self.0)(query);
-            ControlFlow::Continue(())
+            let SetExpr::Select(select) = &*query.body else {
+                return ControlFlow::Continue(());
+            };
+            let projects_null = select.projection.iter().any(|item| {
+                let expr = match item {
+                    SelectItem::UnnamedExpr(expr) | SelectItem::ExprWithAlias { expr, .. } => expr,
+                    _ => return false,
+                };
+                matches!(expr, Expr::Value(v) if matches!(v.value, Value::Null))
+            });
+            if projects_null {
+                ControlFlow::Break(())
+            } else {
+                ControlFlow::Continue(())
+            }
         }
     }
 
-    let _ = stmt.visit(&mut QueryVisitor(f));
+    stmt.visit(&mut BareNull).is_break()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sqlparser::dialect::PostgreSqlDialect;
-    use crate::sqlparser::parser::Parser;
+    use crate::pgwire_handler::read_path_test_helper::parse_verbatim;
     use datafusion_pg_catalog::sql::PostgresCompatibilityParser;
-
-    fn parse(sql: &str) -> Statement {
-        Parser::new(&PostgreSqlDialect {})
-            .try_with_sql(sql)
-            .unwrap()
-            .parse_statements()
-            .unwrap()
-            .remove(0)
-    }
 
     /// The premise of the whole module: fed through the compatibility parser, a select
     /// list subquery that mentions the outer row comes back as a `NULL` literal. If
@@ -693,15 +671,15 @@ mod tests {
     #[test]
     fn recognizes_the_statements_upstream_would_fold() {
         // Genuinely correlated — the outer row is referenced.
-        assert!(upstream_would_null_a_subquery(&parse(
+        assert!(upstream_would_null_a_subquery(&parse_verbatim(
             "SELECT (SELECT max(l.amount) FROM lines l WHERE l.oid = o.id) FROM orders o"
         )));
         // Not correlated at all, but upstream folds it too: an `$N` placeholder counts
         // as correlation, and so does a qualified name whose table has no alias.
-        assert!(upstream_would_null_a_subquery(&parse(
+        assert!(upstream_would_null_a_subquery(&parse_verbatim(
             "SELECT (SELECT max(amount) FROM lines WHERE oid = $1) FROM orders"
         )));
-        assert!(upstream_would_null_a_subquery(&parse(
+        assert!(upstream_would_null_a_subquery(&parse_verbatim(
             "SELECT (SELECT count(*) FROM lines WHERE lines.oid = 1) FROM orders"
         )));
     }
@@ -710,18 +688,18 @@ mod tests {
     fn leaves_the_statements_upstream_only_stamps() {
         // Upstream adds `LIMIT 1` here rather than folding, so the count is unchanged
         // and VaireDB does not take the statement over.
-        assert!(!upstream_would_null_a_subquery(&parse(
+        assert!(!upstream_would_null_a_subquery(&parse_verbatim(
             "SELECT (SELECT max(amount) FROM lines) FROM orders"
         )));
-        assert!(!upstream_would_null_a_subquery(&parse(
+        assert!(!upstream_would_null_a_subquery(&parse_verbatim(
             "SELECT id FROM orders WHERE id IN (SELECT oid FROM lines)"
         )));
-        assert!(!upstream_would_null_a_subquery(&parse("SELECT 1")));
+        assert!(!upstream_would_null_a_subquery(&parse_verbatim("SELECT 1")));
     }
 
     #[test]
     fn keeps_the_subquery_the_upstream_chain_would_delete() {
-        let stmt = parse(
+        let stmt = parse_verbatim(
             "SELECT o.id, (SELECT max(l.amount) FROM lines l WHERE l.oid = o.id) FROM orders o",
         );
 
@@ -740,7 +718,7 @@ mod tests {
     /// user queries: drivers send it for every "id in list" parameter binding.
     #[test]
     fn still_applies_the_rest_of_the_compatibility_chain() {
-        let stmt = parse(
+        let stmt = parse_verbatim(
             "SELECT (SELECT max(l.amount) FROM lines l WHERE l.oid = o.id) \
              FROM orders o WHERE o.id = ANY(ARRAY[1, 2])",
         );
@@ -782,7 +760,7 @@ mod tests {
                 "id NOT IN (SELECT oid FROM lines)",
             ),
         ] {
-            let mut stmt = parse(sql);
+            let mut stmt = parse_verbatim(sql);
             assert!(mentions_any_all_subquery(&stmt), "not detected: {sql}");
             assert!(normalize_any_all_subqueries(&mut stmt));
 
@@ -830,7 +808,7 @@ mod tests {
     /// not touch — a driver binding an "id in list" parameter sends `= ANY(ARRAY[…])`.
     #[test]
     fn leaves_the_array_forms_to_the_upstream_rule() {
-        let mut stmt = parse("SELECT id FROM orders WHERE id = ANY(ARRAY[1, 2])");
+        let mut stmt = parse_verbatim("SELECT id FROM orders WHERE id = ANY(ARRAY[1, 2])");
         assert!(!mentions_any_all_subquery(&stmt));
         assert!(!normalize_any_all_subqueries(&mut stmt));
 
@@ -852,7 +830,7 @@ mod tests {
             "SELECT id FROM orders WHERE id = ALL (SELECT oid FROM lines)",
             "SELECT id FROM orders WHERE id <> ANY (SELECT oid FROM lines)",
         ] {
-            let mut stmt = parse(sql);
+            let mut stmt = parse_verbatim(sql);
             assert!(!mentions_any_all_subquery(&stmt), "swept in: {sql}");
             assert!(!normalize_any_all_subqueries(&mut stmt), "rewritten: {sql}");
         }
@@ -863,7 +841,7 @@ mod tests {
     /// also triggers the takeover above.
     #[test]
     fn normalizes_a_nested_occurrence() {
-        let mut stmt = parse(
+        let mut stmt = parse_verbatim(
             "SELECT (SELECT count(*) FROM lines l WHERE l.oid = o.id) FROM orders o \
              WHERE o.id = ANY (SELECT oid FROM shipped)",
         );
@@ -890,14 +868,14 @@ mod tests {
     /// only to the extent of asking for a second parse.
     #[test]
     fn the_guard_does_not_decide_on_its_own() {
-        let stmt = parse("SELECT NULL AS nothing FROM orders");
+        let stmt = parse_verbatim("SELECT NULL AS nothing FROM orders");
         assert!(projects_a_bare_null(&stmt));
         assert!(!upstream_would_null_a_subquery(&stmt));
     }
 
     /// `sql` after [`rewrite_not_in_subqueries`], asserting it was rewritten at all.
     fn rewritten(sql: &str) -> String {
-        let mut stmt = parse(sql);
+        let mut stmt = parse_verbatim(sql);
         assert!(
             rewrite_not_in_subqueries(&mut stmt),
             "`{sql}` holds a `NOT IN (subquery)` in a truth-valued position"
@@ -907,7 +885,7 @@ mod tests {
 
     /// Assert `sql` comes back exactly as written.
     fn untouched(sql: &str) {
-        let mut stmt = parse(sql);
+        let mut stmt = parse_verbatim(sql);
         let before = stmt.to_string();
         assert!(
             !rewrite_not_in_subqueries(&mut stmt),
@@ -1096,7 +1074,7 @@ mod tests {
     /// it safe to run at every read-path exit of the parser.
     #[test]
     fn is_idempotent() {
-        let mut stmt = parse("SELECT k FROM l WHERE k NOT IN (SELECT k FROM r)");
+        let mut stmt = parse_verbatim("SELECT k FROM l WHERE k NOT IN (SELECT k FROM r)");
         assert!(rewrite_not_in_subqueries(&mut stmt));
         let once = stmt.to_string();
         assert!(!rewrite_not_in_subqueries(&mut stmt));

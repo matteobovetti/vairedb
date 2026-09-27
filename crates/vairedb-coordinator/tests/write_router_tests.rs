@@ -1,5 +1,12 @@
+//! Where a write goes and what it looks like when it gets there: bucket
+//! resolution, shard-local rewriting, and the quorum/replica arithmetic.
+//!
+//! The hash function and the bucket-to-shard lookup are a cross-node contract —
+//! the coordinator routes on them and the core nodes create tables named by them —
+//! so the tests that pin them are about agreement, not just about not crashing.
+
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use datafusion::scalar::ScalarValue;
 use vairedb_coordinator::catalog::{
@@ -7,543 +14,35 @@ use vairedb_coordinator::catalog::{
 };
 use vairedb_coordinator::error::CoordinatorError;
 use vairedb_coordinator::pgwire_handler::parser;
-use vairedb_coordinator::write_router::{WriteRouter, compute_shard_index, shard_for_bucket};
+use vairedb_coordinator::sqlparser::ast::Statement;
+use vairedb_coordinator::write_router::{
+    WriteRouter, compute_quorum_size, compute_shard_index, shard_for_bucket, target_nodes,
+};
 use vairedb_coordinator::write_sql_cl;
 
-static COUNTER: AtomicU32 = AtomicU32::new(0);
-
-fn temp_db_path() -> String {
-    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!(
-        "/tmp/vairedb_test_write_router_{}_{}.redb",
-        std::process::id(),
-        id
-    )
-}
-
-fn setup_catalog_with_table() -> (Arc<MetadataCatalog>, TableMeta) {
-    let catalog = Arc::new(MetadataCatalog::open(&temp_db_path()).unwrap());
-
-    let node = NodeMeta {
-        node_id: "node-0".to_string(),
-        advertised_address: "10.0.0.1:50041".to_string(),
-        state: NodeState::Alive as i32,
-        last_heartbeat: Some(prost_types::Timestamp {
-            seconds: 1000,
-            nanos: 0,
-        }),
-        registered_at: None,
-    };
-    catalog.put_node(&node).unwrap();
-
-    let table_meta = TableMeta {
-        anonymized_columns: std::collections::HashMap::new(),
-        indexes: Vec::new(),
-        constraints: Vec::new(),
-        table_name: "orders".to_string(),
-        columns: vec![
-            ColumnDef {
-                name: "customer_id".to_string(),
-                data_type: "INT".to_string(),
-                nullable: false,
-                default_expr: String::new(),
-            },
-            ColumnDef {
-                name: "amount".to_string(),
-                data_type: "INT".to_string(),
-                nullable: true,
-                default_expr: String::new(),
-            },
-        ],
-        shard_strategy: ShardStrategy::Hash as i32,
-        shard_key: "customer_id".to_string(),
-        shard_count: 3,
-        replication_factor: 3,
-        created_at: None,
-    };
-    catalog.put_table(&table_meta).unwrap();
-
-    for i in 0..3 {
-        let shard = ShardMeta {
-            shard_id: format!("orders_part{}", i),
-            table_name: "orders".to_string(),
-            primary_node_id: "node-0".to_string(),
-            replica_node_ids: vec![],
-            hash_bucket: i,
-            range_lower: String::new(),
-            range_upper: String::new(),
-        };
-        catalog.put_shard(&shard).unwrap();
-    }
-
-    (catalog, table_meta)
-}
-
-#[test]
-fn test_compute_shard_index_deterministic() {
-    let idx1 = compute_shard_index("42", 6);
-    let idx2 = compute_shard_index("42", 6);
-    assert_eq!(idx1, idx2);
-    assert!(idx1 < 6);
-}
-
-#[test]
-fn test_compute_shard_index_range() {
-    for i in 0..100 {
-        let idx = compute_shard_index(&i.to_string(), 6);
-        assert!(idx < 6);
-    }
-}
-
-#[test]
-fn test_compute_shard_index_single_shard() {
-    for i in 0..50 {
-        let idx = compute_shard_index(&i.to_string(), 1);
-        assert_eq!(idx, 0);
-    }
-}
-
-#[test]
-fn test_compute_quorum_size_rf3() {
-    let (catalog, _) = setup_catalog_with_table();
-    let router = WriteRouter::new(catalog);
-    assert_eq!(router.compute_quorum_size(3), 2);
-}
-
-#[test]
-fn test_compute_quorum_size_rf1() {
-    let (catalog, _) = setup_catalog_with_table();
-    let router = WriteRouter::new(catalog);
-    assert_eq!(router.compute_quorum_size(1), 1);
-}
-
-#[test]
-fn test_compute_quorum_size_rf5() {
-    let (catalog, _) = setup_catalog_with_table();
-    let router = WriteRouter::new(catalog);
-    assert_eq!(router.compute_quorum_size(5), 3);
-}
-
-#[test]
-fn test_get_target_nodes_primary_only() {
-    let (catalog, _) = setup_catalog_with_table();
-    let router = WriteRouter::new(catalog);
-
-    let shard = ShardMeta {
-        shard_id: "p0".to_string(),
-        table_name: "orders".to_string(),
-        primary_node_id: "node-0".to_string(),
-        replica_node_ids: vec![],
-        hash_bucket: 0,
-        range_lower: String::new(),
-        range_upper: String::new(),
-    };
-
-    let nodes = router.get_target_nodes(&shard);
-    assert_eq!(nodes, vec!["node-0".to_string()]);
-}
-
-#[test]
-fn test_get_target_nodes_with_replicas() {
-    let (catalog, _) = setup_catalog_with_table();
-    let router = WriteRouter::new(catalog);
-
-    let shard = ShardMeta {
-        shard_id: "p0".to_string(),
-        table_name: "orders".to_string(),
-        primary_node_id: "node-0".to_string(),
-        replica_node_ids: vec!["node-1".to_string(), "node-2".to_string()],
-        hash_bucket: 0,
-        range_lower: String::new(),
-        range_upper: String::new(),
-    };
-
-    let nodes = router.get_target_nodes(&shard);
-    assert_eq!(nodes.len(), 3);
-    assert_eq!(nodes[0], "node-0");
-    assert_eq!(nodes[1], "node-1");
-    assert_eq!(nodes[2], "node-2");
-}
-
-#[test]
-fn test_resolve_target_shards_with_key() {
-    let (catalog, table_meta) = setup_catalog_with_table();
-    let router = WriteRouter::new(catalog);
-
-    let sql = "INSERT INTO orders (customer_id, amount) VALUES (42, 100)";
-    let stmts = parser::parse_sql(sql).unwrap();
-
-    let result = router
-        .resolve_target_shards(&stmts[0], &table_meta, &[])
-        .unwrap();
-    assert_eq!(result.len(), 1);
-}
-
-#[test]
-fn test_resolve_target_shards_without_key_returns_all() {
-    let (catalog, table_meta) = setup_catalog_with_table();
-    let router = WriteRouter::new(catalog);
-
-    let sql = "DELETE FROM orders";
-    let stmts = parser::parse_sql(sql).unwrap();
-
-    let result = router
-        .resolve_target_shards(&stmts[0], &table_meta, &[])
-        .unwrap();
-    assert_eq!(result.len(), 3);
-}
-
-#[test]
-fn test_resolve_target_shards_empty_table_errors() {
-    let catalog = Arc::new(MetadataCatalog::open(&temp_db_path()).unwrap());
-    let table_meta = TableMeta {
-        anonymized_columns: std::collections::HashMap::new(),
-        indexes: Vec::new(),
-        constraints: Vec::new(),
-        table_name: "empty_table".to_string(),
-        columns: vec![],
-        shard_strategy: ShardStrategy::Hash as i32,
-        shard_key: "id".to_string(),
-        shard_count: 3,
-        replication_factor: 3,
-        created_at: None,
-    };
-    catalog.put_table(&table_meta).unwrap();
-    let router = WriteRouter::new(catalog);
-
-    let sql = "INSERT INTO empty_table (id) VALUES (1)";
-    let stmts = parser::parse_sql(sql).unwrap();
-
-    let result = router.resolve_target_shards(&stmts[0], &table_meta, &[]);
-    assert!(result.is_err());
-}
-
-#[test]
-fn test_generate_shard_local_sql() {
-    let (catalog, _) = setup_catalog_with_table();
-    let router = WriteRouter::new(catalog);
-
-    let shard = ShardMeta {
-        shard_id: "orders_part0".to_string(),
-        table_name: "orders".to_string(),
-        primary_node_id: "node-0".to_string(),
-        replica_node_ids: vec![],
-        hash_bucket: 0,
-        range_lower: String::new(),
-        range_upper: String::new(),
-    };
-
-    let sql = "INSERT INTO orders (customer_id) VALUES (1)";
-    let stmts = parser::parse_sql(sql).unwrap();
-
-    let (result, _params) = router
-        .generate_shard_local_sql(&stmts[0], &shard, &[])
-        .unwrap();
-    assert!(result.contains("orders_shard0"));
-}
-
-#[test]
-fn test_generate_shard_local_sql_malformed_placeholder_errors() {
-    let (catalog, _) = setup_catalog_with_table();
-    let router = WriteRouter::new(catalog);
-
-    let shard = ShardMeta {
-        shard_id: "orders_part0".to_string(),
-        table_name: "orders".to_string(),
-        primary_node_id: "node-0".to_string(),
-        replica_node_ids: vec![],
-        hash_bucket: 0,
-        range_lower: String::new(),
-        range_upper: String::new(),
-    };
-
-    // `$foo` parses as a placeholder whose name is not a positional index, so
-    // renumber_placeholders returns None. With non-empty params this must
-    // surface as an error rather than silently dropping the bind parameters.
-    let sql = "INSERT INTO orders (customer_id) VALUES ($foo)";
-    let stmts = parser::parse_sql(sql).unwrap();
-    let params = vec![ScalarValue::Int64(Some(1))];
-
-    let result = router.generate_shard_local_sql(&stmts[0], &shard, &params);
-    assert!(matches!(result, Err(CoordinatorError::Internal(_))));
-}
-
-#[test]
-fn test_generate_shard_local_sql_with_bytea() {
-    let (catalog, _) = setup_catalog_with_table();
-    let router = WriteRouter::new(catalog);
-
-    let shard = ShardMeta {
-        shard_id: "t_part0".to_string(),
-        table_name: "t".to_string(),
-        primary_node_id: "node-0".to_string(),
-        replica_node_ids: vec![],
-        hash_bucket: 1,
-        range_lower: String::new(),
-        range_upper: String::new(),
-    };
-
-    let sql = "CREATE TABLE t (data BYTEA)";
-    let stmts = parser::parse_sql(sql).unwrap();
-
-    let (result, _params) = router
-        .generate_shard_local_sql(&stmts[0], &shard, &[])
-        .unwrap();
-    assert!(result.contains("BLOB"));
-    assert!(result.contains("t_shard1"));
-}
-
-#[test]
-fn test_resolve_target_shards_update_with_key() {
-    let (catalog, table_meta) = setup_catalog_with_table();
-    let router = WriteRouter::new(catalog);
-
-    let sql = "UPDATE orders SET amount = 200 WHERE customer_id = 42";
-    let stmts = parser::parse_sql(sql).unwrap();
-
-    let result = router
-        .resolve_target_shards(&stmts[0], &table_meta, &[])
-        .unwrap();
-    assert_eq!(result.len(), 1);
-}
-
-#[test]
-fn test_resolve_target_shards_update_without_key() {
-    let (catalog, table_meta) = setup_catalog_with_table();
-    let router = WriteRouter::new(catalog);
-
-    let sql = "UPDATE orders SET amount = 0 WHERE amount > 100";
-    let stmts = parser::parse_sql(sql).unwrap();
-
-    let result = router
-        .resolve_target_shards(&stmts[0], &table_meta, &[])
-        .unwrap();
-    assert_eq!(result.len(), 3);
-}
-
-#[test]
-fn test_resolve_target_shards_delete_with_key() {
-    let (catalog, table_meta) = setup_catalog_with_table();
-    let router = WriteRouter::new(catalog);
-
-    let sql = "DELETE FROM orders WHERE customer_id = 7";
-    let stmts = parser::parse_sql(sql).unwrap();
-
-    let result = router
-        .resolve_target_shards(&stmts[0], &table_meta, &[])
-        .unwrap();
-    assert_eq!(result.len(), 1);
-}
-
-#[test]
-fn test_resolve_target_shards_select_returns_all() {
-    let (catalog, table_meta) = setup_catalog_with_table();
-    let router = WriteRouter::new(catalog);
-
-    let sql = "SELECT * FROM orders";
-    let stmts = parser::parse_sql(sql).unwrap();
-
-    let result = router
-        .resolve_target_shards(&stmts[0], &table_meta, &[])
-        .unwrap();
-    assert_eq!(result.len(), 3);
-}
-
-#[test]
-fn test_generate_shard_local_sql_update() {
-    let (catalog, _) = setup_catalog_with_table();
-    let router = WriteRouter::new(catalog);
-
-    let shard = ShardMeta {
-        shard_id: "orders_part2".to_string(),
-        table_name: "orders".to_string(),
-        primary_node_id: "node-0".to_string(),
-        replica_node_ids: vec![],
-        hash_bucket: 2,
-        range_lower: String::new(),
-        range_upper: String::new(),
-    };
-
-    let sql = "UPDATE orders SET amount = 99 WHERE customer_id = 1";
-    let stmts = parser::parse_sql(sql).unwrap();
-
-    let (result, _params) = router
-        .generate_shard_local_sql(&stmts[0], &shard, &[])
-        .unwrap();
-    assert!(result.contains("orders_shard2"));
-    assert!(result.contains("99"));
-}
-
-#[test]
-fn test_generate_shard_local_sql_delete() {
-    let (catalog, _) = setup_catalog_with_table();
-    let router = WriteRouter::new(catalog);
-
-    let shard = ShardMeta {
-        shard_id: "orders_part1".to_string(),
-        table_name: "orders".to_string(),
-        primary_node_id: "node-0".to_string(),
-        replica_node_ids: vec![],
-        hash_bucket: 1,
-        range_lower: String::new(),
-        range_upper: String::new(),
-    };
-
-    let sql = "DELETE FROM orders WHERE customer_id = 5";
-    let stmts = parser::parse_sql(sql).unwrap();
-
-    let (result, _params) = router
-        .generate_shard_local_sql(&stmts[0], &shard, &[])
-        .unwrap();
-    assert!(result.contains("orders_shard1"));
-}
-
-#[test]
-fn test_compute_quorum_size_even_rf() {
-    let (catalog, _) = setup_catalog_with_table();
-    let router = WriteRouter::new(catalog);
-    assert_eq!(router.compute_quorum_size(2), 2);
-    assert_eq!(router.compute_quorum_size(4), 3);
-}
-
-#[test]
-fn test_compute_shard_index_empty_value() {
-    let idx = compute_shard_index("", 4);
-    assert!(idx < 4);
-}
-
-// ---------------------------------------------------------------------------
-// Multi-shard INSERT splitting. Mirrors the grouping in
-// pgwire_handler::handle_insert_with_split: each VALUES row is bucketed by
-// compute_shard_index on its shard-key value, then split_insert_by_rows rebuilds
-// a per-shard INSERT carrying only that shard's rows.
-// ---------------------------------------------------------------------------
-
-/// Group VALUES-row indices by target shard exactly as handle_insert_with_split
-/// does, so the split logic can be asserted without a live cluster.
-fn group_rows_by_shard(
-    stmt: &vairedb_coordinator::sqlparser::ast::Statement,
-    shard_key: &str,
-    shard_count: usize,
-) -> std::collections::HashMap<usize, Vec<usize>> {
-    let keys = write_sql_cl::extract_insert_row_shard_keys(stmt, shard_key, &[])
-        .expect("multi-row INSERT should expose per-row shard keys");
-    let mut shard_rows: std::collections::HashMap<usize, Vec<usize>> =
-        std::collections::HashMap::new();
-    for (row_idx, key_value) in &keys {
-        let shard_idx = compute_shard_index(key_value, shard_count);
-        shard_rows.entry(shard_idx).or_default().push(*row_idx);
-    }
-    shard_rows
-}
-
-#[test]
-fn test_multi_row_insert_splits_across_shards() {
-    // Pick three ids that hash to three distinct buckets so the INSERT must fan
-    // out to every shard.
-    let mut by_bucket: std::collections::HashMap<usize, i64> = std::collections::HashMap::new();
-    let mut id = 1i64;
-    while by_bucket.len() < 3 {
-        by_bucket
-            .entry(compute_shard_index(&id.to_string(), 3))
-            .or_insert(id);
-        id += 1;
-    }
-    let ids: Vec<i64> = by_bucket.values().copied().collect();
-    let values = ids
-        .iter()
-        .map(|i| format!("({i}, 100)"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!("INSERT INTO orders (customer_id, amount) VALUES {values}");
-    let stmts = parser::parse_sql(&sql).unwrap();
-
-    let shard_rows = group_rows_by_shard(&stmts[0], "customer_id", 3);
-    assert_eq!(
-        shard_rows.len(),
-        3,
-        "three ids hashing to distinct buckets must split into three shard groups"
-    );
-    // Every original row index is assigned to exactly one shard group.
-    let mut assigned: Vec<usize> = shard_rows.values().flatten().copied().collect();
-    assigned.sort_unstable();
-    assert_eq!(assigned, vec![0, 1, 2]);
-}
-
-#[test]
-fn test_multi_row_insert_same_shard_one_group() {
-    // Three ids that all hash to the same bucket must stay in a single group.
-    let bucket = compute_shard_index("1", 3);
-    let mut ids = Vec::new();
-    let mut id = 1i64;
-    while ids.len() < 3 {
-        if compute_shard_index(&id.to_string(), 3) == bucket {
-            ids.push(id);
-        }
-        id += 1;
-    }
-    let values = ids
-        .iter()
-        .map(|i| format!("({i}, 1)"))
-        .collect::<Vec<_>>()
-        .join(", ");
-    let sql = format!("INSERT INTO orders (customer_id, amount) VALUES {values}");
-    let stmts = parser::parse_sql(&sql).unwrap();
-
-    let shard_rows = group_rows_by_shard(&stmts[0], "customer_id", 3);
-    assert_eq!(shard_rows.len(), 1, "co-located rows must form one group");
-    assert_eq!(shard_rows[&bucket].len(), 3);
-}
-
-#[test]
-fn test_resolve_consistent_shard_routing() {
-    let (catalog, table_meta) = setup_catalog_with_table();
-    let router = WriteRouter::new(catalog);
-
-    let insert_sql = "INSERT INTO orders (customer_id, amount) VALUES (42, 100)";
-    let update_sql = "UPDATE orders SET amount = 200 WHERE customer_id = 42";
-    let delete_sql = "DELETE FROM orders WHERE customer_id = 42";
-
-    let insert_stmts = parser::parse_sql(insert_sql).unwrap();
-    let update_stmts = parser::parse_sql(update_sql).unwrap();
-    let delete_stmts = parser::parse_sql(delete_sql).unwrap();
-
-    let insert_shards = router
-        .resolve_target_shards(&insert_stmts[0], &table_meta, &[])
-        .unwrap();
-    let update_shards = router
-        .resolve_target_shards(&update_stmts[0], &table_meta, &[])
-        .unwrap();
-    let delete_shards = router
-        .resolve_target_shards(&delete_stmts[0], &table_meta, &[])
-        .unwrap();
-
-    assert_eq!(insert_shards[0].shard_id, update_shards[0].shard_id);
-    assert_eq!(insert_shards[0].shard_id, delete_shards[0].shard_id);
-}
-
-// ---------------------------------------------------------------------------
-// Bucket-to-shard resolution over more than ten shards.
-//
-// A shard's position in a list of shards is not its hash bucket: catalog records
-// are keyed by the string "{table}:shard{n}", so a prefix scan returns `shard10`
-// before `shard2`. Up to ten shards the two orders coincide and indexing by
-// position happens to work; from eleven on it does not, and routing by position
-// would send a key to a shard that does not own it — with no error, because every
-// shard can run the statement.
-// ---------------------------------------------------------------------------
-
-/// The number of shards these tests use: the smallest count at which the
-/// lexicographic order of the shard ids differs from the bucket order.
+mod common;
+use common::temp_catalog;
+
+/// The shard count the default fixture uses.
+const SHARDS: u32 = 3;
+
+/// A shard count above ten, where the lexicographic order of the stored shard ids
+/// (`shard10` before `shard2`) stops agreeing with the bucket order. Below eleven
+/// the two coincide and indexing by position happens to work.
 const WIDE_SHARDS: u32 = 11;
 
-/// One shard record of `orders` for `bucket`, primaried on the single test node.
-fn shard_of_bucket(bucket: u32) -> ShardMeta {
+// ---------------------------------------------------------------------------
+// Fixtures
+// ---------------------------------------------------------------------------
+
+/// One shard record of `table` for `bucket`, primaried on the single test node.
+///
+/// `shard_id` is spelled the way production spells it, which is what makes the
+/// stored key order lexicographic rather than numeric.
+fn shard_of(table: &str, bucket: u32) -> ShardMeta {
     ShardMeta {
-        // The production spelling: this is what makes the stored key order
-        // lexicographic rather than numeric.
         shard_id: format!("shard{bucket}"),
-        table_name: "orders".to_string(),
+        table_name: table.to_string(),
         primary_node_id: "node-0".to_string(),
         replica_node_ids: vec![],
         hash_bucket: bucket,
@@ -552,21 +51,93 @@ fn shard_of_bucket(bucket: u32) -> ShardMeta {
     }
 }
 
-/// The same `orders` table as [`setup_catalog_with_table`] but spread over
-/// `shard_count` shards whose records are keyed as production keys them.
-fn setup_catalog_with_shard_count(shard_count: u32) -> (Arc<MetadataCatalog>, TableMeta) {
-    let (catalog, mut table_meta) = setup_catalog_with_table();
-    catalog.delete_shards_for_table("orders").unwrap();
-    table_meta.shard_count = shard_count;
+/// `orders`, sharded on `customer_id` over `shard_count` buckets, in a catalog of
+/// its own.
+fn catalog_with_orders(shard_count: u32) -> (Arc<MetadataCatalog>, TableMeta) {
+    let catalog = Arc::new(temp_catalog());
+
+    catalog
+        .put_node(&NodeMeta {
+            node_id: "node-0".to_string(),
+            advertised_address: "10.0.0.1:50041".to_string(),
+            state: NodeState::Alive as i32,
+            last_heartbeat: None,
+            registered_at: None,
+        })
+        .unwrap();
+
+    let table_meta = TableMeta {
+        table_name: "orders".to_string(),
+        columns: ["customer_id", "amount"]
+            .into_iter()
+            .map(|name| ColumnDef {
+                name: name.to_string(),
+                data_type: "INT".to_string(),
+                nullable: false,
+                default_expr: String::new(),
+            })
+            .collect(),
+        shard_strategy: ShardStrategy::Hash as i32,
+        shard_key: "customer_id".to_string(),
+        shard_count,
+        replication_factor: 3,
+        anonymized_columns: HashMap::new(),
+        indexes: Vec::new(),
+        constraints: Vec::new(),
+        created_at: None,
+    };
     catalog.put_table(&table_meta).unwrap();
+
     for bucket in 0..shard_count {
-        catalog.put_shard(&shard_of_bucket(bucket)).unwrap();
+        catalog.put_shard(&shard_of("orders", bucket)).unwrap();
     }
+
     (catalog, table_meta)
 }
 
+fn router_for(shard_count: u32) -> (WriteRouter, TableMeta) {
+    let (catalog, table_meta) = catalog_with_orders(shard_count);
+    (WriteRouter::new(catalog), table_meta)
+}
+
+fn parse_one(sql: &str) -> Statement {
+    parser::parse_sql(sql)
+        .expect("the fixture SQL parses")
+        .swap_remove(0)
+}
+
+// ---------------------------------------------------------------------------
+// The hash
+// ---------------------------------------------------------------------------
+
+/// The routing contract: a key always hashes to the same bucket, and always to one
+/// that exists. A key landing outside `0..shard_count` would route a write to a
+/// shard that is not there; a key hashing differently twice would put an UPDATE on
+/// a different shard than the INSERT it is meant to amend.
 #[test]
-fn test_shard_for_bucket_matches_the_bucket_not_the_position() {
+fn a_key_hashes_to_the_same_in_range_bucket_every_time() {
+    for shard_count in [1, 3, 4, WIDE_SHARDS as usize] {
+        for key in (0..100).map(|i| i.to_string()).chain(["".to_string()]) {
+            let bucket = compute_shard_index(&key, shard_count);
+            assert!(
+                bucket < shard_count,
+                "{key:?} hashed outside 0..{shard_count}"
+            );
+            assert_eq!(
+                bucket,
+                compute_shard_index(&key, shard_count),
+                "{key:?} hashed differently twice"
+            );
+        }
+    }
+}
+
+/// A bucket is resolved by the `hash_bucket` each record carries, never by the
+/// record's position in the list. Past ten shards the two disagree, and routing by
+/// position would fail silently — every shard can run the statement, so the row is
+/// simply written to a shard that does not own its key.
+#[test]
+fn a_bucket_resolves_by_its_shard_record_not_by_list_position() {
     // The order a prefix scan hands the shards back in.
     let mut buckets: Vec<u32> = (0..WIDE_SHARDS).collect();
     buckets.sort_by_key(|bucket| format!("shard{bucket}"));
@@ -575,20 +146,21 @@ fn test_shard_for_bucket_matches_the_bucket_not_the_position() {
         "the fixture must be an order in which position and bucket disagree"
     );
 
-    let shards: Vec<ShardMeta> = buckets.iter().copied().map(shard_of_bucket).collect();
+    let shards: Vec<ShardMeta> = buckets.iter().map(|b| shard_of("orders", *b)).collect();
     for bucket in 0..WIDE_SHARDS as usize {
         let shard = shard_for_bucket(&shards, bucket, "orders").unwrap();
         assert_eq!(shard.hash_bucket as usize, bucket);
-        assert_eq!(shard.shard_id, format!("shard{bucket}"));
     }
 }
 
+/// An incomplete layout is an error, not something to fall back from: no shard owns
+/// the keys that hash to the missing bucket, and any other shard would be wrong.
 #[test]
-fn test_shard_for_bucket_reports_a_bucket_with_no_shard() {
-    // An incomplete layout: bucket 2 has no record, so no shard owns the keys
-    // that hash to it. Any other shard would be the wrong one.
-    let shards: Vec<ShardMeta> = [0, 1, 3].into_iter().map(shard_of_bucket).collect();
-    let err = shard_for_bucket(&shards, 2, "orders").unwrap_err();
+fn a_bucket_with_no_shard_record_is_refused_by_name() {
+    let shards: Vec<ShardMeta> = [0, 1, 3].map(|b| shard_of("orders", b)).to_vec();
+
+    let err = shard_for_bucket(&shards, 2, "orders").expect_err("bucket 2 has no shard");
+
     assert!(
         matches!(err, CoordinatorError::ShardNotAssigned(_)),
         "got: {err:?}"
@@ -598,13 +170,18 @@ fn test_shard_for_bucket_reports_a_bucket_with_no_shard() {
     assert!(message.contains("bucket 2"), "got: {message}");
 }
 
-#[test]
-fn test_resolve_target_shards_routes_to_the_hashed_bucket_over_ten_shards() {
-    let (catalog, table_meta) = setup_catalog_with_shard_count(WIDE_SHARDS);
-    let router = WriteRouter::new(catalog);
+// ---------------------------------------------------------------------------
+// Choosing the target shards
+// ---------------------------------------------------------------------------
 
-    // Enough keys to cover every bucket, including the ones whose position and
-    // bucket disagree.
+/// A statement that pins the shard key goes to exactly the shard owning that key's
+/// bucket — for every DML form, and across a shard count where position and bucket
+/// disagree. That INSERT, UPDATE and DELETE agree on the bucket is the property
+/// that makes a row findable by the statements that amend it.
+#[test]
+fn a_pinned_shard_key_routes_every_dml_form_to_the_bucket_that_owns_it() {
+    let (router, table_meta) = router_for(WIDE_SHARDS);
+
     for id in 1..=60i64 {
         let expected = compute_shard_index(&id.to_string(), WIDE_SHARDS as usize);
         for sql in [
@@ -612,10 +189,10 @@ fn test_resolve_target_shards_routes_to_the_hashed_bucket_over_ten_shards() {
             format!("UPDATE orders SET amount = 2 WHERE customer_id = {id}"),
             format!("DELETE FROM orders WHERE customer_id = {id}"),
         ] {
-            let stmts = parser::parse_sql(&sql).unwrap();
             let shards = router
-                .resolve_target_shards(&stmts[0], &table_meta, &[])
+                .resolve_target_shards(&parse_one(&sql), &table_meta, &[])
                 .unwrap();
+
             assert_eq!(shards.len(), 1, "`{sql}` must route to one shard");
             assert_eq!(
                 shards[0].hash_bucket as usize, expected,
@@ -625,16 +202,218 @@ fn test_resolve_target_shards_routes_to_the_hashed_bucket_over_ten_shards() {
     }
 }
 
+/// A statement that does not pin the shard key must reach every shard: any of them
+/// may hold a matching row, so a broadcast that missed one would under-report and
+/// leave rows behind.
 #[test]
-fn test_resolve_target_shards_broadcasts_in_bucket_order_over_ten_shards() {
-    let (catalog, table_meta) = setup_catalog_with_shard_count(WIDE_SHARDS);
+fn a_statement_that_does_not_pin_the_key_broadcasts_in_bucket_order() {
+    let (router, table_meta) = router_for(WIDE_SHARDS);
+
+    for sql in [
+        "DELETE FROM orders",
+        "UPDATE orders SET amount = 0 WHERE amount > 100",
+        "SELECT * FROM orders",
+    ] {
+        let shards = router
+            .resolve_target_shards(&parse_one(sql), &table_meta, &[])
+            .unwrap();
+
+        let buckets: Vec<u32> = shards.iter().map(|shard| shard.hash_bucket).collect();
+        assert_eq!(
+            buckets,
+            (0..WIDE_SHARDS).collect::<Vec<_>>(),
+            "`{sql}` must reach every shard, in bucket order"
+        );
+    }
+}
+
+/// A table with no shard records cannot be written. There is no shard to pick, and
+/// picking none would silently accept a write that went nowhere.
+#[test]
+fn a_table_with_no_shards_cannot_be_routed() {
+    let (catalog, table_meta) = catalog_with_orders(SHARDS);
+    catalog.delete_shards_for_table("orders").unwrap();
     let router = WriteRouter::new(catalog);
 
-    let stmts = parser::parse_sql("DELETE FROM orders").unwrap();
-    let shards = router
-        .resolve_target_shards(&stmts[0], &table_meta, &[])
+    let sql = "INSERT INTO orders (customer_id, amount) VALUES (1, 1)";
+    let err = router
+        .resolve_target_shards(&parse_one(sql), &table_meta, &[])
+        .expect_err("a table with no shards has nowhere to put the row");
+
+    assert!(
+        matches!(err, CoordinatorError::ShardNotAssigned(_)),
+        "got: {err:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Rewriting to shard-local SQL
+// ---------------------------------------------------------------------------
+
+/// The rewritten statement names the physical shard table, which is the string the
+/// core node created its DuckDB table under. Every DML form must be rewritten: one
+/// that kept the logical name would fail on a node that has no such table.
+#[test]
+fn every_dml_form_is_rewritten_to_the_physical_shard_table() {
+    let (router, _) = router_for(SHARDS);
+
+    for (bucket, sql, rest) in [
+        (0u32, "INSERT INTO orders (customer_id) VALUES (1)", "1"),
+        (1, "DELETE FROM orders WHERE customer_id = 5", "5"),
+        (
+            2,
+            "UPDATE orders SET amount = 99 WHERE customer_id = 1",
+            "99",
+        ),
+    ] {
+        let (rewritten, params) = router
+            .generate_shard_local_sql(&parse_one(sql), &shard_of("orders", bucket), &[])
+            .unwrap();
+
+        assert!(
+            rewritten.contains(&format!("orders_shard{bucket}")),
+            "`{sql}` was not rewritten to the shard table: {rewritten}"
+        );
+        assert!(
+            !rewritten.contains(" orders "),
+            "the logical name survived the rewrite: {rewritten}"
+        );
+        assert!(
+            rewritten.contains(rest),
+            "the rewrite dropped part of the statement: {rewritten}"
+        );
+        assert!(params.is_empty(), "no placeholders were bound");
+    }
+}
+
+/// DDL is rewritten too, types included: a `BYTEA` column has to reach DuckDB as
+/// `BLOB`, or the shard table would not be creatable.
+#[test]
+fn ddl_is_rewritten_with_its_types_translated() {
+    let (router, _) = router_for(SHARDS);
+
+    let (rewritten, _) = router
+        .generate_shard_local_sql(
+            &parse_one("CREATE TABLE orders (data BYTEA)"),
+            &shard_of("orders", 1),
+            &[],
+        )
         .unwrap();
 
-    let buckets: Vec<u32> = shards.iter().map(|shard| shard.hash_bucket).collect();
-    assert_eq!(buckets, (0..WIDE_SHARDS).collect::<Vec<_>>());
+    assert!(rewritten.contains("orders_shard1"), "got: {rewritten}");
+    assert!(rewritten.contains("BLOB"), "got: {rewritten}");
+}
+
+/// A placeholder that is not a positional index cannot be renumbered, and the bind
+/// parameters would then be dropped — the statement would run against whatever the
+/// engine made of `$foo`. Refused instead.
+#[test]
+fn a_placeholder_that_cannot_be_renumbered_is_an_error_not_a_dropped_parameter() {
+    let (router, _) = router_for(SHARDS);
+
+    let result = router.generate_shard_local_sql(
+        &parse_one("INSERT INTO orders (customer_id) VALUES ($foo)"),
+        &shard_of("orders", 0),
+        &[ScalarValue::Int64(Some(1))],
+    );
+
+    assert!(
+        matches!(result, Err(CoordinatorError::Internal(_))),
+        "got: {result:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Quorum and replica targets
+// ---------------------------------------------------------------------------
+
+/// A quorum is a strict majority, so an even replication factor needs the same
+/// count as the next odd one — that is what stops two quorums from overlapping.
+#[test]
+fn a_quorum_is_a_strict_majority_of_the_replication_factor() {
+    let sizes: Vec<usize> = (1..=6).map(compute_quorum_size).collect();
+    assert_eq!(sizes, vec![1, 2, 2, 3, 3, 4]);
+}
+
+/// The primary comes first, then the replicas in order. Order is load-bearing: the
+/// primary's acknowledgement is what makes a write durable, so it must be
+/// identifiable rather than just present.
+#[test]
+fn the_primary_leads_the_replica_targets() {
+    let mut shard = shard_of("orders", 0);
+    assert_eq!(target_nodes(&shard).collect::<Vec<_>>(), vec!["node-0"]);
+
+    shard.replica_node_ids = vec!["node-1".to_string(), "node-2".to_string()];
+    assert_eq!(
+        target_nodes(&shard).collect::<Vec<_>>(),
+        vec!["node-0", "node-1", "node-2"]
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Multi-shard INSERT splitting
+//
+// Mirrors the grouping in pgwire_handler::handle_insert_with_split: each VALUES
+// row is bucketed by its own shard-key value, then split_insert_by_rows rebuilds a
+// per-shard INSERT carrying only that shard's rows.
+// ---------------------------------------------------------------------------
+
+/// Group VALUES-row indices by target shard exactly as handle_insert_with_split
+/// does, so the split can be asserted without a live cluster.
+fn group_rows_by_shard(stmt: &Statement, shard_count: usize) -> HashMap<usize, Vec<usize>> {
+    let keys = write_sql_cl::extract_insert_row_shard_keys(stmt, "customer_id", &[])
+        .expect("a multi-row INSERT exposes per-row shard keys");
+
+    let mut shard_rows: HashMap<usize, Vec<usize>> = HashMap::new();
+    for (row_idx, key_value) in &keys {
+        shard_rows
+            .entry(compute_shard_index(key_value, shard_count))
+            .or_default()
+            .push(*row_idx);
+    }
+    shard_rows
+}
+
+fn insert_of(ids: &[i64]) -> Statement {
+    let values: Vec<String> = ids.iter().map(|id| format!("({id}, 1)")).collect();
+    parse_one(&format!(
+        "INSERT INTO orders (customer_id, amount) VALUES {}",
+        values.join(", ")
+    ))
+}
+
+/// Ids hashing to distinct buckets split into one group each; ids sharing a bucket
+/// stay in one group. A row grouped by the statement's bucket rather than its own
+/// would be written to a shard that does not own its key.
+#[test]
+fn a_multi_row_insert_groups_each_row_by_its_own_key() {
+    // Three ids on three different buckets, and three that share one.
+    let mut first_of_bucket: HashMap<usize, i64> = HashMap::new();
+    let mut co_located: Vec<i64> = Vec::new();
+    let target = compute_shard_index("1", SHARDS as usize);
+    let mut id = 1i64;
+    while first_of_bucket.len() < SHARDS as usize || co_located.len() < 3 {
+        let bucket = compute_shard_index(&id.to_string(), SHARDS as usize);
+        first_of_bucket.entry(bucket).or_insert(id);
+        if bucket == target && co_located.len() < 3 {
+            co_located.push(id);
+        }
+        id += 1;
+    }
+
+    let spread: Vec<i64> = first_of_bucket.values().copied().collect();
+    let groups = group_rows_by_shard(&insert_of(&spread), SHARDS as usize);
+    assert_eq!(
+        groups.len(),
+        SHARDS as usize,
+        "ids on distinct buckets must split into one group each"
+    );
+    // Every row is assigned to exactly one group, and none is lost.
+    let mut assigned: Vec<usize> = groups.values().flatten().copied().collect();
+    assigned.sort_unstable();
+    assert_eq!(assigned, (0..spread.len()).collect::<Vec<_>>());
+
+    let groups = group_rows_by_shard(&insert_of(&co_located), SHARDS as usize);
+    assert_eq!(groups.len(), 1, "co-located rows must form one group");
+    assert_eq!(groups[&target].len(), 3);
 }

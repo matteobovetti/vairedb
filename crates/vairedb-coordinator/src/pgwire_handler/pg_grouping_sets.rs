@@ -186,21 +186,16 @@ fn groups_by_nothing(expr: &Expr) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sqlparser::dialect::PostgreSqlDialect;
-    use crate::sqlparser::parser::Parser;
+    use crate::pgwire_handler::read_path_test_helper::parse_verbatim;
 
     fn rewritten(sql: &str) -> String {
-        let mut stmt = Parser::parse_sql(&PostgreSqlDialect {}, sql)
-            .expect("parsed")
-            .remove(0);
+        let mut stmt = parse_verbatim(sql);
         remove_empty_grouping_sets(&mut stmt).unwrap_or_else(|e| panic!("{sql} was refused: {e}"));
         stmt.to_string()
     }
 
     fn refusal(sql: &str) -> String {
-        let mut stmt = Parser::parse_sql(&PostgreSqlDialect {}, sql)
-            .expect("parsed")
-            .remove(0);
+        let mut stmt = parse_verbatim(sql);
         match remove_empty_grouping_sets(&mut stmt) {
             Err(PgWireError::UserError(info)) => info.message.clone(),
             other => panic!("{sql} was not refused: {other:?}"),

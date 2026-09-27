@@ -8,31 +8,14 @@ use datafusion::physical_plan::ExecutionPlan;
 use datafusion_proto::logical_plan::LogicalExtensionCodec;
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 
-use vairedb_coordinator::catalog::{
-    ColumnDef, MetadataCatalog, ShardMeta, ShardStrategy, TableMeta,
-};
-use vairedb_coordinator::column_types::parse_data_type;
+use vairedb_coordinator::catalog::{ColumnDef, ShardMeta, ShardStrategy, TableMeta};
 use vairedb_coordinator::scheduler::{
     OpaqueTextColumns, RemoteDuckDbScanExec, SchedulerTableProvider, VaireLogicalCodec,
     VairePhysicalCodec, refresh_catalog_tables, register_vairedb_catalog_schema,
 };
 
-use std::sync::atomic::{AtomicU32, Ordering};
-
-static COUNTER: AtomicU32 = AtomicU32::new(0);
-
-fn temp_db_path() -> String {
-    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!(
-        "/tmp/vairedb_test_scheduler_{}_{}.redb",
-        std::process::id(),
-        id
-    )
-}
-
-fn make_catalog() -> MetadataCatalog {
-    MetadataCatalog::open(&temp_db_path()).unwrap()
-}
+mod common;
+use common::temp_catalog;
 
 fn sample_schema() -> Arc<Schema> {
     Arc::new(Schema::new(vec![
@@ -54,134 +37,35 @@ fn sample_shard(table_name: &str, bucket: u32) -> ShardMeta {
     }
 }
 
-// =============================================================================
-// parse_data_type tests
-// =============================================================================
-
-#[test]
-fn parse_data_type_integer_variants() {
-    assert_eq!(parse_data_type("INTEGER"), DataType::Int32);
-    assert_eq!(parse_data_type("INT"), DataType::Int32);
-    assert_eq!(parse_data_type("INT4"), DataType::Int32);
-    assert_eq!(parse_data_type("integer"), DataType::Int32);
-}
-
-#[test]
-fn parse_data_type_bigint() {
-    assert_eq!(parse_data_type("BIGINT"), DataType::Int64);
-    assert_eq!(parse_data_type("INT8"), DataType::Int64);
-    assert_eq!(parse_data_type("bigint"), DataType::Int64);
-}
-
-#[test]
-fn parse_data_type_smallint_tinyint() {
-    assert_eq!(parse_data_type("SMALLINT"), DataType::Int16);
-    assert_eq!(parse_data_type("INT2"), DataType::Int16);
-    assert_eq!(parse_data_type("TINYINT"), DataType::Int8);
-}
-
-#[test]
-fn parse_data_type_boolean() {
-    assert_eq!(parse_data_type("BOOLEAN"), DataType::Boolean);
-    assert_eq!(parse_data_type("BOOL"), DataType::Boolean);
-    assert_eq!(parse_data_type("bool"), DataType::Boolean);
-}
-
-#[test]
-fn parse_data_type_float_variants() {
-    assert_eq!(parse_data_type("FLOAT"), DataType::Float32);
-    assert_eq!(parse_data_type("REAL"), DataType::Float32);
-    assert_eq!(parse_data_type("FLOAT4"), DataType::Float32);
-    assert_eq!(parse_data_type("DOUBLE"), DataType::Float64);
-    assert_eq!(parse_data_type("DOUBLE PRECISION"), DataType::Float64);
-    assert_eq!(parse_data_type("FLOAT8"), DataType::Float64);
-}
-
-#[test]
-fn parse_data_type_string_variants() {
-    assert_eq!(parse_data_type("VARCHAR"), DataType::Utf8);
-    assert_eq!(parse_data_type("TEXT"), DataType::Utf8);
-    assert_eq!(parse_data_type("STRING"), DataType::Utf8);
-}
-
-#[test]
-fn parse_data_type_binary() {
-    assert_eq!(parse_data_type("BLOB"), DataType::Binary);
-    assert_eq!(parse_data_type("BYTEA"), DataType::Binary);
-}
-
-#[test]
-fn parse_data_type_timestamp_and_date() {
-    assert_eq!(
-        parse_data_type("TIMESTAMP"),
-        DataType::Timestamp(TimeUnit::Microsecond, None)
-    );
-    assert_eq!(parse_data_type("DATE"), DataType::Date32);
-}
-
-#[test]
-fn parse_data_type_json() {
-    assert_eq!(parse_data_type("JSON"), DataType::Utf8);
-    assert_eq!(parse_data_type("JSONB"), DataType::Utf8);
-}
-
-#[test]
-fn parse_data_type_decimal() {
-    // The declared precision and scale are the type: widening every decimal to a fixed
-    // (38,10) both mis-rendered the scale and NULLified values that would not rescale.
-    assert_eq!(
-        parse_data_type("DECIMAL(10,2)"),
-        DataType::Decimal128(10, 2)
-    );
-    assert_eq!(parse_data_type("NUMERIC(5,3)"), DataType::Decimal128(5, 3));
-    // Undeclared falls back to DuckDB's own default, which is what the shard stores.
-    assert_eq!(parse_data_type("DECIMAL"), DataType::Decimal128(18, 3));
-}
-
-#[test]
-fn parse_data_type_unknown_falls_back_to_utf8() {
-    assert_eq!(parse_data_type("GEOMETRY"), DataType::Utf8);
-    assert_eq!(parse_data_type("UNKNOWN_TYPE"), DataType::Utf8);
-}
-
-#[test]
-fn parse_data_type_case_insensitive() {
-    assert_eq!(parse_data_type("Integer"), DataType::Int32);
-    assert_eq!(parse_data_type("boolean"), DataType::Boolean);
-    assert_eq!(parse_data_type("Varchar"), DataType::Utf8);
-    assert_eq!(parse_data_type("Double Precision"), DataType::Float64);
-}
-
-fn list_of(element: DataType) -> DataType {
-    DataType::List(Arc::new(Field::new("item", element, true)))
-}
-
-#[test]
-fn parse_data_type_array_element_types() {
-    assert_eq!(parse_data_type("INTEGER[]"), list_of(DataType::Int32));
-    assert_eq!(parse_data_type("BIGINT[]"), list_of(DataType::Int64));
-    assert_eq!(parse_data_type("TEXT[]"), list_of(DataType::Utf8));
-    assert_eq!(parse_data_type("BOOLEAN[]"), list_of(DataType::Boolean));
-}
-
-#[test]
-fn parse_data_type_array_case_insensitive_and_sized() {
-    assert_eq!(parse_data_type("integer[]"), list_of(DataType::Int32));
-    // A fixed-size array (e.g. INTEGER[3]) is still modeled as a variable List.
-    assert_eq!(parse_data_type("INTEGER[3]"), list_of(DataType::Int32));
-}
-
-#[test]
-fn parse_data_type_nested_array() {
-    assert_eq!(
-        parse_data_type("INTEGER[][]"),
-        list_of(list_of(DataType::Int32))
-    );
-}
-
-#[test]
-fn parse_data_type_unknown_element_array_falls_back_to_utf8_list() {
-    assert_eq!(parse_data_type("GEOMETRY[]"), list_of(DataType::Utf8));
+/// A hash-sharded table of `columns`, each given as `(name, declared type, nullable)`.
+///
+/// The shard key is the first column and both counts are 1: the tests that care about
+/// another value overwrite the field on the returned value, so what a test states is
+/// exactly what it depends on.
+fn table_meta(name: &str, columns: &[(&str, &str, bool)]) -> TableMeta {
+    TableMeta {
+        anonymized_columns: std::collections::HashMap::new(),
+        indexes: Vec::new(),
+        constraints: Vec::new(),
+        table_name: name.to_string(),
+        columns: columns
+            .iter()
+            .map(|(name, data_type, nullable)| ColumnDef {
+                name: name.to_string(),
+                data_type: data_type.to_string(),
+                nullable: *nullable,
+                default_expr: String::new(),
+            })
+            .collect(),
+        shard_strategy: ShardStrategy::Hash as i32,
+        shard_key: columns
+            .first()
+            .map(|(name, ..)| name.to_string())
+            .unwrap_or_default(),
+        shard_count: 1,
+        replication_factor: 1,
+        created_at: None,
+    }
 }
 
 // =============================================================================
@@ -665,73 +549,56 @@ fn logical_codec_treats_a_missing_opaque_set_as_unknown() {
 
 // The end-to-end wiring: the declared types only exist in the catalog, so a provider built
 // from it is the one place the distinction can be established.
-#[test]
-fn refresh_catalog_tables_marks_columns_that_are_text_in_name_only() {
-    let catalog = make_catalog();
+#[tokio::test]
+async fn refresh_catalog_tables_marks_columns_that_are_text_in_name_only() {
+    let catalog = temp_catalog();
 
-    let column = |name: &str, data_type: &str| ColumnDef {
-        name: name.to_string(),
-        data_type: data_type.to_string(),
-        nullable: true,
-        default_expr: String::new(),
-    };
-
-    let table_meta = TableMeta {
-        anonymized_columns: std::collections::HashMap::new(),
-        indexes: Vec::new(),
-        constraints: Vec::new(),
-        table_name: "docs".to_string(),
-        columns: vec![
-            column("id", "INTEGER"),
-            column("title", "VARCHAR(255)"),
-            column("code", "CHAR(3)"),
-            column("body", "JSON"),
-            column("uid", "UUID"),
-        ],
-        shard_strategy: ShardStrategy::Hash as i32,
-        shard_key: "id".to_string(),
-        shard_count: 1,
-        replication_factor: 1,
-        created_at: None,
-    };
-    catalog.put_table(&table_meta).unwrap();
+    catalog
+        .put_table(&table_meta(
+            "docs",
+            &[
+                ("id", "INTEGER", true),
+                ("title", "VARCHAR(255)", true),
+                ("code", "CHAR(3)", true),
+                ("body", "JSON", true),
+                ("uid", "UUID", true),
+            ],
+        ))
+        .unwrap();
     catalog.put_shard(&sample_shard("docs", 0)).unwrap();
 
     let ctx = SessionContext::new();
     refresh_catalog_tables(&ctx, &catalog).unwrap();
 
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    rt.block_on(async {
-        let provider = ctx.table_provider("docs").await.unwrap();
+    let provider = ctx.table_provider("docs").await.unwrap();
 
-        // Every one of these is advertised as text to the client.
-        for name in ["title", "code", "body", "uid"] {
-            let field = provider.schema().field_with_name(name).unwrap().clone();
-            assert_eq!(field.data_type(), &DataType::Utf8, "{name}");
-        }
+    // Every one of these is advertised as text to the client.
+    for name in ["title", "code", "body", "uid"] {
+        let field = provider.schema().field_with_name(name).unwrap().clone();
+        assert_eq!(field.data_type(), &DataType::Utf8, "{name}");
+    }
 
-        use datafusion::logical_expr::{TableProviderFilterPushDown, col, lit};
-        let on_varchar = col("title").eq(lit("a"));
-        let on_char = col("code").eq(lit("abc"));
-        let on_json = col("body").eq(lit("{}"));
-        let on_uuid = col("uid").eq(lit("x"));
+    use datafusion::logical_expr::{TableProviderFilterPushDown, col, lit};
+    let on_varchar = col("title").eq(lit("a"));
+    let on_char = col("code").eq(lit("abc"));
+    let on_json = col("body").eq(lit("{}"));
+    let on_uuid = col("uid").eq(lit("x"));
 
-        assert_eq!(
-            provider
-                .supports_filters_pushdown(&[&on_varchar, &on_char, &on_json, &on_uuid])
-                .unwrap(),
-            vec![
-                // The shard stores these two as VARCHAR, so it evaluates them as the
-                // coordinator would.
-                TableProviderFilterPushDown::Inexact,
-                TableProviderFilterPushDown::Inexact,
-                // These two it does not, and a literal it cannot convert is an error there
-                // rather than an empty result.
-                TableProviderFilterPushDown::Unsupported,
-                TableProviderFilterPushDown::Unsupported,
-            ]
-        );
-    });
+    assert_eq!(
+        provider
+            .supports_filters_pushdown(&[&on_varchar, &on_char, &on_json, &on_uuid])
+            .unwrap(),
+        vec![
+            // The shard stores these two as VARCHAR, so it evaluates them as the
+            // coordinator would.
+            TableProviderFilterPushDown::Inexact,
+            TableProviderFilterPushDown::Inexact,
+            // These two it does not, and a literal it cannot convert is an error there
+            // rather than an empty result.
+            TableProviderFilterPushDown::Unsupported,
+            TableProviderFilterPushDown::Unsupported,
+        ]
+    );
 }
 
 #[test]
@@ -771,14 +638,6 @@ fn logical_codec_decode_extension_not_implemented() {
 }
 
 #[test]
-fn logical_codec_encode_extension_not_implemented() {
-    // VaireLogicalCodec::try_encode returns NotImplemented for any Extension.
-    // We can't easily construct an Extension node, but the decode test above
-    // already confirms the error path. This test exists for completeness.
-    let _codec = VaireLogicalCodec;
-}
-
-#[test]
 fn logical_codec_decode_invalid_json_fails() {
     let codec = VaireLogicalCodec;
     let schema = sample_schema();
@@ -801,7 +660,7 @@ fn logical_codec_decode_invalid_json_fails() {
 
 #[test]
 fn refresh_catalog_tables_empty_catalog() {
-    let catalog = make_catalog();
+    let catalog = temp_catalog();
     let ctx = SessionContext::new();
 
     refresh_catalog_tables(&ctx, &catalog).unwrap();
@@ -812,158 +671,84 @@ fn refresh_catalog_tables_empty_catalog() {
     assert!(tables.contains(&"datafusion".to_string()));
 }
 
-#[test]
-fn refresh_catalog_tables_single_table() {
-    let catalog = make_catalog();
+#[tokio::test]
+async fn refresh_catalog_tables_single_table() {
+    let catalog = temp_catalog();
 
-    let table_meta = TableMeta {
-        anonymized_columns: std::collections::HashMap::new(),
-        indexes: Vec::new(),
-        constraints: Vec::new(),
-        table_name: "users".to_string(),
-        columns: vec![
-            ColumnDef {
-                name: "id".to_string(),
-                data_type: "INTEGER".to_string(),
-                nullable: false,
-                default_expr: String::new(),
-            },
-            ColumnDef {
-                name: "email".to_string(),
-                data_type: "VARCHAR".to_string(),
-                nullable: true,
-                default_expr: String::new(),
-            },
-        ],
-        shard_strategy: ShardStrategy::Hash as i32,
-        shard_key: "id".to_string(),
-        shard_count: 2,
-        replication_factor: 1,
-        created_at: None,
-    };
-    catalog.put_table(&table_meta).unwrap();
-
-    let p0 = sample_shard("users", 0);
-    let p1 = sample_shard("users", 1);
-    catalog.put_shard(&p0).unwrap();
-    catalog.put_shard(&p1).unwrap();
+    catalog
+        .put_table(&table_meta(
+            "users",
+            &[("id", "INTEGER", false), ("email", "VARCHAR", true)],
+        ))
+        .unwrap();
+    catalog.put_shard(&sample_shard("users", 0)).unwrap();
+    catalog.put_shard(&sample_shard("users", 1)).unwrap();
 
     let ctx = SessionContext::new();
     refresh_catalog_tables(&ctx, &catalog).unwrap();
 
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    rt.block_on(async {
-        let provider = ctx.table_provider("users").await.unwrap();
-        assert_eq!(provider.schema().fields().len(), 2);
-        assert_eq!(provider.schema().field(0).name(), "id");
-        assert_eq!(provider.schema().field(0).data_type(), &DataType::Int32);
-        assert_eq!(provider.schema().field(1).name(), "email");
-        assert_eq!(provider.schema().field(1).data_type(), &DataType::Utf8);
-    });
+    let provider = ctx.table_provider("users").await.unwrap();
+    assert_eq!(provider.schema().fields().len(), 2);
+    assert_eq!(provider.schema().field(0).name(), "id");
+    assert_eq!(provider.schema().field(0).data_type(), &DataType::Int32);
+    assert_eq!(provider.schema().field(1).name(), "email");
+    assert_eq!(provider.schema().field(1).data_type(), &DataType::Utf8);
 }
 
-#[test]
-fn refresh_catalog_tables_multiple_tables() {
-    let catalog = make_catalog();
+#[tokio::test]
+async fn refresh_catalog_tables_multiple_tables() {
+    let catalog = temp_catalog();
 
     for name in &["orders", "products", "reviews"] {
-        let table_meta = TableMeta {
-            anonymized_columns: std::collections::HashMap::new(),
-            indexes: Vec::new(),
-            constraints: Vec::new(),
-            table_name: name.to_string(),
-            columns: vec![ColumnDef {
-                name: "id".to_string(),
-                data_type: "BIGINT".to_string(),
-                nullable: false,
-                default_expr: String::new(),
-            }],
-            shard_strategy: ShardStrategy::Hash as i32,
-            shard_key: "id".to_string(),
-            shard_count: 1,
-            replication_factor: 1,
-            created_at: None,
-        };
-        catalog.put_table(&table_meta).unwrap();
+        catalog
+            .put_table(&table_meta(name, &[("id", "BIGINT", false)]))
+            .unwrap();
         catalog.put_shard(&sample_shard(name, 0)).unwrap();
     }
 
     let ctx = SessionContext::new();
     refresh_catalog_tables(&ctx, &catalog).unwrap();
 
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    rt.block_on(async {
-        for name in &["orders", "products", "reviews"] {
-            let provider = ctx.table_provider(*name).await.unwrap();
-            assert_eq!(provider.schema().fields().len(), 1);
-            assert_eq!(provider.schema().field(0).data_type(), &DataType::Int64);
-        }
-    });
+    for name in &["orders", "products", "reviews"] {
+        let provider = ctx.table_provider(*name).await.unwrap();
+        assert_eq!(provider.schema().fields().len(), 1);
+        assert_eq!(provider.schema().field(0).data_type(), &DataType::Int64);
+    }
 }
 
-#[test]
-fn refresh_catalog_tables_maps_column_types_correctly() {
-    let catalog = make_catalog();
+#[tokio::test]
+async fn refresh_catalog_tables_maps_column_types_correctly() {
+    let catalog = temp_catalog();
 
-    let table_meta = TableMeta {
-        anonymized_columns: std::collections::HashMap::new(),
-        indexes: Vec::new(),
-        constraints: Vec::new(),
-        table_name: "typed_table".to_string(),
-        columns: vec![
-            ColumnDef {
-                name: "int_col".to_string(),
-                data_type: "INTEGER".to_string(),
-                nullable: false,
-                default_expr: String::new(),
-            },
-            ColumnDef {
-                name: "bool_col".to_string(),
-                data_type: "BOOLEAN".to_string(),
-                nullable: true,
-                default_expr: String::new(),
-            },
-            ColumnDef {
-                name: "ts_col".to_string(),
-                data_type: "TIMESTAMP".to_string(),
-                nullable: true,
-                default_expr: String::new(),
-            },
-            ColumnDef {
-                name: "dec_col".to_string(),
-                data_type: "DECIMAL(10,2)".to_string(),
-                nullable: true,
-                default_expr: String::new(),
-            },
-        ],
-        shard_strategy: ShardStrategy::Hash as i32,
-        shard_key: "int_col".to_string(),
-        shard_count: 1,
-        replication_factor: 1,
-        created_at: None,
-    };
-    catalog.put_table(&table_meta).unwrap();
+    catalog
+        .put_table(&table_meta(
+            "typed_table",
+            &[
+                ("int_col", "INTEGER", false),
+                ("bool_col", "BOOLEAN", true),
+                ("ts_col", "TIMESTAMP", true),
+                ("dec_col", "DECIMAL(10,2)", true),
+            ],
+        ))
+        .unwrap();
     catalog.put_shard(&sample_shard("typed_table", 0)).unwrap();
 
     let ctx = SessionContext::new();
     refresh_catalog_tables(&ctx, &catalog).unwrap();
 
-    let rt = tokio::runtime::Runtime::new().unwrap();
-    rt.block_on(async {
-        let provider = ctx.table_provider("typed_table").await.unwrap();
-        let schema = provider.schema();
+    let provider = ctx.table_provider("typed_table").await.unwrap();
+    let schema = provider.schema();
 
-        assert_eq!(schema.field(0).data_type(), &DataType::Int32);
-        assert!(!schema.field(0).is_nullable());
-        assert_eq!(schema.field(1).data_type(), &DataType::Boolean);
-        assert!(schema.field(1).is_nullable());
-        assert_eq!(
-            schema.field(2).data_type(),
-            &DataType::Timestamp(TimeUnit::Microsecond, None)
-        );
-        // The registered schema carries the column's *declared* precision and scale.
-        assert_eq!(schema.field(3).data_type(), &DataType::Decimal128(10, 2));
-    });
+    assert_eq!(schema.field(0).data_type(), &DataType::Int32);
+    assert!(!schema.field(0).is_nullable());
+    assert_eq!(schema.field(1).data_type(), &DataType::Boolean);
+    assert!(schema.field(1).is_nullable());
+    assert_eq!(
+        schema.field(2).data_type(),
+        &DataType::Timestamp(TimeUnit::Microsecond, None)
+    );
+    // The registered schema carries the column's *declared* precision and scale.
+    assert_eq!(schema.field(3).data_type(), &DataType::Decimal128(10, 2));
 }
 
 // =============================================================================
@@ -973,37 +758,15 @@ fn refresh_catalog_tables_maps_column_types_correctly() {
 
 #[tokio::test]
 async fn local_ctx_select_vairedb_catalog_tables() {
-    let catalog = Arc::new(make_catalog());
+    let catalog = Arc::new(temp_catalog());
 
-    let table_meta = TableMeta {
-        anonymized_columns: std::collections::HashMap::new(),
-        indexes: Vec::new(),
-        constraints: Vec::new(),
-        table_name: "orders".to_string(),
-        columns: vec![
-            ColumnDef {
-                name: "id".to_string(),
-                data_type: "INTEGER".to_string(),
-                nullable: false,
-                default_expr: String::new(),
-            },
-            ColumnDef {
-                name: "total".to_string(),
-                data_type: "DECIMAL(10,2)".to_string(),
-                nullable: true,
-                default_expr: String::new(),
-            },
-        ],
-        shard_strategy: ShardStrategy::Hash as i32,
-        shard_key: "id".to_string(),
-        shard_count: 2,
-        replication_factor: 3,
-        created_at: Some(prost_types::Timestamp {
-            seconds: 1700000000,
-            nanos: 0,
-        }),
-    };
-    catalog.put_table(&table_meta).unwrap();
+    let mut orders = table_meta(
+        "orders",
+        &[("id", "INTEGER", false), ("total", "DECIMAL(10,2)", true)],
+    );
+    orders.shard_count = 2;
+    orders.replication_factor = 3;
+    catalog.put_table(&orders).unwrap();
 
     let local_ctx = SessionContext::new();
     register_vairedb_catalog_schema(&local_ctx, Arc::clone(&catalog)).unwrap();
@@ -1050,40 +813,18 @@ async fn local_ctx_select_vairedb_catalog_tables() {
 
 #[tokio::test]
 async fn local_ctx_select_vairedb_catalog_columns() {
-    let catalog = Arc::new(make_catalog());
+    let catalog = Arc::new(temp_catalog());
 
-    let table_meta = TableMeta {
-        anonymized_columns: std::collections::HashMap::new(),
-        indexes: Vec::new(),
-        constraints: Vec::new(),
-        table_name: "users".to_string(),
-        columns: vec![
-            ColumnDef {
-                name: "user_id".to_string(),
-                data_type: "BIGINT".to_string(),
-                nullable: false,
-                default_expr: String::new(),
-            },
-            ColumnDef {
-                name: "email".to_string(),
-                data_type: "VARCHAR".to_string(),
-                nullable: true,
-                default_expr: String::new(),
-            },
-            ColumnDef {
-                name: "active".to_string(),
-                data_type: "BOOLEAN".to_string(),
-                nullable: false,
-                default_expr: "true".to_string(),
-            },
-        ],
-        shard_strategy: ShardStrategy::Hash as i32,
-        shard_key: "user_id".to_string(),
-        shard_count: 1,
-        replication_factor: 1,
-        created_at: None,
-    };
-    catalog.put_table(&table_meta).unwrap();
+    catalog
+        .put_table(&table_meta(
+            "users",
+            &[
+                ("user_id", "BIGINT", false),
+                ("email", "VARCHAR", true),
+                ("active", "BOOLEAN", false),
+            ],
+        ))
+        .unwrap();
 
     let local_ctx = SessionContext::new();
     register_vairedb_catalog_schema(&local_ctx, Arc::clone(&catalog)).unwrap();
@@ -1119,7 +860,7 @@ async fn local_ctx_select_vairedb_catalog_columns() {
 
 #[tokio::test]
 async fn local_ctx_select_vairedb_catalog_shards() {
-    let catalog = Arc::new(make_catalog());
+    let catalog = Arc::new(temp_catalog());
 
     catalog
         .put_shard(&ShardMeta {
@@ -1178,7 +919,7 @@ async fn local_ctx_select_vairedb_catalog_shards() {
 async fn local_ctx_select_vairedb_catalog_nodes() {
     use vairedb_coordinator::catalog::{NodeMeta, NodeState};
 
-    let catalog = Arc::new(make_catalog());
+    let catalog = Arc::new(temp_catalog());
 
     catalog
         .put_node(&NodeMeta {
@@ -1237,27 +978,12 @@ async fn local_ctx_select_vairedb_catalog_nodes() {
 
 #[tokio::test]
 async fn local_ctx_catalog_query_with_filter() {
-    let catalog = Arc::new(make_catalog());
+    let catalog = Arc::new(temp_catalog());
 
     for name in &["alpha", "beta", "gamma"] {
-        let table_meta = TableMeta {
-            anonymized_columns: std::collections::HashMap::new(),
-            indexes: Vec::new(),
-            constraints: Vec::new(),
-            table_name: name.to_string(),
-            columns: vec![ColumnDef {
-                name: "id".to_string(),
-                data_type: "INTEGER".to_string(),
-                nullable: false,
-                default_expr: String::new(),
-            }],
-            shard_strategy: ShardStrategy::Hash as i32,
-            shard_key: "id".to_string(),
-            shard_count: 1,
-            replication_factor: 1,
-            created_at: None,
-        };
-        catalog.put_table(&table_meta).unwrap();
+        catalog
+            .put_table(&table_meta(name, &[("id", "INTEGER", false)]))
+            .unwrap();
     }
 
     let local_ctx = SessionContext::new();
@@ -1282,7 +1008,7 @@ async fn local_ctx_catalog_query_with_filter() {
 
 #[tokio::test]
 async fn local_ctx_catalog_empty_tables() {
-    let catalog = Arc::new(make_catalog());
+    let catalog = Arc::new(temp_catalog());
 
     let local_ctx = SessionContext::new();
     register_vairedb_catalog_schema(&local_ctx, Arc::clone(&catalog)).unwrap();
@@ -1313,7 +1039,7 @@ mod affinity_tests {
         AvailableTaskSlots, JobStatus, RunningJob, TaskStatus, job_status,
     };
     use ballista_core::serde::scheduler::{ExecutorMetadata, PartitionLocation};
-    use ballista_scheduler::cluster::DistributionPolicy;
+    use ballista_scheduler::cluster::{BoundTask, DistributionPolicy};
     use ballista_scheduler::scheduler_server::event::QueryStageSchedulerEvent;
     use ballista_scheduler::state::execution_graph::{
         ExecutionGraph, ExecutionGraphBox, RunningTaskInfo,
@@ -1506,56 +1232,85 @@ mod affinity_tests {
         }
     }
 
-    fn make_job_cache(graph: MockExecutionGraph) -> JobInfoCache {
+    /// A union of one scan per shard, the shape `SchedulerTableProvider::scan` produces
+    /// for a multi-shard table.
+    fn union_of(scans: Vec<Arc<dyn ExecutionPlan>>) -> Arc<dyn ExecutionPlan> {
+        UnionExec::try_new(scans).expect("the scans share one schema")
+    }
+
+    /// Offer `executor_id` `slots` free slots against a cluster whose only job is `graph`,
+    /// and return the tasks the policy bound plus the slots it left unused.
+    ///
+    /// The slot count comes back because it is the policy's second output: a task bound
+    /// without a slot spent is a task the executor has no capacity for.
+    async fn bind(
+        graph: MockExecutionGraph,
+        executor_id: &str,
+        slots: u32,
+    ) -> (Vec<BoundTask>, u32) {
+        let job_id = graph.job_id.clone();
         let boxed: ExecutionGraphBox = Box::new(graph);
-        JobInfoCache::new(boxed)
+
+        let mut jobs = HashMap::new();
+        jobs.insert(job_id, JobInfoCache::new(boxed));
+
+        let mut slot = AvailableTaskSlots {
+            executor_id: executor_id.to_string(),
+            slots,
+        };
+        let bound = VaireAffinityPolicy
+            .bind_tasks(vec![&mut slot], Arc::new(jobs))
+            .await
+            .expect("the policy must not fail");
+        (bound, slot.slots)
+    }
+
+    /// The executors a binding assigned work to, in binding order.
+    fn executors(bound: &[BoundTask]) -> Vec<&str> {
+        bound
+            .iter()
+            .map(|(executor, _)| executor.as_str())
+            .collect()
+    }
+
+    /// The partitions a binding covers, sorted — the order within a priority pass is not
+    /// part of the contract.
+    fn partitions(bound: &[BoundTask]) -> Vec<usize> {
+        let mut ids: Vec<usize> = bound
+            .iter()
+            .map(|(_, task)| task.partition.partition_id)
+            .collect();
+        ids.sort_unstable();
+        ids
     }
 
     #[test]
     fn affinity_policy_name() {
-        let policy = VaireAffinityPolicy;
-        assert_eq!(policy.name(), "VaireAffinityPolicy");
+        assert_eq!(VaireAffinityPolicy.name(), "VaireAffinityPolicy");
     }
 
     #[tokio::test]
     async fn affinity_bind_tasks_zero_slots() {
-        let policy = VaireAffinityPolicy;
         let plan = make_remote_scan("shard0", Some("exec-1"), vec![]);
-        let graph = MockExecutionGraph::new(plan, 1);
-        let cache = make_job_cache(graph);
-
-        let mut jobs = HashMap::new();
-        jobs.insert(JobId::new("job-1"), cache);
-        let running_jobs = Arc::new(jobs);
-
-        let mut slot = AvailableTaskSlots {
-            executor_id: "exec-1".to_string(),
-            slots: 0,
-        };
-        let slots = vec![&mut slot];
-
-        let result = policy.bind_tasks(slots, running_jobs).await.unwrap();
-        assert!(result.is_empty());
+        let (bound, _) = bind(MockExecutionGraph::new(plan, 1), "exec-1", 0).await;
+        assert!(bound.is_empty());
     }
 
     #[tokio::test]
     async fn affinity_bind_tasks_no_running_jobs() {
-        let policy = VaireAffinityPolicy;
-        let running_jobs = Arc::new(HashMap::new());
-
         let mut slot = AvailableTaskSlots {
             executor_id: "exec-1".to_string(),
             slots: 4,
         };
-        let slots = vec![&mut slot];
-
-        let result = policy.bind_tasks(slots, running_jobs).await.unwrap();
-        assert!(result.is_empty());
+        let bound = VaireAffinityPolicy
+            .bind_tasks(vec![&mut slot], Arc::new(HashMap::new()))
+            .await
+            .unwrap();
+        assert!(bound.is_empty());
     }
 
     #[tokio::test]
     async fn affinity_bind_tasks_non_running_status_skipped() {
-        let policy = VaireAffinityPolicy;
         let plan = make_remote_scan("shard0", Some("exec-1"), vec![]);
         let mut graph = MockExecutionGraph::new(plan, 1);
         graph.status = JobStatus {
@@ -1565,166 +1320,69 @@ mod affinity_tests {
                 ballista_core::serde::protobuf::QueuedJob { queued_at: 0 },
             )),
         };
-        let boxed: ExecutionGraphBox = Box::new(graph);
-        let cache = JobInfoCache::new(boxed);
 
-        let mut jobs = HashMap::new();
-        jobs.insert(JobId::new("job-1"), cache);
-        let running_jobs = Arc::new(jobs);
-
-        let mut slot = AvailableTaskSlots {
-            executor_id: "exec-1".to_string(),
-            slots: 4,
-        };
-        let slots = vec![&mut slot];
-
-        let result = policy.bind_tasks(slots, running_jobs).await.unwrap();
-        assert!(result.is_empty());
+        let (bound, _) = bind(graph, "exec-1", 4).await;
+        assert!(bound.is_empty());
     }
 
     #[tokio::test]
     async fn affinity_bind_tasks_primary_match() {
-        let policy = VaireAffinityPolicy;
         let plan = make_remote_scan("shard0", Some("exec-1"), vec!["exec-2"]);
-        let graph = MockExecutionGraph::new(plan, 1);
-        let cache = make_job_cache(graph);
+        let (bound, _) = bind(MockExecutionGraph::new(plan, 1), "exec-1", 4).await;
 
-        let mut jobs = HashMap::new();
-        jobs.insert(JobId::new("job-1"), cache);
-        let running_jobs = Arc::new(jobs);
-
-        let mut slot = AvailableTaskSlots {
-            executor_id: "exec-1".to_string(),
-            slots: 4,
-        };
-        let slots = vec![&mut slot];
-
-        let result = policy.bind_tasks(slots, running_jobs).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].0, "exec-1");
-        assert_eq!(result[0].1.partition.partition_id, 0);
+        assert_eq!(executors(&bound), vec!["exec-1"]);
+        assert_eq!(partitions(&bound), vec![0]);
     }
 
     #[tokio::test]
     async fn affinity_bind_tasks_replica_fallback() {
-        let policy = VaireAffinityPolicy;
         let plan = make_remote_scan("shard0", Some("exec-1"), vec!["exec-2"]);
-        let graph = MockExecutionGraph::new(plan, 1);
-        let cache = make_job_cache(graph);
+        let (bound, _) = bind(MockExecutionGraph::new(plan, 1), "exec-2", 4).await;
 
-        let mut jobs = HashMap::new();
-        jobs.insert(JobId::new("job-1"), cache);
-        let running_jobs = Arc::new(jobs);
-
-        let mut slot = AvailableTaskSlots {
-            executor_id: "exec-2".to_string(),
-            slots: 4,
-        };
-        let slots = vec![&mut slot];
-
-        let result = policy.bind_tasks(slots, running_jobs).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].0, "exec-2");
+        assert_eq!(executors(&bound), vec!["exec-2"]);
     }
 
     #[tokio::test]
     async fn affinity_bind_tasks_no_affinity_match() {
-        let policy = VaireAffinityPolicy;
         let plan = make_remote_scan("shard0", Some("exec-1"), vec!["exec-2"]);
-        let graph = MockExecutionGraph::new(plan, 1);
-        let cache = make_job_cache(graph);
+        let (bound, _) = bind(MockExecutionGraph::new(plan, 1), "exec-3", 4).await;
 
-        let mut jobs = HashMap::new();
-        jobs.insert(JobId::new("job-1"), cache);
-        let running_jobs = Arc::new(jobs);
-
-        let mut slot = AvailableTaskSlots {
-            executor_id: "exec-3".to_string(),
-            slots: 4,
-        };
-        let slots = vec![&mut slot];
-
-        let result = policy.bind_tasks(slots, running_jobs).await.unwrap();
-        assert!(result.is_empty());
+        assert!(bound.is_empty());
     }
 
     #[tokio::test]
     async fn affinity_bind_tasks_no_target_executor_treated_as_primary() {
-        let policy = VaireAffinityPolicy;
         let plan = make_remote_scan("shard0", None, vec![]);
-        let graph = MockExecutionGraph::new(plan, 1);
-        let cache = make_job_cache(graph);
+        let (bound, _) = bind(MockExecutionGraph::new(plan, 1), "any-executor", 4).await;
 
-        let mut jobs = HashMap::new();
-        jobs.insert(JobId::new("job-1"), cache);
-        let running_jobs = Arc::new(jobs);
-
-        let mut slot = AvailableTaskSlots {
-            executor_id: "any-executor".to_string(),
-            slots: 4,
-        };
-        let slots = vec![&mut slot];
-
-        let result = policy.bind_tasks(slots, running_jobs).await.unwrap();
-        assert_eq!(result.len(), 1);
-        assert_eq!(result[0].0, "any-executor");
+        assert_eq!(executors(&bound), vec!["any-executor"]);
     }
 
     #[tokio::test]
     async fn affinity_bind_tasks_slot_exhaustion() {
-        let policy = VaireAffinityPolicy;
-        let children: Vec<Arc<dyn ExecutionPlan>> = (0..5)
-            .map(|i| make_remote_scan(&format!("shard{}", i), Some("exec-1"), vec![]))
-            .collect();
-        let plan: Arc<dyn ExecutionPlan> = UnionExec::try_new(children).unwrap();
-        let graph = MockExecutionGraph::new(plan, 5);
-        let cache = make_job_cache(graph);
+        let plan = union_of(
+            (0..5)
+                .map(|i| make_remote_scan(&format!("shard{i}"), Some("exec-1"), vec![]))
+                .collect(),
+        );
+        let (bound, left) = bind(MockExecutionGraph::new(plan, 5), "exec-1", 2).await;
 
-        let mut jobs = HashMap::new();
-        jobs.insert(JobId::new("job-1"), cache);
-        let running_jobs = Arc::new(jobs);
-
-        let mut slot = AvailableTaskSlots {
-            executor_id: "exec-1".to_string(),
-            slots: 2,
-        };
-        let slots = vec![&mut slot];
-
-        let result = policy.bind_tasks(slots, running_jobs).await.unwrap();
-        assert_eq!(result.len(), 2);
-        assert_eq!(slot.slots, 0);
+        // Five partitions this executor owns, but only two slots to run them in.
+        assert_eq!(bound.len(), 2);
+        assert_eq!(left, 0);
     }
 
     #[tokio::test]
     async fn affinity_bind_tasks_union_multiple_partitions() {
-        let policy = VaireAffinityPolicy;
-        let children: Vec<Arc<dyn ExecutionPlan>> = vec![
+        let plan = union_of(vec![
             make_remote_scan("shard0", Some("exec-1"), vec!["exec-2"]),
             make_remote_scan("shard1", Some("exec-2"), vec!["exec-1"]),
             make_remote_scan("shard2", Some("exec-1"), vec![]),
-        ];
-        let plan: Arc<dyn ExecutionPlan> = UnionExec::try_new(children).unwrap();
-        let graph = MockExecutionGraph::new(plan, 3);
-        let cache = make_job_cache(graph);
+        ]);
+        let (bound, _) = bind(MockExecutionGraph::new(plan, 3), "exec-1", 10).await;
 
-        let mut jobs = HashMap::new();
-        jobs.insert(JobId::new("job-1"), cache);
-        let running_jobs = Arc::new(jobs);
-
-        let mut slot = AvailableTaskSlots {
-            executor_id: "exec-1".to_string(),
-            slots: 10,
-        };
-        let slots = vec![&mut slot];
-
-        let result = policy.bind_tasks(slots, running_jobs).await.unwrap();
-        // exec-1 is primary for partition 0 and 2 (first pass)
-        // exec-1 is replica for partition 1 (second pass)
-        assert_eq!(result.len(), 3);
-
-        let partition_ids: Vec<usize> = result.iter().map(|r| r.1.partition.partition_id).collect();
-        assert!(partition_ids.contains(&0));
-        assert!(partition_ids.contains(&1));
-        assert!(partition_ids.contains(&2));
+        // Primary for partitions 0 and 2, replica for 1 — with slots to spare it takes
+        // all three rather than leaving the replica pass unbound.
+        assert_eq!(partitions(&bound), vec![0, 1, 2]);
     }
 }

@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU32, Ordering};
 
 use datafusion::catalog::SchemaProvider;
 use datafusion::execution::context::SessionContext;
@@ -9,20 +8,11 @@ use vairedb_coordinator::catalog::{
     VaireDbCatalogSchema, ViewMeta,
 };
 
-static COUNTER: AtomicU32 = AtomicU32::new(0);
-
-fn temp_db_path() -> String {
-    let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-    format!(
-        "/tmp/vairedb_test_catalog_provider_{}_{}.redb",
-        std::process::id(),
-        id
-    )
-}
+mod common;
+use common::temp_catalog;
 
 fn make_catalog() -> Arc<MetadataCatalog> {
-    let path = temp_db_path();
-    Arc::new(MetadataCatalog::open(&path).unwrap())
+    Arc::new(temp_catalog())
 }
 
 fn sample_table() -> TableMeta {

@@ -78,16 +78,19 @@ const DEFAULT_DECIMAL: (u8, i8) = (18, 3);
 /// arrays like `INTEGER[][]`), so the advertised schema — and thus the pgwire array type
 /// OID — reflects the column's real shape rather than `Utf8`.
 pub fn parse_data_type(type_str: &str) -> DataType {
-    let upper = type_str.trim().to_uppercase();
+    let declared = Declared::parse(type_str);
 
-    if let Some(element) = array_element(&upper) {
-        let element = parse_data_type(element);
-        return DataType::List(Arc::new(Field::new("item", element, true)));
+    let mut data_type = scalar_data_type(&declared);
+    // One `List` per peeled suffix, so `INTEGER[][]` is a list of lists of `Int32`.
+    for _ in 0..declared.array_depth {
+        data_type = DataType::List(Arc::new(Field::new("item", data_type, true)));
     }
+    data_type
+}
 
-    let (base, parameters) = split_parameters(&upper);
-
-    match base.as_str() {
+/// The Arrow type of a declaration whose array suffixes have already been peeled off.
+fn scalar_data_type(declared: &Declared) -> DataType {
+    match declared.base.as_str() {
         "INTEGER" | "INT" | "INT4" | "SIGNED" => DataType::Int32,
         "BIGINT" | "INT8" | "LONG" => DataType::Int64,
         "SMALLINT" | "INT2" | "SHORT" => DataType::Int16,
@@ -128,7 +131,7 @@ pub fn parse_data_type(type_str: &str) -> DataType {
         // a month is not a fixed number of days and a day is not always 24 hours.
         "INTERVAL" => DataType::Interval(IntervalUnit::MonthDayNano),
         "JSON" | "JSONB" => DataType::Utf8,
-        "DECIMAL" | "NUMERIC" => decimal_type(parameters),
+        "DECIMAL" | "NUMERIC" => decimal_type(declared.parameters.as_deref()),
         _ => DataType::Utf8,
     }
 }
@@ -187,29 +190,37 @@ pub fn pg_declared_type(type_str: &str) -> Option<(PgDeclaredType, i32)> {
     /// between a declared length and the `atttypmod` that records it.
     const VARHDRSZ: i32 = 4;
 
-    let upper = type_str.trim().to_uppercase();
-    if array_element(&upper).is_some() {
+    let declared = Declared::parse(type_str);
+    if declared.is_array() {
         return None;
     }
-    let (base, parameters) = split_parameters(&upper);
+    let pg = pg_type_of(&declared)?;
 
-    let declared = match base.as_str() {
-        "JSON" | "JSONB" => PgDeclaredType::Json,
-        "UUID" => PgDeclaredType::Uuid,
-        "CHAR" | "BPCHAR" | "CHARACTER" => PgDeclaredType::BpChar,
-        "VARCHAR" | "CHARACTER VARYING" | "CHAR VARYING" => PgDeclaredType::VarChar,
-        _ => return None,
-    };
     // Only a character type has a length, and only a length that is really a number is one:
     // a `CHAR` with no parentheses is the unbounded type, which `-1` is the name of.
-    let typmod = match declared {
-        PgDeclaredType::BpChar | PgDeclaredType::VarChar => parameters
-            .and_then(|p| p.trim().parse::<i32>().ok())
-            .filter(|length| *length > 0)
-            .map_or(-1, |length| length + VARHDRSZ),
+    let typmod = match pg {
+        PgDeclaredType::BpChar | PgDeclaredType::VarChar => {
+            declared.length().map_or(-1, |length| length + VARHDRSZ)
+        }
         _ => -1,
     };
-    Some((declared, typmod))
+    Some((pg, typmod))
+}
+
+/// Which PostgreSQL type a scalar declaration names, ignoring its length.
+///
+/// The one place the character-type spellings are written down. They used to be listed here
+/// *and* in [`is_declared_text`], and the two lists had already drifted apart: `CHAR VARYING`
+/// was reported as `varchar` to a client and simultaneously treated as an opaque non-text
+/// column, which silently cost every predicate on such a column its push-down.
+fn pg_type_of(declared: &Declared) -> Option<PgDeclaredType> {
+    match declared.base.as_str() {
+        "JSON" | "JSONB" => Some(PgDeclaredType::Json),
+        "UUID" => Some(PgDeclaredType::Uuid),
+        "CHAR" | "BPCHAR" | "CHARACTER" => Some(PgDeclaredType::BpChar),
+        "VARCHAR" | "CHARACTER VARYING" | "CHAR VARYING" => Some(PgDeclaredType::VarChar),
+        _ => None,
+    }
 }
 
 /// The Arrow field a column declared as `declared` is advertised as.
@@ -254,19 +265,25 @@ pub fn field_declared_type(field: &Field) -> Option<(PgDeclaredType, i32)> {
 /// one behaves identically in the two engines. `JSON` does not count, even though it is
 /// mapped by an explicit arm rather than by the fallback, because DuckDB parses the literal
 /// it is compared against as JSON.
+///
+/// Derived from [`pg_type_of`] rather than from a second list of spellings, so a character
+/// type this module learns to name cannot stay opaque here.
 pub fn is_declared_text(type_str: &str) -> bool {
-    let upper = type_str.trim().to_uppercase();
+    let declared = Declared::parse(type_str);
 
     // An array of text is a list, not text.
-    if array_element(&upper).is_some() {
+    if declared.is_array() {
         return false;
     }
 
-    let (base, _) = split_parameters(&upper);
-    matches!(
-        base.as_str(),
-        "VARCHAR" | "TEXT" | "STRING" | "CHAR" | "BPCHAR" | "CHARACTER" | "CHARACTER VARYING"
-    )
+    match pg_type_of(&declared) {
+        Some(PgDeclaredType::BpChar | PgDeclaredType::VarChar) => true,
+        // `JSON` and `UUID`: rendered as text, stored as something a text literal does not
+        // convert to.
+        Some(_) => false,
+        // The types `Utf8` already names, and which therefore carry no declared type.
+        None => matches!(declared.base.as_str(), "TEXT" | "STRING"),
+    }
 }
 
 /// Why a column declared as `type_str` cannot be served, or `None` if it can be.
@@ -281,15 +298,11 @@ pub fn is_declared_text(type_str: &str) -> bool {
 ///
 /// An array is refused for the same reason its element is.
 pub fn unserviceable_type_reason(type_str: &str) -> Option<&'static str> {
-    let upper = type_str.trim().to_uppercase();
+    // An array is refused for the same reason its element is, so the suffixes are simply
+    // dropped: what `[]` wraps is all this decision depends on.
+    let declared = Declared::parse(type_str);
 
-    if let Some(element) = array_element(&upper) {
-        return unserviceable_type_reason(element);
-    }
-
-    let (base, _) = split_parameters(&upper);
-
-    match base.as_str() {
+    match declared.base.as_str() {
         "HUGEINT" | "INT128" => Some(
             "the shards' engine narrows a 128-bit integer to a 38-digit decimal before the \
              coordinator ever sees it, so the widest values would read back silently \
@@ -329,6 +342,61 @@ pub fn unserviceable_type_reason(type_str: &str) -> Option<&'static str> {
              TIMESTAMPTZ, which keeps its offset, or TIME with the offset in its own column",
         ),
         _ => None,
+    }
+}
+
+/// A declared type taken apart once: upper-cased by the caller, its `[]` suffixes counted
+/// and peeled off, and its parenthesised parameters split from its base name.
+///
+/// All four entry points above ask the same three questions of a declared string — what is it
+/// called, what is inside its parentheses, and is it an array — and each used to ask them for
+/// itself, answering the array one its own way. Asking once is what keeps `NUMERIC(10,2)[]`
+/// from being a decimal to one of them and an unrecognized type to another.
+struct Declared {
+    /// Upper-cased, with the parameters and every array suffix removed. Words trailing the
+    /// closing parenthesis stay part of it, so `TIMESTAMP(6) WITH TIME ZONE` reduces to
+    /// `TIMESTAMP WITH TIME ZONE` rather than to something unrecognized.
+    base: String,
+    /// The text between the parentheses, if the declaration had any.
+    parameters: Option<String>,
+    /// How many `[]` suffixes were peeled: 0 for a scalar, 2 for `INTEGER[][]`.
+    array_depth: usize,
+}
+
+impl Declared {
+    /// Take a declaration apart, normalizing it on the way in.
+    ///
+    /// Owns what it hands back rather than borrowing the upper-cased string, so that
+    /// case-folding happens here and cannot be forgotten at a call site — the four entry
+    /// points each used to do it themselves.
+    fn parse(type_str: &str) -> Self {
+        let upper = type_str.trim().to_uppercase();
+
+        let mut rest = upper.as_str();
+        let mut array_depth = 0;
+        while let Some(element) = array_element(rest) {
+            rest = element;
+            array_depth += 1;
+        }
+        let (base, parameters) = split_parameters(rest);
+        Self {
+            base,
+            parameters: parameters.map(str::to_string),
+            array_depth,
+        }
+    }
+
+    fn is_array(&self) -> bool {
+        self.array_depth > 0
+    }
+
+    /// The declared length, when the parentheses really hold one. `CHAR`, `VARCHAR(x)` and
+    /// `VARCHAR(0)` are all the unbounded type, which has no length rather than length zero.
+    fn length(&self) -> Option<i32> {
+        self.parameters
+            .as_deref()
+            .and_then(|p| p.trim().parse::<i32>().ok())
+            .filter(|length| *length > 0)
     }
 }
 
@@ -405,71 +473,92 @@ mod tests {
         DataType::Timestamp(TimeUnit::Microsecond, Some("UTC".into()))
     }
 
+    fn list_of(element: DataType) -> DataType {
+        DataType::List(Arc::new(Field::new("item", element, true)))
+    }
+
+    /// The alias table itself, one row per spelling. Flat and unsurprising, and kept because
+    /// an arm quietly lost from the `match` falls through to the `Utf8` default rather than
+    /// failing to compile: a `DATE` column would still answer, as text.
     #[test]
-    fn unsigned_integers_keep_their_range() {
-        assert_eq!(parse_data_type("UTINYINT"), DataType::UInt8);
-        assert_eq!(parse_data_type("USMALLINT"), DataType::UInt16);
-        assert_eq!(parse_data_type("UINTEGER"), DataType::UInt32);
-        // The one width with no unsigned room left below it: `u64::MAX` is not an `i64`,
-        // and a `UInt64` column is put on the wire as `bigint`, which would refuse it.
-        assert_eq!(parse_data_type("UBIGINT"), DataType::Decimal128(20, 0));
+    fn every_declared_spelling_maps_to_its_arrow_type() {
+        for (declared, expected) in [
+            ("INTEGER", DataType::Int32),
+            ("INT", DataType::Int32),
+            ("INT4", DataType::Int32),
+            ("SIGNED", DataType::Int32),
+            ("BIGINT", DataType::Int64),
+            ("INT8", DataType::Int64),
+            ("LONG", DataType::Int64),
+            ("SMALLINT", DataType::Int16),
+            ("INT2", DataType::Int16),
+            ("SHORT", DataType::Int16),
+            ("TINYINT", DataType::Int8),
+            ("INT1", DataType::Int8),
+            ("UTINYINT", DataType::UInt8),
+            ("USMALLINT", DataType::UInt16),
+            ("UINTEGER", DataType::UInt32),
+            // The one width with no unsigned room left above it: `u64::MAX` is not an `i64`,
+            // and a `UInt64` column goes on the wire as `bigint`, which would refuse it.
+            ("UBIGINT", DataType::Decimal128(20, 0)),
+            ("BOOLEAN", DataType::Boolean),
+            ("BOOL", DataType::Boolean),
+            ("LOGICAL", DataType::Boolean),
+            ("FLOAT", DataType::Float32),
+            ("REAL", DataType::Float32),
+            ("FLOAT4", DataType::Float32),
+            ("DOUBLE", DataType::Float64),
+            ("DOUBLE PRECISION", DataType::Float64),
+            ("FLOAT8", DataType::Float64),
+            ("VARCHAR", DataType::Utf8),
+            ("TEXT", DataType::Utf8),
+            ("STRING", DataType::Utf8),
+            ("JSON", DataType::Utf8),
+            ("JSONB", DataType::Utf8),
+            // The aliases whose absence lost data rather than an OID: a `Binary` -> `Utf8`
+            // rebuild is a safe cast, so every value that was not valid UTF-8 read as NULL.
+            ("BLOB", DataType::Binary),
+            ("BYTEA", DataType::Binary),
+            ("BINARY", DataType::Binary),
+            ("VARBINARY", DataType::Binary),
+            ("DATE", DataType::Date32),
+            // Microseconds, which is what the shards return — not the SQL parser's
+            // nanosecond default.
+            (
+                "TIMESTAMP",
+                DataType::Timestamp(TimeUnit::Microsecond, None),
+            ),
+            ("DATETIME", DataType::Timestamp(TimeUnit::Microsecond, None)),
+            ("TIMESTAMP_S", DataType::Timestamp(TimeUnit::Second, None)),
+            (
+                "TIMESTAMP_MS",
+                DataType::Timestamp(TimeUnit::Millisecond, None),
+            ),
+            (
+                "TIMESTAMP_NS",
+                DataType::Timestamp(TimeUnit::Nanosecond, None),
+            ),
+            // The zone is the point of the type.
+            ("TIMESTAMPTZ", micros_utc()),
+            ("TIMESTAMP WITH TIME ZONE", micros_utc()),
+            ("TIME", DataType::Time64(TimeUnit::Microsecond)),
+            // Months, days and nanoseconds separately: a month is not a fixed number of days.
+            ("INTERVAL", DataType::Interval(IntervalUnit::MonthDayNano)),
+        ] {
+            assert_eq!(parse_data_type(declared), expected, "`{declared}`");
+        }
     }
 
     #[test]
-    fn the_temporal_types_are_not_text() {
-        assert_eq!(parse_data_type("TIMESTAMPTZ"), micros_utc());
-        assert_eq!(parse_data_type("TIMESTAMP WITH TIME ZONE"), micros_utc());
+    fn matching_is_case_and_space_insensitive() {
+        assert_eq!(parse_data_type("Integer"), DataType::Int32);
+        assert_eq!(parse_data_type("  bigint  "), DataType::Int64);
+        assert_eq!(parse_data_type("Double Precision"), DataType::Float64);
+        assert_eq!(parse_data_type("timestamptz"), micros_utc());
         assert_eq!(
-            parse_data_type("TIME"),
-            DataType::Time64(TimeUnit::Microsecond)
+            parse_data_type("numeric(10,2)"),
+            DataType::Decimal128(10, 2)
         );
-        assert_eq!(
-            parse_data_type("INTERVAL"),
-            DataType::Interval(IntervalUnit::MonthDayNano)
-        );
-    }
-
-    #[test]
-    fn timestamp_units_are_honored() {
-        assert_eq!(
-            parse_data_type("TIMESTAMP_S"),
-            DataType::Timestamp(TimeUnit::Second, None)
-        );
-        assert_eq!(
-            parse_data_type("TIMESTAMP_MS"),
-            DataType::Timestamp(TimeUnit::Millisecond, None)
-        );
-        assert_eq!(
-            parse_data_type("TIMESTAMP_NS"),
-            DataType::Timestamp(TimeUnit::Nanosecond, None)
-        );
-        // The unqualified spelling stays microseconds, matching what DuckDB returns.
-        assert_eq!(
-            parse_data_type("TIMESTAMP"),
-            DataType::Timestamp(TimeUnit::Microsecond, None)
-        );
-    }
-
-    #[test]
-    fn the_missing_aliases_resolve_to_their_canonical_types() {
-        assert_eq!(parse_data_type("LONG"), DataType::Int64);
-        assert_eq!(parse_data_type("SIGNED"), DataType::Int32);
-        assert_eq!(parse_data_type("SHORT"), DataType::Int16);
-        assert_eq!(parse_data_type("INT1"), DataType::Int8);
-        assert_eq!(parse_data_type("LOGICAL"), DataType::Boolean);
-        assert_eq!(
-            parse_data_type("DATETIME"),
-            DataType::Timestamp(TimeUnit::Microsecond, None)
-        );
-    }
-
-    // The alias whose absence lost data rather than an OID.
-    #[test]
-    fn the_blob_aliases_stay_binary() {
-        assert_eq!(parse_data_type("BINARY"), DataType::Binary);
-        assert_eq!(parse_data_type("VARBINARY"), DataType::Binary);
-        assert_eq!(parse_data_type("BLOB"), DataType::Binary);
-        assert_eq!(parse_data_type("BYTEA"), DataType::Binary);
     }
 
     #[test]
@@ -489,11 +578,10 @@ mod tests {
     }
 
     #[test]
-    fn a_decimal_with_no_parentheses_takes_the_shards_default() {
+    fn a_decimal_arrow_cannot_hold_takes_the_shards_default() {
         let default = DataType::Decimal128(DEFAULT_DECIMAL.0, DEFAULT_DECIMAL.1);
         assert_eq!(parse_data_type("DECIMAL"), default);
         assert_eq!(parse_data_type("NUMERIC"), default);
-        // As does a declaration Arrow cannot hold, or one that is not a declaration.
         assert_eq!(parse_data_type("DECIMAL(40,2)"), default);
         assert_eq!(parse_data_type("DECIMAL(10,20)"), default);
         assert_eq!(parse_data_type("DECIMAL(x,y)"), default);
@@ -516,23 +604,29 @@ mod tests {
     }
 
     #[test]
-    fn matching_is_case_and_space_insensitive() {
-        assert_eq!(parse_data_type("Integer"), DataType::Int32);
-        assert_eq!(parse_data_type("  bigint  "), DataType::Int64);
-        assert_eq!(parse_data_type("Double Precision"), DataType::Float64);
-        assert_eq!(parse_data_type("timestamptz"), micros_utc());
-        assert_eq!(
-            parse_data_type("numeric(10,2)"),
-            DataType::Decimal128(10, 2)
-        );
-    }
-
-    #[test]
     fn an_unknown_type_still_degrades_to_text() {
         assert_eq!(parse_data_type("GEOMETRY"), DataType::Utf8);
         assert_eq!(parse_data_type("UUID"), DataType::Utf8);
         assert_eq!(parse_data_type("ENUM('a', 'b')"), DataType::Utf8);
         assert_eq!(parse_data_type("STRUCT(a INTEGER)"), DataType::Utf8);
+    }
+
+    #[test]
+    fn arrays_carry_their_element_type() {
+        assert_eq!(parse_data_type("INTEGER[]"), list_of(DataType::Int32));
+        assert_eq!(parse_data_type("integer[3]"), list_of(DataType::Int32));
+        assert_eq!(
+            parse_data_type("NUMERIC(10,2)[]"),
+            list_of(DataType::Decimal128(10, 2))
+        );
+        assert_eq!(
+            parse_data_type("INTEGER[][]"),
+            list_of(list_of(DataType::Int32))
+        );
+        assert_eq!(parse_data_type("GEOMETRY[]"), list_of(DataType::Utf8));
+
+        // A `[` inside a nested declaration is not an array marker.
+        assert_eq!(parse_data_type("STRUCT(a INTEGER[])"), DataType::Utf8);
     }
 
     // Both halves of the `Utf8` answer, told apart. The predicate push-down needs the
@@ -547,7 +641,11 @@ mod tests {
             "CHAR",
             "CHAR(3)",
             "BPCHAR",
+            "CHARACTER",
             "CHARACTER VARYING(10)",
+            // Shares `varchar`'s OID and DuckDB's `VARCHAR` storage, and so must share its
+            // push-down too; it did not while two lists of spellings existed.
+            "CHAR VARYING",
         ] {
             assert!(
                 is_declared_text(declared),
@@ -565,6 +663,7 @@ mod tests {
             "STRUCT(a INTEGER)",
             "GEOMETRY",
             "VARCHAR[]",
+            "TEXT[]",
         ] {
             assert!(
                 !is_declared_text(declared),
@@ -574,28 +673,6 @@ mod tests {
 
         // A type that is not text at all is trivially not text.
         assert!(!is_declared_text("INTEGER"));
-    }
-
-    #[test]
-    fn arrays_carry_their_element_type() {
-        let list_of = |dt| DataType::List(Arc::new(Field::new("item", dt, true)));
-        assert_eq!(parse_data_type("INTEGER[]"), list_of(DataType::Int32));
-        assert_eq!(parse_data_type("integer[3]"), list_of(DataType::Int32));
-        assert_eq!(
-            parse_data_type("NUMERIC(10,2)[]"),
-            list_of(DataType::Decimal128(10, 2))
-        );
-        assert_eq!(
-            parse_data_type("INTEGER[][]"),
-            list_of(list_of(DataType::Int32))
-        );
-        assert_eq!(parse_data_type("GEOMETRY[]"), list_of(DataType::Utf8));
-    }
-
-    // A `[` inside a nested declaration is not an array marker.
-    #[test]
-    fn a_bracket_inside_a_declaration_is_not_an_array_suffix() {
-        assert_eq!(parse_data_type("STRUCT(a INTEGER[])"), DataType::Utf8);
     }
 
     // The four types whose values are text and whose *name* is not, told apart from the
@@ -612,10 +689,17 @@ mod tests {
             ("CHARACTER", (P::BpChar, -1)),
             ("VARCHAR", (P::VarChar, -1)),
             ("character varying", (P::VarChar, -1)),
+            ("CHAR VARYING", (P::VarChar, -1)),
             // The length, as PostgreSQL records it: the declaration plus `VARHDRSZ`.
             ("VARCHAR(64)", (P::VarChar, 68)),
             ("CHAR(3)", (P::BpChar, 7)),
             ("CHARACTER VARYING(10)", (P::VarChar, 14)),
+            // A length that is not a length does not become one, and neither does a zero or
+            // a negative: all of them are the unbounded type, which `-1` is the name of.
+            ("VARCHAR(x)", (P::VarChar, -1)),
+            ("VARCHAR()", (P::VarChar, -1)),
+            ("VARCHAR(0)", (P::VarChar, -1)),
+            ("VARCHAR(-2)", (P::VarChar, -1)),
         ] {
             assert_eq!(pg_declared_type(declared), Some(expected), "`{declared}`");
         }
@@ -639,27 +723,6 @@ mod tests {
         ] {
             assert_eq!(pg_declared_type(declared), None, "`{declared}`");
         }
-    }
-
-    // A length that is not a length does not become one, and neither does a zero.
-    #[test]
-    fn a_length_that_is_not_a_number_is_no_modifier_at_all() {
-        assert_eq!(
-            pg_declared_type("VARCHAR(x)"),
-            Some((PgDeclaredType::VarChar, -1))
-        );
-        assert_eq!(
-            pg_declared_type("VARCHAR()"),
-            Some((PgDeclaredType::VarChar, -1))
-        );
-        assert_eq!(
-            pg_declared_type("VARCHAR(0)"),
-            Some((PgDeclaredType::VarChar, -1))
-        );
-        assert_eq!(
-            pg_declared_type("VARCHAR(-2)"),
-            Some((PgDeclaredType::VarChar, -1))
-        );
     }
 
     // The metadata is carried only where it says something, so that every other column's
@@ -714,12 +777,10 @@ mod tests {
                 "{declared} is refused without naming an alternative: {reason}"
             );
         }
-    }
 
-    #[test]
-    fn an_array_is_refused_for_the_same_reason_its_element_is() {
+        // And an array is refused for the same reason its element is, at any nesting.
         assert_eq!(
-            unserviceable_type_reason("HUGEINT[]"),
+            unserviceable_type_reason("HUGEINT[][]"),
             unserviceable_type_reason("HUGEINT")
         );
         assert!(unserviceable_type_reason("BIT[3]").is_some());

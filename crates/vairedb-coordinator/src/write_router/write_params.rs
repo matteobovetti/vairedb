@@ -63,8 +63,9 @@ use vairedb_common::proto::vairedb::v1::{WriteParam, write_param};
 use crate::error::{CoordinatorError, Result};
 use crate::pgwire_handler::encoding::interval_sql_literal as interval_literal;
 
-/// Nanoseconds in a microsecond, the unit an interval's sub-day part is rendered in.
-const NANOS_PER_MICRO: i64 = 1_000;
+/// Nanoseconds in a millisecond: `IntervalDayTime` counts its sub-day part in
+/// milliseconds and `interval_sql_literal` takes nanoseconds.
+const NANOS_PER_MILLI: i64 = 1_000_000;
 
 /// Convert the decoded bind parameter at `position` (1-based, as the client numbers it)
 /// into a `WriteParam`.
@@ -133,7 +134,7 @@ fn typed_value(scalar: &ScalarValue, position: usize) -> Result<write_param::Val
         ScalarValue::IntervalDayTime(Some(v)) => Value::StringVal(interval_literal(
             0,
             v.days,
-            v.milliseconds as i64 * NANOS_PER_MICRO * NANOS_PER_MICRO,
+            v.milliseconds as i64 * NANOS_PER_MILLI,
         )),
         ScalarValue::IntervalMonthDayNano(Some(v)) => {
             let (months, days, nanos) = IntervalMonthDayNanoType::to_parts(*v);
@@ -200,6 +201,18 @@ mod tests {
             } => Ok(s),
             other => Err(format!("expected a string parameter, got {other:?}")),
         }
+    }
+
+    /// A one-element list parameter: the type with no SQL literal form. `None`
+    /// builds the NULL list, which the NULL check must catch before the refusal.
+    fn list(row: Option<Vec<Option<i32>>>) -> ScalarValue {
+        use datafusion::arrow::array::ListArray;
+        use datafusion::arrow::datatypes::Int32Type;
+        ScalarValue::List(std::sync::Arc::new(ListArray::from_iter_primitive::<
+            Int32Type,
+            _,
+            _,
+        >(vec![row])))
     }
 
     // The defect this module was written for: the literal DuckDB could not bind.
@@ -340,15 +353,8 @@ mod tests {
         // Including a typed NULL of a type whose non-NULL form is refused: the NULL check
         // comes first, so a client binding NULL to an array column is not refused for the
         // type it did not send a value of.
-        let empty_list = ScalarValue::List(std::sync::Arc::new(
-            datafusion::arrow::array::ListArray::from_iter_primitive::<
-                datafusion::arrow::datatypes::Int32Type,
-                _,
-                _,
-            >(vec![None::<Vec<Option<i32>>>]),
-        ));
         assert!(matches!(
-            scalar_to_write_param(Some(&empty_list), 1).unwrap().value,
+            scalar_to_write_param(Some(&list(None)), 1).unwrap().value,
             Some(write_param::Value::IsNull(true))
         ));
     }
@@ -356,14 +362,7 @@ mod tests {
     // A type with no literal form is refused by name, and the message says what to do.
     #[test]
     fn a_parameter_with_no_literal_form_is_refused_rather_than_stringified() {
-        let list = ScalarValue::List(std::sync::Arc::new(
-            datafusion::arrow::array::ListArray::from_iter_primitive::<
-                datafusion::arrow::datatypes::Int32Type,
-                _,
-                _,
-            >(vec![Some(vec![Some(1), Some(2)])]),
-        ));
-        let err = scalar_to_write_param(Some(&list), 3)
+        let err = scalar_to_write_param(Some(&list(Some(vec![Some(1), Some(2)]))), 3)
             .expect_err("an array parameter has no literal form")
             .to_string();
         assert!(err.contains("$3"), "the position must be named: {err}");

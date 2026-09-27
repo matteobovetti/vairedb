@@ -417,10 +417,11 @@ fn rewrite_window_filter(func: &mut Function) {
 
 /// Whether a NULL argument is no input at all to this aggregate, which is what makes
 /// [`rewrite_window_filter`] exact. PostgreSQL's own spellings, since the rewrite runs
-/// before [`postgres_aggregate_alias`].
+/// before [`postgres_aggregate_alias`]. `name` comes from [`bare_function_name`], which
+/// has already lower-cased it.
 fn aggregate_ignores_null_arguments(name: &str) -> bool {
     matches!(
-        name.to_lowercase().as_str(),
+        name,
         "count"
             | "sum"
             | "avg"
@@ -458,17 +459,7 @@ fn aggregate_ignores_null_arguments(name: &str) -> bool {
 /// The cost is that the result column is labelled with the DataFusion name; column
 /// labelling is a separate, already-recorded gap.
 fn postgres_aggregate_alias(name: &ObjectName) -> Option<&'static str> {
-    if name.0.len() != 1 {
-        return None;
-    }
-    match name
-        .0
-        .first()?
-        .as_ident()?
-        .value
-        .to_ascii_lowercase()
-        .as_str()
-    {
+    match bare_function_name(name)?.as_str() {
         "variance" => Some("var_samp"),
         "every" => Some("bool_and"),
         "any_value" => Some("min"),
@@ -477,6 +468,9 @@ fn postgres_aggregate_alias(name: &ObjectName) -> Option<&'static str> {
 }
 
 /// The bare, unqualified name of a function call, lower-cased.
+///
+/// `None` for a qualified name, which is how every check in this module scopes itself to
+/// the built-ins: `myschema.every(b)` is the user's function and none of our business.
 fn bare_function_name(name: &ObjectName) -> Option<String> {
     if name.0.len() != 1 {
         return None;
@@ -629,22 +623,21 @@ fn reject_ordered_set_without_within_group(func: &Function) -> PgWireResult<()> 
     let Some(name) = bare_function_name(&func.name) else {
         return Ok(());
     };
-    let lowered = name.to_lowercase();
     let has_arguments = match &func.args {
         FunctionArguments::List(list) => !list.args.is_empty(),
         _ => false,
     };
     let is_ordered_set = matches!(
-        lowered.as_str(),
+        name.as_str(),
         "mode" | "percentile_cont" | "percentile_disc"
     ) || (has_arguments
-        && vairedb_common::within_group::hypothetical_set_udaf(&lowered).is_some());
+        && vairedb_common::within_group::hypothetical_set_udaf(&name).is_some());
     if !is_ordered_set {
         return Ok(());
     }
     Err(make_vdb_error(
         VdbErrorCode::WrongObjectType,
-        format!("WITHIN GROUP is required for ordered-set aggregate {lowered}"),
+        format!("WITHIN GROUP is required for ordered-set aggregate {name}"),
     ))
 }
 
@@ -683,12 +676,10 @@ fn rename_hypothetical_set_aggregate(func: &mut Function) {
 /// fraction is decidable before any plan is shipped, which is what lets the client have
 /// PostgreSQL's own message and an `invalid_parameter_value` SQLSTATE.
 fn reject_percentile_fraction_out_of_range(func: &Function) -> PgWireResult<()> {
-    let Some(name) = func.name.0.last().and_then(|part| part.as_ident()) else {
+    let Some(name) = bare_function_name(&func.name) else {
         return Ok(());
     };
-    if !name.value.eq_ignore_ascii_case("percentile_cont")
-        && !name.value.eq_ignore_ascii_case("percentile_disc")
-    {
+    if !matches!(name.as_str(), "percentile_cont" | "percentile_disc") {
         return Ok(());
     }
 
@@ -1031,17 +1022,11 @@ fn call(name: &str, args: Vec<Expr>) -> Expr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sqlparser::dialect::PostgreSqlDialect;
-    use crate::sqlparser::parser::Parser;
+    use crate::pgwire_handler::read_path_test_helper::parse_verbatim;
 
-    /// Parse one statement, apply the rewrites, and render the result back to SQL.
+    /// Apply the rewrites to one statement and render the result back to SQL.
     fn rewritten(sql: &str) -> Result<String, String> {
-        let mut stmt: Statement = Parser::new(&PostgreSqlDialect {})
-            .try_with_sql(sql)
-            .unwrap()
-            .parse_statements()
-            .unwrap()
-            .remove(0);
+        let mut stmt = parse_verbatim(sql);
         match rewrite_pg_expressions(&mut stmt) {
             Ok(()) => Ok(stmt.to_string()),
             Err(e) => Err(e.to_string()),
@@ -1191,6 +1176,11 @@ mod tests {
             "SELECT percentile_cont($1) WITHIN GROUP (ORDER BY n) FROM t",
             // The multi-fraction form: an array, not a number.
             "SELECT percentile_cont(ARRAY[0.5, 1.5]) WITHIN GROUP (ORDER BY n) FROM t",
+            // A qualified name is the user's own function, whatever it is spelled like,
+            // and every check in this module scopes itself the same way — through
+            // `bare_function_name`. The planner faults an unknown one; this does not
+            // fault it on the built-in's behalf.
+            "SELECT s.percentile_cont(1.5) WITHIN GROUP (ORDER BY n) FROM t",
         ] {
             assert_eq!(rewritten(sql).unwrap(), sql, "`{sql}` must be untouched");
         }
@@ -1346,17 +1336,11 @@ mod tests {
         assert!(err.contains("one character"), "{err}");
     }
 
-    /// Parse one statement and run the parse-time collation check over it, the way
+    /// Run the parse-time collation check the way
     /// [`crate::pgwire_handler::parser::parse_sql`] does — on the client's own text,
     /// before the compatibility parser has a chance to strip the clause.
     fn collation_checked(sql: &str) -> Result<(), String> {
-        let stmt: Statement = Parser::new(&PostgreSqlDialect {})
-            .try_with_sql(sql)
-            .unwrap()
-            .parse_statements()
-            .unwrap()
-            .remove(0);
-        reject_unsupported_collation(&stmt).map_err(|e| e.to_string())
+        reject_unsupported_collation(&parse_verbatim(sql)).map_err(|e| e.to_string())
     }
 
     // Byte order is what VaireDB does, so asking for it by name changes nothing and

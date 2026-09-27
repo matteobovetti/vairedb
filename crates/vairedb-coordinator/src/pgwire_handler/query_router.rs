@@ -329,26 +329,17 @@ pub fn extract_table_name(stmt: &Statement) -> Option<String> {
             TableObject::TableName(name) => canonical_table_name(name),
             _ => None,
         },
-        Statement::Update(update) => match &update.table.relation {
-            TableFactor::Table { name, .. } => canonical_table_name(name),
-            _ => None,
-        },
+        Statement::Update(update) => relation_name(&update.table.relation),
         Statement::Delete(delete) => {
             let tables = match &delete.from {
                 FromTable::WithFromKeyword(t) => t,
                 FromTable::WithoutKeyword(t) => t,
             };
-            match &tables.first()?.relation {
-                TableFactor::Table { name, .. } => canonical_table_name(name),
-                _ => None,
-            }
+            relation_name(&tables.first()?.relation)
         }
         // The table being merged into, not the one being read from: the error
         // context and the shard lookup are both about the target.
-        Statement::Merge(merge) => match &merge.table {
-            TableFactor::Table { name, .. } => canonical_table_name(name),
-            _ => None,
-        },
+        Statement::Merge(merge) => relation_name(&merge.table),
         Statement::CreateTable(create) => canonical_table_name(&create.name),
         Statement::AlterTable(alter) => canonical_table_name(&alter.name),
         // The table an index is built on, not the index: this is what the error
@@ -370,6 +361,28 @@ pub fn extract_table_name(stmt: &Statement) -> Option<String> {
     }
 }
 
+/// The canonical name of a relation that is a plain table, `None` for any other
+/// source (a subquery, a join, a table function).
+///
+/// `None` rather than a best guess: every caller uses the name to find a relation,
+/// and a derived table is not one. Naming the relation inside it would route a write
+/// at the wrong rows.
+///
+/// A table *function* is a `TableFactor::Table` too — sqlparser distinguishes
+/// `generate_series(1, 3)` from the relation `generate_series` only by the presence of
+/// `args` — so the arguments have to be read, not just the variant. Treating the call
+/// as the relation of the same name is not merely an inexact error context: at
+/// `transaction::guard`, a table with buffered writes whose name a client also calls as
+/// a function made the call read as a read of that table, and refused it.
+fn relation_name(relation: &TableFactor) -> Option<String> {
+    match relation {
+        TableFactor::Table {
+            name, args: None, ..
+        } => canonical_table_name(name),
+        _ => None,
+    }
+}
+
 /// Return the canonical table name of a simple top-level SELECT's first FROM
 /// relation, or `None` for non-SELECT statements, set operations, or non-table
 /// sources (subqueries, joins, table functions).
@@ -380,9 +393,540 @@ pub fn extract_select_table_name(stmt: &Statement) -> Option<String> {
     let SetExpr::Select(select) = query.body.as_ref() else {
         return None;
     };
-    let table_with_joins = select.from.first()?;
-    match &table_with_joins.relation {
-        TableFactor::Table { name, .. } => canonical_table_name(name),
-        _ => None,
+    relation_name(&select.from.first()?.relation)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pgwire_handler::parser;
+    use crate::util::shard_table_name;
+    use crate::write_sql_cl;
+
+    /// Parse through the coordinator's own entry rather than a bare sqlparser call: the
+    /// statements classified in production are the ones `parse_sql` returns, and two of
+    /// the classifications below exist only because it respells something first —
+    /// `RESET` and `ALTER TABLE … SET SCHEMA` are in neither parser's grammar.
+    fn statement(sql: &str) -> Statement {
+        let mut statements = parser::parse_sql(sql).unwrap_or_else(|e| panic!("`{sql}`: {e}"));
+        assert_eq!(statements.len(), 1, "`{sql}` is not one statement");
+        statements.pop().expect("one statement")
+    }
+
+    fn classify(sql: &str) -> QueryType {
+        classify_statement(&statement(sql))
+    }
+
+    /// The relation a statement names, as an [`ObjectName`] — taken off a `DROP TABLE`
+    /// because it is a write statement, so `parse_sql` hands back the client's own name
+    /// with its quoting and its qualifiers intact.
+    fn name(spelling: &str) -> ObjectName {
+        match statement(&format!("DROP TABLE {spelling}")) {
+            Statement::Drop { names, .. } => names.into_iter().next().expect("one name"),
+            other => panic!("`{spelling}` did not parse as a DROP: {other:?}"),
+        }
+    }
+
+    fn canonical(spelling: &str) -> Option<String> {
+        canonical_table_name(&name(spelling))
+    }
+
+    /// One statement per [`QueryType`] a client can reach, because the variant chosen
+    /// here decides which of the two execution paths runs — and a statement that lands
+    /// on `Other` is answered by neither.
+    #[test]
+    fn every_reachable_query_type_is_reached() {
+        let cases = [
+            ("SELECT 1", QueryType::Select),
+            ("INSERT INTO t VALUES (1)", QueryType::Insert),
+            ("UPDATE t SET v = 1", QueryType::Update),
+            ("DELETE FROM t", QueryType::Delete),
+            (
+                "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE",
+                QueryType::Merge,
+            ),
+            ("CREATE TABLE t (id INT)", QueryType::CreateTable),
+            ("ALTER TABLE t ADD COLUMN v INT", QueryType::AlterTable),
+            ("DROP TABLE t", QueryType::DropTable),
+            ("TRUNCATE TABLE t", QueryType::TruncateTable),
+            ("CREATE INDEX i ON t (id)", QueryType::CreateIndex),
+            ("DROP INDEX i", QueryType::DropIndex),
+            ("CREATE VIEW v AS SELECT 1", QueryType::CreateView),
+            ("ALTER VIEW v AS SELECT 2", QueryType::AlterView),
+            ("DROP VIEW v", QueryType::DropView),
+            ("CREATE SCHEMA s", QueryType::CreateSchema),
+            ("DROP SCHEMA s", QueryType::DropSchema),
+            ("ALTER SCHEMA s RENAME TO s2", QueryType::AlterSchema),
+            ("COPY t TO '/tmp/t.csv'", QueryType::Copy),
+            ("BEGIN", QueryType::TransactionControl),
+            ("COMMIT", QueryType::TransactionControl),
+            ("ROLLBACK", QueryType::TransactionControl),
+            ("SAVEPOINT s", QueryType::TransactionControl),
+            ("RELEASE SAVEPOINT s", QueryType::TransactionControl),
+            ("SET search_path TO public", QueryType::SessionParam),
+            ("SHOW search_path", QueryType::SessionParam),
+            // Only a `SessionParam` because `parse_sql` respells it: `RESET` is in
+            // neither parser's grammar, so classifying it is a joint claim.
+            ("RESET search_path", QueryType::SessionParam),
+            ("EXPLAIN SELECT 1", QueryType::Explain),
+            ("EXPLAIN ANALYZE SELECT 1", QueryType::Explain),
+        ];
+        for (sql, expected) in cases {
+            assert_eq!(classify(sql), expected, "`{sql}`");
+        }
+    }
+
+    /// `ALTER TABLE … SET SCHEMA` is the other respelling, and it must stay an
+    /// `AlterTable`: it is broadcast DDL, and a misclassification would answer it on the
+    /// read path, where no shard is touched and the rename silently does not happen.
+    #[test]
+    fn set_schema_stays_alter_table() {
+        assert_eq!(
+            classify("ALTER TABLE t SET SCHEMA sales"),
+            QueryType::AlterTable
+        );
+    }
+
+    /// `DROP` splits on the object kind, not on the statement. Each namespace has its
+    /// own catalog lookup, and the wrong one reports a missing table instead of the
+    /// `42809` that tells a client it named the wrong kind of object.
+    #[test]
+    fn drop_splits_on_the_object_kind() {
+        assert_eq!(classify("DROP INDEX i"), QueryType::DropIndex);
+        assert_eq!(classify("DROP VIEW v"), QueryType::DropView);
+        assert_eq!(classify("DROP SCHEMA s"), QueryType::DropSchema);
+        assert_eq!(classify("DROP TABLE t"), QueryType::DropTable);
+        // Every other kind keeps reaching the table path, which is what reports `42809`
+        // for a kind that names a table. A `DROP SEQUENCE t` classified as anything else
+        // would report "does not exist" and leave the client thinking `t` was gone.
+        assert_eq!(classify("DROP SEQUENCE s"), QueryType::DropTable);
+    }
+
+    /// `Other` has to stay reachable: it is what turns a command no subsystem claims
+    /// into a refusal that names it, rather than into a fake `OK`.
+    #[test]
+    fn an_unclaimed_command_falls_through_to_other() {
+        assert_eq!(classify("CALL p()"), QueryType::Other);
+    }
+
+    /// Every spelling of transaction control, because one of them falling through to
+    /// `Other` would be refused as unsupported — which is the whole failure the variant
+    /// exists to prevent.
+    #[test]
+    fn every_spelling_of_transaction_control_is_recognized() {
+        for sql in [
+            "BEGIN",
+            "BEGIN TRANSACTION",
+            "BEGIN WORK",
+            "BEGIN ISOLATION LEVEL SERIALIZABLE",
+            "BEGIN READ ONLY",
+            "START TRANSACTION",
+            "COMMIT",
+            "COMMIT WORK",
+            "END",
+            "ROLLBACK",
+            "ROLLBACK TRANSACTION",
+            "ABORT",
+            "ROLLBACK TO SAVEPOINT sp",
+            "SAVEPOINT sp",
+            "RELEASE SAVEPOINT sp",
+        ] {
+            assert_eq!(classify(sql), QueryType::TransactionControl, "`{sql}`");
+        }
+    }
+
+    /// The optional and decorated spellings of the statements whose keyword is not the
+    /// whole grammar. `TRUNCATE orders` losing its classification would be refused as
+    /// unsupported while `TRUNCATE TABLE orders` emptied the table; a `TRUNCATE ONLY`
+    /// losing its *target* would empty nothing and report success.
+    #[test]
+    fn optional_keywords_and_decorations_do_not_change_the_route() {
+        for sql in ["TRUNCATE TABLE orders", "TRUNCATE orders"] {
+            assert_eq!(classify(sql), QueryType::TruncateTable, "`{sql}`");
+        }
+        for sql in [
+            "CREATE INDEX idx ON orders (amount)",
+            "CREATE UNIQUE INDEX idx ON orders (id)",
+        ] {
+            assert_eq!(classify(sql), QueryType::CreateIndex, "`{sql}`");
+        }
+        for sql in [
+            "TRUNCATE TABLE ONLY orders",
+            "TRUNCATE TABLE orders *",
+            "TRUNCATE orders",
+        ] {
+            assert_eq!(
+                extract_table_name(&statement(sql)).as_deref(),
+                Some("orders"),
+                "`{sql}` must resolve its target"
+            );
+        }
+    }
+
+    /// The write path is what executes on DuckDB. A statement wrongly inside it is
+    /// broadcast to every shard; one wrongly outside is handed to a planner that never
+    /// sees it — so the membership is pinned, not derived.
+    #[test]
+    fn the_write_path_is_dml_plus_broadcast_ddl() {
+        for sql in [
+            "INSERT INTO t VALUES (1)",
+            "UPDATE t SET v = 1",
+            "DELETE FROM t",
+            "MERGE INTO t USING s ON t.id = s.id WHEN MATCHED THEN DELETE",
+            "CREATE TABLE t (id INT)",
+            "ALTER TABLE t ADD COLUMN v INT",
+            "DROP TABLE t",
+            "TRUNCATE TABLE t",
+            "CREATE INDEX i ON t (id)",
+            "DROP INDEX i",
+            "COPY t TO '/tmp/t.csv'",
+        ] {
+            assert!(classify(sql).is_write_path(), "`{sql}` left the write path");
+        }
+
+        for sql in [
+            "SELECT 1",
+            "EXPLAIN SELECT 1",
+            // View and schema DDL are coordinator-only: a view lives in the catalog and
+            // a schema holds no rows, so neither is broadcast.
+            "CREATE VIEW v AS SELECT 1",
+            "ALTER VIEW v AS SELECT 2",
+            "DROP VIEW v",
+            "CREATE SCHEMA s",
+            "DROP SCHEMA s",
+            "ALTER SCHEMA s RENAME TO s2",
+            // Transaction control moves session state only. The writes it releases at
+            // COMMIT were each classified as DML in their own right.
+            "BEGIN",
+            "COMMIT",
+            "SET search_path TO public",
+        ] {
+            assert!(
+                !classify(sql).is_write_path(),
+                "`{sql}` joined the write path"
+            );
+        }
+    }
+
+    /// `wants_verbatim_ast` is wider than `is_write_path` by exactly view DDL, and that
+    /// difference is the whole reason the two predicates exist: a view body is *stored*
+    /// and re-planned on every read, so storing a rewritten one would bake one client's
+    /// compatibility shim into the catalog permanently.
+    #[test]
+    fn view_ddl_wants_a_verbatim_ast_without_being_a_write() {
+        for sql in ["CREATE VIEW v AS SELECT 1", "ALTER VIEW v AS SELECT 2"] {
+            let query_type = classify(sql);
+            assert!(!query_type.is_write_path(), "`{sql}`");
+            assert!(query_type.wants_verbatim_ast(), "`{sql}`");
+        }
+        // Everything else agrees with `is_write_path`, in both directions.
+        for sql in [
+            "INSERT INTO t VALUES (1)",
+            "CREATE TABLE t (id INT)",
+            "SELECT 1",
+            "DROP VIEW v",
+            "BEGIN",
+        ] {
+            let query_type = classify(sql);
+            assert_eq!(
+                query_type.wants_verbatim_ast(),
+                query_type.is_write_path(),
+                "`{sql}`"
+            );
+        }
+    }
+
+    /// The fold, part by part: an unquoted part lowercases as PostgreSQL folds it, a
+    /// quoted part keeps its case. Comparing a raw `Ident::value` instead does not fail
+    /// loudly — it misses a shard key and broadcasts the row to every shard.
+    #[test]
+    fn identifier_folding_follows_postgresql() {
+        assert_eq!(canonical("Orders").as_deref(), Some("orders"));
+        assert_eq!(canonical("ORDERS").as_deref(), Some("orders"));
+        assert_eq!(canonical("\"Orders\"").as_deref(), Some("Orders"));
+        // Per part, not per name: one quoted part does not protect the other.
+        assert_eq!(
+            canonical("Sales.\"Orders\"").as_deref(),
+            Some("sales.Orders")
+        );
+        assert_eq!(
+            canonical("\"Sales\".Orders").as_deref(),
+            Some("Sales.orders")
+        );
+    }
+
+    /// A name carrying no qualifier and one spelling out `public.` are the same key, so
+    /// `orders` and `public.orders` cannot become two relations.
+    #[test]
+    fn the_default_schema_is_folded_away() {
+        assert_eq!(canonical("orders").as_deref(), Some("orders"));
+        assert_eq!(canonical("public.orders").as_deref(), Some("orders"));
+        assert_eq!(canonical("PUBLIC.orders").as_deref(), Some("orders"));
+        // Quoted, it is still the default schema — the fold is on the canonical part.
+        assert_eq!(canonical("\"public\".orders").as_deref(), Some("orders"));
+        assert_eq!(canonical("sales.orders").as_deref(), Some("sales.orders"));
+    }
+
+    /// Only the last two parts are read: a client that spells out the database has named
+    /// the same relation, and there is one catalog.
+    #[test]
+    fn a_leading_catalog_part_is_ignored() {
+        assert_eq!(
+            canonical("vairedb.sales.orders").as_deref(),
+            Some("sales.orders")
+        );
+        assert_eq!(
+            canonical("vairedb.public.orders").as_deref(),
+            Some("orders")
+        );
+    }
+
+    /// The pieces and the key are the same decision, so they cannot disagree about which
+    /// schema a relation is in.
+    #[test]
+    fn the_key_is_its_parts_rejoined() {
+        for spelling in [
+            "orders",
+            "public.orders",
+            "sales.orders",
+            "\"Sales\".orders",
+        ] {
+            let (schema, relation) = canonical_schema_and_table(&name(spelling)).expect("a name");
+            let key = qualified_name(&schema, &relation);
+            assert_eq!(
+                canonical(spelling).as_deref(),
+                Some(key.as_str()),
+                "{spelling}"
+            );
+            assert_eq!(schema_of(&key), schema, "{spelling}");
+            assert_eq!(relation_of(&key), relation, "{spelling}");
+        }
+    }
+
+    /// A bare key is in the default schema — the qualifier's absence is the statement,
+    /// not a missing value.
+    #[test]
+    fn a_bare_key_reads_back_as_the_default_schema() {
+        assert_eq!(schema_of("orders"), DEFAULT_SCHEMA);
+        assert_eq!(relation_of("orders"), "orders");
+        assert_eq!(schema_of("sales.orders"), "sales");
+        assert_eq!(relation_of("sales.orders"), "orders");
+    }
+
+    /// A qualified key registers as a *structured* reference. A bare `"sales.orders"`
+    /// survives `datafusion-proto`'s print and comes back from its re-parse as
+    /// `Partial { sales, orders }`, so a filtered or sorted read of a qualified relation
+    /// used to fail `42703` while an unfiltered one worked.
+    #[test]
+    fn a_qualified_key_registers_as_a_two_part_reference() {
+        assert_eq!(
+            table_reference("sales.orders"),
+            TableReference::partial("sales", "orders")
+        );
+        assert_eq!(table_reference("orders"), TableReference::bare("orders"));
+        // Case is carried verbatim: the key is already canonical, so re-folding it here
+        // would lose the case a quoted name was created with.
+        assert_eq!(
+            table_reference("Sales.MyTable"),
+            TableReference::partial("Sales", "MyTable")
+        );
+    }
+
+    /// And the round trip the structured key exists for: printing a reference and
+    /// re-parsing it — what `datafusion-proto` does to every column qualifier in a
+    /// distributed plan — has to be the identity, or a filtered read of the relation
+    /// cannot resolve its own columns.
+    #[test]
+    fn a_structured_reference_survives_the_proto_round_trip() {
+        for key in ["orders", "sales.orders", "Sales.MyTable"] {
+            let reference = table_reference(key);
+            assert_eq!(
+                TableReference::parse_str_normalized(&reference.to_string(), true),
+                reference,
+                "the qualifier for `{key}` must survive being printed and re-parsed"
+            );
+        }
+    }
+
+    /// The residue, pinned as residue: a relation quoted with a dot inside a non-default
+    /// schema has no two-part reference, so it keeps the bare key and today's behaviour.
+    #[test]
+    fn a_dotted_relation_part_keeps_the_bare_reference() {
+        let key = canonical("sales.\"a.b\"").expect("a key");
+        assert_eq!(key, "sales.a.b");
+        assert_eq!(table_reference(&key), TableReference::bare("sales.a.b"));
+    }
+
+    /// A source that is not a relation has no name to report, and `None` is the answer
+    /// rather than a guess: the callers use it to find a relation.
+    ///
+    /// The table-function case is the one that is not obvious. sqlparser parses
+    /// `generate_series(1, 3)` as a `TableFactor::Table` carrying `args`, so matching the
+    /// variant alone reports `generate_series` as the relation read — and
+    /// `transaction::guard` then refuses the query as a read of a table with buffered
+    /// writes, if a table of that name has any.
+    #[test]
+    fn a_source_that_is_not_a_relation_has_no_name() {
+        for sql in [
+            "SELECT * FROM (SELECT 1) AS s",
+            "SELECT * FROM generate_series(1, 3)",
+        ] {
+            assert_eq!(extract_select_table_name(&statement(sql)), None, "`{sql}`");
+        }
+        // An alias is not a source of its own: the relation underneath is still the one
+        // being read.
+        assert_eq!(
+            extract_select_table_name(&statement("SELECT o.id FROM Orders AS o")).as_deref(),
+            Some("orders")
+        );
+    }
+
+    /// Only the first target of a multi-relation statement is reported. That is not a
+    /// resolution — it is why `plan_truncate` refuses the multi-table form before the
+    /// name is used, and dropping the guard would empty one table of several.
+    #[test]
+    fn only_the_first_of_several_targets_is_reported() {
+        assert_eq!(
+            extract_table_name(&statement("DROP TABLE t1, t2")).as_deref(),
+            Some("t1")
+        );
+        assert_eq!(
+            extract_table_name(&statement("TRUNCATE TABLE t1, t2")).as_deref(),
+            Some("t1")
+        );
+    }
+
+    /// A statement with no target at all reports none, rather than the relation its
+    /// inner query happens to name.
+    #[test]
+    fn a_statement_with_no_target_reports_none() {
+        for sql in ["EXPLAIN SELECT 1", "BEGIN", "SET search_path TO public"] {
+            assert_eq!(extract_table_name(&statement(sql)), None, "`{sql}`");
+        }
+    }
+
+    /// [`quoted_if_folded`] is [`canonicalize_ident_str`]'s inverse, which is what lets
+    /// the coordinator emit SQL built from catalog metadata: a column stored as
+    /// `"Amount"` and named unquoted would look for `amount` instead.
+    #[test]
+    fn rendering_a_canonical_name_round_trips() {
+        for canonical in ["amount", "Amount", "AMOUNT", "order_id"] {
+            let rendered = quoted_if_folded(canonical);
+            assert_eq!(canonicalize_ident_str(&rendered), canonical);
+        }
+        assert_eq!(quoted_if_folded("amount"), "amount");
+        assert_eq!(quoted_if_folded("Amount"), "\"Amount\"");
+        // A string that reached us unquoted folds like an unquoted identifier.
+        assert_eq!(canonicalize_ident_str("Amount"), "amount");
+        assert_eq!(canonicalize_ident_str("\"Amount\""), "Amount");
+    }
+
+    /// The target of a write or DDL statement, per kind — the name the error context and
+    /// the shard lookup are both built from.
+    #[test]
+    fn the_target_of_a_write_is_its_own_relation() {
+        let cases = [
+            ("INSERT INTO Sales.Orders VALUES (1)", "sales.orders"),
+            ("UPDATE orders SET v = 1", "orders"),
+            ("DELETE FROM public.orders", "orders"),
+            ("CREATE TABLE sales.orders (id INT)", "sales.orders"),
+            ("ALTER TABLE orders ADD COLUMN v INT", "orders"),
+            ("DROP TABLE orders", "orders"),
+            ("TRUNCATE TABLE orders", "orders"),
+            // A view's own name, since a view *is* the relation the statement is about.
+            ("CREATE VIEW v AS SELECT 1 FROM orders", "v"),
+            ("ALTER VIEW v AS SELECT 2 FROM orders", "v"),
+            // An index's *table*, not the index: that is what the shard lookup needs.
+            ("CREATE INDEX i ON orders (id)", "orders"),
+        ];
+        for (sql, expected) in cases {
+            assert_eq!(
+                extract_table_name(&statement(sql)).as_deref(),
+                Some(expected),
+                "`{sql}`"
+            );
+        }
+    }
+
+    /// A MERGE reports the table being merged *into*, not the one being read from. The
+    /// other way round routes the write at the source's shards.
+    #[test]
+    fn a_merge_reports_its_target_and_not_its_source() {
+        let sql = "MERGE INTO target USING source ON target.id = source.id \
+                   WHEN MATCHED THEN DELETE";
+        assert_eq!(
+            extract_table_name(&statement(sql)).as_deref(),
+            Some("target")
+        );
+    }
+
+    /// A SELECT has no single write target, and a write statement has no SELECT source:
+    /// the two extractors are not interchangeable, which is what their doc comments say.
+    #[test]
+    fn the_two_extractors_answer_about_different_statements() {
+        let select = statement("SELECT id FROM Sales.Orders");
+        assert_eq!(extract_table_name(&select), None);
+        assert_eq!(
+            extract_select_table_name(&select).as_deref(),
+            Some("sales.orders")
+        );
+
+        let insert = statement("INSERT INTO orders VALUES (1)");
+        assert_eq!(extract_table_name(&insert).as_deref(), Some("orders"));
+        assert_eq!(extract_select_table_name(&insert), None);
+    }
+
+    /// A set operation has no single FROM relation, and reporting its first branch's
+    /// would name one side of a query that reads both.
+    #[test]
+    fn a_set_operation_has_no_single_source() {
+        assert_eq!(
+            extract_select_table_name(&statement("SELECT id FROM a UNION SELECT id FROM b")),
+            None
+        );
+    }
+
+    /// The cross-node contract: the physical name the write path rewrites a relation to
+    /// must be the one [`shard_table_name`] builds from the same canonical key, byte for
+    /// byte, because the core node's `CREATE TABLE` uses the second and its DML the
+    /// first. Both already route through [`canonical_table_name`], and this is what keeps
+    /// them doing so.
+    ///
+    /// Compared as *rendered SQL*, not by re-extracting the name: the rewrite emits one
+    /// unquoted identifier, so reading it back through [`canonical_table_name`] would fold
+    /// its case away and the assertion would pass on a name that had not matched.
+    #[test]
+    fn the_write_rewrite_agrees_with_the_shard_name() {
+        for spelling in [
+            "orders",
+            "Orders",
+            "public.orders",
+            "sales.orders",
+            "Sales.Orders",
+            "\"Sales\".\"Orders\"",
+            "vairedb.sales.orders",
+        ] {
+            let key = canonical(spelling).expect("a key");
+            let mut stmt = statement(&format!("DELETE FROM {spelling}"));
+            write_sql_cl::rewrite_to_shard_local(&mut stmt, "shard3");
+            assert_eq!(
+                stmt.to_string(),
+                format!("DELETE FROM {}", shard_table_name(&key, 3)),
+                "`{spelling}` rewrote to a name the storage node does not build"
+            );
+        }
+    }
+
+    /// The fold onto one flat identifier is **not injective**, which is not a defect to
+    /// repair here: the storage node splices the physical name into SQL unquoted, so it
+    /// may carry neither a dot nor quotes. The collision is instead refused at
+    /// `CREATE TABLE` — see `schemas::physical_name_conflict` — and this pins the
+    /// premise that refusal rests on.
+    #[test]
+    fn two_logical_names_can_fold_to_one_physical_name() {
+        let qualified = canonical("sales.orders").expect("a key");
+        let flat = canonical("\"sales_orders\"").expect("a key");
+        assert_ne!(qualified, flat);
+        assert_eq!(shard_table_name(&qualified, 0), shard_table_name(&flat, 0));
     }
 }

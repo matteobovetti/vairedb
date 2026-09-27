@@ -4,15 +4,16 @@
 //! exact string/integer arithmetic — never a float round-trip — so large
 //! integers and high-precision decimals route exactly.
 //!
-//! Only forms whose value the coordinator can determine from the statement alone
-//! are routable. Anything else — a computed expression, a function call, a value
-//! of a type whose bound and literal spellings do not agree — yields
-//! [`RoutedValue::Unroutable`] so the caller rejects the write. Hashing such an
-//! expression's *source text* would place the row on a shard that no equivalent
-//! lookup ever visits, and nothing would fail.
+//! Only forms whose value the coordinator can determine from the statement alone are
+//! routable. Anything else — a computed expression, a function call, a type whose bound
+//! and literal spellings disagree — yields [`RoutedValue::Unroutable`] so the caller
+//! rejects the write. Hashing such an expression's *source text* would place the row on
+//! a shard no equivalent lookup ever visits, and nothing would fail.
 
 use crate::sqlparser::ast::{Expr, UnaryOperator, Value};
 use datafusion::scalar::ScalarValue;
+
+use super::placeholder_index;
 
 /// The routing form of a single shard-key expression.
 pub(super) enum RoutedValue {
@@ -31,18 +32,15 @@ pub(super) enum RoutedValue {
 
 /// Resolve the routing string for a shard-key expression.
 ///
-/// Routable forms are those whose value is fixed by the statement plus its bind
-/// parameters: a literal (rendered the way it would be re-serialized into SQL),
-/// a parenthesized such literal, a signed numeric literal, a typed string
-/// constant (`DATE '2022-01-08'`), and a `$N` placeholder resolved against the
-/// decoded parameters so a parameterized write hashes to the same shard as the
-/// equivalent literal. The result is canonicalized so different textual forms of
-/// one value (`10`, `10.0`, `10.00`) route together.
+/// Routable forms are those fixed by the statement plus its bind parameters: a literal
+/// (rendered as it would be re-serialized into SQL), a parenthesized one, a signed
+/// numeric literal, a typed string constant (`DATE '2022-01-08'`), and a `$N`
+/// placeholder resolved against the decoded parameters. The result is canonicalized so
+/// `10`, `10.0` and `10.00` route together.
 ///
-/// Every other expression is [`RoutedValue::Unroutable`]: `VALUES (1 + 1, …)`
-/// hashed as the text `1 + 1` lands on a different shard from the `2` the row is
-/// stored under, and `nextval('s')` or a bare column reference has no value here
-/// at all.
+/// Every other expression is [`RoutedValue::Unroutable`]: `VALUES (1 + 1, …)` hashed as
+/// the text `1 + 1` lands on a different shard from the `2` actually stored, and
+/// `nextval('s')` or a bare column reference has no value here at all.
 pub(super) fn expr_routing_value(expr: &Expr, params: &[ScalarValue]) -> RoutedValue {
     match expr {
         // Parentheses do not change the value.
@@ -77,11 +75,7 @@ pub(super) fn expr_routing_value(expr: &Expr, params: &[ScalarValue]) -> RoutedV
 fn value_routing_value(value: &Value, expr: &Expr, params: &[ScalarValue]) -> RoutedValue {
     match value {
         Value::Null => RoutedValue::Null,
-        Value::Placeholder(name) => match name
-            .strip_prefix('$')
-            .and_then(|d| d.parse::<usize>().ok())
-            .and_then(|n| n.checked_sub(1))
-        {
+        Value::Placeholder(name) => match placeholder_index(name) {
             Some(idx) => match params.get(idx) {
                 Some(scalar) => scalar_routing_value(scalar),
                 // The client bound fewer parameters than the statement uses.
@@ -180,14 +174,13 @@ fn expand_scientific_notation(t: &str) -> Option<String> {
     Some(out)
 }
 
-/// Canonicalize a routing token so that all textual forms of the same value hash
-/// identically: `"10.0"`, `"10.00"`, `"10"` → `"10"`; `"-0"` → `"0"`. A
-/// single-quoted string literal whose content is numeric is unwrapped and
-/// canonicalized as that number (`"'2'"` → `"2"`), so a value written to a
-/// numeric column as a quoted string (`VALUES ('2')`) routes to the same shard
-/// as the bare-number form used in a later `WHERE id = 2` — they denote the same
-/// stored value. Genuine (non-numeric) string keys (`'abc'`) and booleans
-/// (`true`/`false`) are returned unchanged.
+/// Canonicalize a routing token so every textual form of one value hashes identically:
+/// `"10.0"`, `"10.00"`, `"10"` → `"10"`; `"-0"` → `"0"`.
+///
+/// A single-quoted literal whose content is numeric is unwrapped and canonicalized as
+/// that number (`"'2'"` → `"2"`), so `VALUES ('2')` into a numeric column routes where a
+/// later `WHERE id = 2` looks — they denote the same stored value. Non-numeric string
+/// keys (`'abc'`) and booleans are returned unchanged.
 fn canonicalize_routing_value(s: String) -> String {
     let t = s.trim();
 
@@ -262,14 +255,12 @@ fn canonicalize_numeric(t: &str) -> Option<String> {
 
 /// Routing form of a decoded bind parameter.
 ///
-/// Only types whose bound form and literal form agree are routable: a parameter
-/// and a literal of the same value must hash to one shard, or a parameterized
-/// INSERT and a literal point lookup of the same row disagree about which shard
-/// holds it. `ScalarValue`'s `Display` is a *debug-ish* rendering, not a SQL
-/// literal, so each accepted type is spelled out here rather than falling back to
-/// it: a `Timestamp` displays as its raw epoch count (and a different count per
-/// `TimeUnit`), `Interval` as a Rust struct, `Binary` as hex — none of which any
-/// literal of the same value can match. Those are rejected.
+/// Only types whose bound and literal forms agree are routable: otherwise a
+/// parameterized INSERT and a literal point lookup of the same row disagree about which
+/// shard holds it. `ScalarValue`'s `Display` is a debug-ish rendering, not a SQL literal,
+/// so each accepted type is spelled out rather than deferring to it — a `Timestamp`
+/// displays as a raw epoch count (a different one per `TimeUnit`), `Interval` as a Rust
+/// struct, `Binary` as hex, none of which a literal can match. Those are rejected.
 fn scalar_routing_value(scalar: &ScalarValue) -> RoutedValue {
     if scalar.is_null() {
         return RoutedValue::Null;

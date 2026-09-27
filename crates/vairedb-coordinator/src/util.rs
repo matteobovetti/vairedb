@@ -1,19 +1,40 @@
 //! Small cross-cutting helpers shared across coordinator modules.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use vairedb_common::proto::vairedb::v1::NodeState;
 
 use crate::sqlparser::ast::{Ident, ObjectName};
 
-/// Current wall-clock time as whole seconds since the Unix epoch. Centralizes
-/// the `SystemTime::now()` → epoch-duration conversion used wherever the
-/// coordinator stamps heartbeats, registration times, and `created_at`.
-pub fn now_unix_secs() -> u64 {
-    SystemTime::now()
+/// Current wall-clock time as a protobuf `Timestamp`, at the full precision the
+/// message carries. Centralizes the `SystemTime::now()` → epoch-duration
+/// conversion used wherever the coordinator stamps heartbeats, registration
+/// times, and `created_at`.
+///
+/// A clock reading before the Unix epoch is stamped as the epoch rather than
+/// panicking. Every caller is recording when something happened, and one of them
+/// runs inside the spawned task that serves a node's heartbeat stream: a panic
+/// there takes that node's liveness down — the coordinator stops refreshing it
+/// and the failure detector buries it — while the cluster is in fact whole and
+/// the only trace is a backtrace in one task. The core node's heartbeat sender
+/// already reads its clock this way.
+pub fn now_timestamp() -> prost_types::Timestamp {
+    let since_epoch = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
+        .unwrap_or_else(|e| {
+            tracing::warn!(error = %e, "system clock is before the Unix epoch, stamping the epoch");
+            Duration::ZERO
+        });
+    prost_types::Timestamp {
+        seconds: since_epoch.as_secs() as i64,
+        nanos: since_epoch.subsec_nanos() as i32,
+    }
+}
+
+/// Current wall-clock time as whole seconds since the Unix epoch, from the same
+/// reading as [`now_timestamp`] so the two cannot disagree about what "now" is.
+pub fn now_unix_secs() -> u64 {
+    now_timestamp().seconds as u64
 }
 
 /// The physical relation name a logical table's shards are built on, before the
@@ -103,16 +124,28 @@ mod tests {
         assert_eq!(physical_base_name("orders"), "orders");
     }
 
+    // Every state a node is shown in has a label, and the two different ways of
+    // having no state share one. `Unspecified` is a discriminant the enum knows, so
+    // it converts successfully and still falls through to the catch-all arm, which
+    // an out-of-range integer reaches by failing to convert at all — worth covering
+    // both, since the arm is written once and is easy to narrow to only one of them.
     #[test]
-    fn node_state_str_known_values() {
+    fn node_state_str_labels_every_state_and_neither_kind_of_none() {
         assert_eq!(node_state_str(NodeState::Alive as i32), "ALIVE");
         assert_eq!(node_state_str(NodeState::Suspect as i32), "SUSPECT");
         assert_eq!(node_state_str(NodeState::Dead as i32), "DEAD");
+        assert_eq!(node_state_str(NodeState::Unspecified as i32), "UNSPECIFIED");
+        assert_eq!(node_state_str(99), "UNSPECIFIED");
     }
 
+    // The two shard names are not interchangeable, which is the whole reason both
+    // exist: `logical_shard_id` is the table-agnostic id stored in `ShardMeta`, and
+    // using it where a relation name is needed would name a table no node created.
     #[test]
-    fn node_state_str_unknown_value() {
-        assert_eq!(node_state_str(99), "UNSPECIFIED");
+    fn a_logical_shard_id_names_the_shard_and_not_a_table() {
+        assert_eq!(logical_shard_id(0), "shard0");
+        assert_eq!(logical_shard_id(3), "shard3");
+        assert_ne!(logical_shard_id(3), shard_table_name("orders", 3));
     }
 
     #[test]
@@ -132,10 +165,22 @@ mod tests {
         assert!(insert_column_ident(&dotted).is_none());
     }
 
+    // Bounded on both sides by `now_timestamp`, which is the claim the two functions
+    // make about each other: they read the same clock in the same unit. A one-sided
+    // "later than 2020" bound is satisfied by any unit larger than seconds, so it would
+    // pass on a millisecond count — the reading that looks like the year 51,000 and
+    // would make every heartbeat arrive from the future. The epoch still needs the
+    // lower bound, since a zero clock is inside the sandwich too.
     #[test]
-    fn now_unix_secs_is_plausible() {
-        // Sanity: after 2020-01-01 and before some far-future bound.
-        let now = now_unix_secs();
-        assert!(now > 1_577_836_800);
+    fn now_unix_secs_reads_the_same_clock_as_now_timestamp_in_the_same_unit() {
+        let before = now_timestamp().seconds as u64;
+        let secs = now_unix_secs();
+        let after = now_timestamp().seconds as u64;
+
+        assert!(
+            (before..=after).contains(&secs),
+            "{secs} is not between {before} and {after}"
+        );
+        assert!(secs > 1_577_836_800, "{secs} is before 2020-01-01");
     }
 }

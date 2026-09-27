@@ -3,13 +3,14 @@
 //! or a legitimate broadcast. This is the single source of truth for that
 //! route/reject/broadcast decision.
 
-use crate::sqlparser::ast::{Expr, SetExpr, Statement};
+use crate::sqlparser::ast::{BinaryOperator, Expr, SetExpr, Statement};
 use datafusion::scalar::ScalarValue;
 
 use crate::pgwire_handler::query_router::canonicalize_ident;
 
 use super::routing_value::{RoutedValue, expr_routing_value};
 use super::statement::shard_key_column_index;
+use super::unnest;
 
 /// How a write statement should be routed across shards.
 pub enum ShardRouting {
@@ -53,19 +54,32 @@ pub fn route_target(stmt: &Statement, shard_key: &str, params: &[ScalarValue]) -
             }
             ShardRouting::Broadcast
         }
-        Statement::Update(update) => match &update.selection {
-            Some(where_clause) => {
-                routing_from_equality(extract_equality_from_where(where_clause, shard_key, params))
-            }
-            None => ShardRouting::Broadcast,
-        },
-        Statement::Delete(delete) => match &delete.selection {
-            Some(where_clause) => {
-                routing_from_equality(extract_equality_from_where(where_clause, shard_key, params))
-            }
-            None => ShardRouting::Broadcast,
-        },
+        // An UPDATE and a DELETE route identically: each carries one optional
+        // predicate, and a missing one means every row — so every shard.
+        Statement::Update(update) => {
+            predicate_routing(update.selection.as_ref(), shard_key, params)
+        }
+        Statement::Delete(delete) => {
+            predicate_routing(delete.selection.as_ref(), shard_key, params)
+        }
         _ => ShardRouting::Broadcast,
+    }
+}
+
+/// Route a statement whose shard key can only come from its `WHERE` clause.
+///
+/// No predicate is a legitimate broadcast: the statement applies to every row, so
+/// it applies to every shard.
+fn predicate_routing(
+    selection: Option<&Expr>,
+    shard_key: &str,
+    params: &[ScalarValue],
+) -> ShardRouting {
+    match selection {
+        Some(where_clause) => {
+            routing_from_equality(extract_equality_from_where(where_clause, shard_key, params))
+        }
+        None => ShardRouting::Broadcast,
     }
 }
 
@@ -107,43 +121,33 @@ fn extract_equality_from_where(
     key_column: &str,
     params: &[ScalarValue],
 ) -> Option<RoutedValue> {
-    match expr {
-        Expr::BinaryOp { left, op, right } => {
-            if matches!(op, crate::sqlparser::ast::BinaryOperator::Eq) {
+    let Expr::BinaryOp { left, op, right } = unnest(expr) else {
+        return None;
+    };
+    match op {
+        // Either operand order: `id = 5` and `5 = id` constrain the same key.
+        BinaryOperator::Eq => [(left, right), (right, left)]
+            .into_iter()
+            .find_map(|(key_side, value_side)| {
                 // `key_column` is the catalog's canonical name, so fold the
                 // client's identifier the same way: `WHERE ID = 1` constrains a
                 // shard key declared `id`.
-                if let Expr::Identifier(ident) = left.as_ref()
-                    && canonicalize_ident(ident) == key_column
-                {
-                    return Some(expr_routing_value(right, params));
-                }
-                if let Expr::Identifier(ident) = right.as_ref()
-                    && canonicalize_ident(ident) == key_column
-                {
-                    return Some(expr_routing_value(left, params));
-                }
-            }
-            if matches!(op, crate::sqlparser::ast::BinaryOperator::And) {
-                if let Some(val) = extract_equality_from_where(left, key_column, params) {
-                    return Some(val);
-                }
-                return extract_equality_from_where(right, key_column, params);
-            }
-            None
-        }
+                matches!(unnest(key_side), Expr::Identifier(ident) if canonicalize_ident(ident) == key_column)
+                    .then(|| expr_routing_value(value_side, params))
+            }),
+        // The key constraint may be any one of a chain of conjuncts.
+        BinaryOperator::And => extract_equality_from_where(left, key_column, params)
+            .or_else(|| extract_equality_from_where(right, key_column, params)),
+        // `OR` does not constrain: `id = 1 OR id = 2` needs both shards, and
+        // narrowing to one would silently skip rows the client asked for.
         _ => None,
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use super::super::parse_one;
     use super::*;
-    use crate::pgwire_handler::parser::parse_sql;
-
-    fn parse_one(sql: &str) -> Statement {
-        parse_sql(sql).unwrap().into_iter().next().unwrap()
-    }
 
     #[test]
     fn shard_key_resolved_from_int_param() {
@@ -503,32 +507,74 @@ mod tests {
         ));
     }
 
+    /// A decimal parameter routes to the same shard as the equivalent literal, in
+    /// both widths. `ScalarValue`'s `Display` for a decimal is a debug rendering of
+    /// `(mantissa, precision, scale)`, so this is checking that
+    /// `routing_value::scaled_plain_string` reconstructs the literal's own spelling
+    /// — and it has to hold for `Decimal256` as well, which formats its mantissa
+    /// through `i256` rather than `i128`.
     #[test]
-    fn decimal256_param_matches_literal() {
+    fn a_decimal_param_of_either_width_matches_the_literal() {
         use datafusion::arrow::datatypes::i256;
-        let stmt = parse_one("INSERT INTO t (id, v) VALUES ($1, $2)");
-        let params = vec![
-            ScalarValue::Decimal256(Some(i256::from_i128(123456)), 6, 3),
-            ScalarValue::Utf8(Some("a".into())),
-        ];
-        let from_param = extract_shard_key_value(&stmt, "id", &params).unwrap();
+
         let literal = parse_one("INSERT INTO t (id, v) VALUES (123.456, 'a')");
-        assert_eq!(
-            extract_shard_key_value(&literal, "id", &[]).unwrap(),
-            from_param
-        );
+        let expected = extract_shard_key_value(&literal, "id", &[]).unwrap();
+
+        for scalar in [
+            ScalarValue::Decimal128(Some(123456), 6, 3),
+            ScalarValue::Decimal256(Some(i256::from_i128(123456)), 6, 3),
+        ] {
+            let data_type = scalar.data_type();
+            let stmt = parse_one("INSERT INTO t (id, v) VALUES ($1, $2)");
+            let params = vec![scalar, ScalarValue::Utf8(Some("a".into()))];
+            assert_eq!(
+                extract_shard_key_value(&stmt, "id", &params).unwrap(),
+                expected,
+                "a {data_type} param must route like the literal 123.456"
+            );
+        }
     }
 
+    /// Parentheses are grouping, not meaning, so a predicate a client happened to
+    /// parenthesize must route exactly like the bare form.
+    ///
+    /// The fall-through was a broadcast, which is *correct* — every shard
+    /// re-evaluates the predicate over its own rows — but it fanned a point lookup
+    /// out to the whole cluster, and an ORM that always parenthesizes its WHERE
+    /// clause would never get a single-shard write.
     #[test]
-    fn decimal_param_matches_literal() {
-        let stmt = parse_one("INSERT INTO t (id, v) VALUES ($1, $2)");
-        let params = vec![
-            ScalarValue::Decimal128(Some(123456), 6, 3),
-            ScalarValue::Utf8(Some("a".into())),
-        ];
-        let from_param = extract_shard_key_value(&stmt, "id", &params).unwrap();
-        let literal = parse_one("INSERT INTO t (id, v) VALUES (123.456, 'a')");
-        let from_literal = extract_shard_key_value(&literal, "id", &[]).unwrap();
-        assert_eq!(from_param, from_literal);
+    fn a_parenthesized_predicate_routes_like_the_bare_one() {
+        for sql in [
+            "DELETE FROM t WHERE (id = 5)",
+            "DELETE FROM t WHERE ((id = 5))",
+            "UPDATE t SET v = 'x' WHERE (id = 5)",
+            "UPDATE t SET v = 'x' WHERE (id) = 5",
+            "UPDATE t SET v = 'x' WHERE (a = 1) AND (id = 5)",
+            "DELETE FROM t WHERE (5 = id)",
+        ] {
+            assert_eq!(
+                extract_shard_key_value(&parse_one(sql), "id", &[]).as_deref(),
+                Some("5"),
+                "`{sql}` must route to one shard, not broadcast"
+            );
+        }
+    }
+
+    /// `OR` still does not narrow, parenthesized or not: `id = 1 OR id = 2` needs
+    /// both shards, and routing it to one would silently skip rows.
+    #[test]
+    fn a_disjunction_still_broadcasts() {
+        for sql in [
+            "DELETE FROM t WHERE id = 1 OR id = 2",
+            "DELETE FROM t WHERE (id = 1 OR id = 2)",
+        ] {
+            assert!(
+                matches!(
+                    route_target(&parse_one(sql), "id", &[]),
+                    ShardRouting::Broadcast
+                ),
+                "`{sql}` must broadcast"
+            );
+        }
     }
 }

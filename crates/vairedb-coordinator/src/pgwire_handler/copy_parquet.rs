@@ -275,24 +275,7 @@ mod tests {
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
 
     use super::*;
-    use crate::catalog::ColumnDef;
-
-    fn meta(columns: &[&str], shard_key: &str) -> TableMeta {
-        TableMeta {
-            table_name: "orders".to_string(),
-            columns: columns
-                .iter()
-                .map(|c| ColumnDef {
-                    name: (*c).to_string(),
-                    data_type: "INTEGER".to_string(),
-                    nullable: true,
-                    ..Default::default()
-                })
-                .collect(),
-            shard_key: shard_key.to_string(),
-            ..Default::default()
-        }
-    }
+    use crate::catalog::catalog_test_helper::table_meta;
 
     fn schema() -> SchemaRef {
         Arc::new(Schema::new(vec![
@@ -328,7 +311,12 @@ mod tests {
     async fn imported(path: &str, stated: &[&str], table: &[&str]) -> PgWireResult<Vec<String>> {
         let mut file = ParquetFile::open(path).await?;
         let stated: Vec<String> = stated.iter().map(|s| (*s).to_string()).collect();
-        let template = insert_template("orders", &stated, file.fields(), &meta(table, "id"))?;
+        let template = insert_template(
+            "orders",
+            &stated,
+            file.fields(),
+            &table_meta("orders", table, "id"),
+        )?;
 
         let mut sql = Vec::new();
         while let Some(batch) = file.next_batch().await? {

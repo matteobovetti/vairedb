@@ -282,26 +282,14 @@ impl VaireDbQueryHandler {
 
         match query_type {
             QueryType::Select => {
-                let written = query_router::extract_select_table_name(stmt)
-                    .is_some_and(|table| txn.has_buffered_writes_for(&table));
-                if written {
-                    return Err(reads_a_buffered_table());
-                }
-                Ok(())
+                reject_buffered_reads(&txn, query_router::extract_select_table_name(stmt))
             }
             QueryType::Insert if txn.is_read_only() => Err(read_only_transaction("INSERT")),
+            // An `INSERT ... SELECT` is a read as much as a write: its source query runs
+            // now, against a database that does not yet hold the block's buffered writes.
+            // Refused for the same reason a plain SELECT of a written table is.
             QueryType::Insert => {
-                // An `INSERT ... SELECT` is a read as much as a write: its source
-                // query runs now, against a database that does not yet hold the
-                // block's buffered writes. Refused for the same reason a plain
-                // SELECT of a written table is.
-                if write_sql_cl::insert_source_tables(stmt)
-                    .iter()
-                    .any(|table| txn.has_buffered_writes_for(table))
-                {
-                    return Err(reads_a_buffered_table());
-                }
-                Ok(())
+                reject_buffered_reads(&txn, write_sql_cl::insert_source_tables(stmt))
             }
             QueryType::Update | QueryType::Delete => {
                 let command = if *query_type == QueryType::Update {
@@ -343,15 +331,7 @@ impl VaireDbQueryHandler {
                 }
                 Ok(())
             }
-            QueryType::Copy => {
-                if copy::copy_source_tables(stmt)
-                    .iter()
-                    .any(|table| txn.has_buffered_writes_for(table))
-                {
-                    return Err(reads_a_buffered_table());
-                }
-                Ok(())
-            }
+            QueryType::Copy => reject_buffered_reads(&txn, copy::copy_source_tables(stmt)),
             QueryType::CreateTable
             | QueryType::AlterTable
             | QueryType::DropTable
@@ -394,15 +374,11 @@ impl VaireDbQueryHandler {
             // refused SELECT would have. A `DESCRIBE <relation>` reports no inner
             // query and is allowed: only DDL could change a relation's shape, and DDL
             // cannot have run inside the block.
-            QueryType::Explain => {
-                let written = introspection::explained_query(stmt)
-                    .and_then(query_router::extract_select_table_name)
-                    .is_some_and(|table| txn.has_buffered_writes_for(&table));
-                if written {
-                    return Err(reads_a_buffered_table());
-                }
-                Ok(())
-            }
+            QueryType::Explain => reject_buffered_reads(
+                &txn,
+                introspection::explained_query(stmt)
+                    .and_then(query_router::extract_select_table_name),
+            ),
             // Transaction control never reaches here, and an unsupported
             // statement is rejected by name a moment later either way.
             QueryType::TransactionControl | QueryType::Other => Ok(()),
@@ -427,6 +403,27 @@ fn reads_a_buffered_table() -> PgWireError {
         VdbErrorCode::FeatureNotSupported,
         "cannot read a table this transaction block has written to: VaireDB buffers a block's writes in the coordinator until COMMIT, so the read would silently miss them. Read the table before writing it, or after COMMIT",
     )
+}
+
+/// Refuse the statement if any of `tables` is one the open block has already written.
+///
+/// Four statement kinds ask this — a `SELECT`, an `INSERT ... SELECT`'s source, a
+/// `COPY ... TO`'s source, and an `EXPLAIN`'s inner query — and they ask it for one
+/// reason, stated once in [`reads_a_buffered_table`]. Only where the names come from
+/// differs, which is why each caller supplies its own extractor and nothing else:
+/// `Option<String>` and `Vec<String>` are both `IntoIterator<Item = String>`, so the
+/// "one table or none" and "every source table" shapes need no adapter between them.
+fn reject_buffered_reads<I>(txn: &Transaction, tables: I) -> PgWireResult<()>
+where
+    I: IntoIterator<Item = String>,
+{
+    if tables
+        .into_iter()
+        .any(|table| txn.has_buffered_writes_for(&table))
+    {
+        return Err(reads_a_buffered_table());
+    }
+    Ok(())
 }
 
 /// `25006`: a write was issued inside a `READ ONLY` block.
@@ -481,20 +478,12 @@ fn reject_modifier(modifier: Option<TransactionModifier>, command: &str) -> PgWi
 
 #[cfg(test)]
 mod tests {
+    use super::super::write_path_test_helper::{parse_one, user_error};
     use super::*;
 
     use pgwire::messages::response::CommandComplete;
 
-    use crate::catalog::ShardMeta;
     use crate::replication::BatchStatement;
-
-    /// The (SQLSTATE, message) a client would receive.
-    fn reported(err: PgWireError) -> (String, String) {
-        match err {
-            PgWireError::UserError(info) => (info.code, info.message),
-            other => panic!("expected a user-facing error, got {other:?}"),
-        }
-    }
 
     /// Which `Response` variant was returned, and the completion tag it carries.
     /// The variant is as load-bearing as the tag: pgwire derives the connection's
@@ -508,14 +497,6 @@ mod tests {
             Response::Execution(tag) => ("execution", CommandComplete::from(tag).tag),
             _ => panic!("expected a tag-carrying response"),
         }
-    }
-
-    fn parse_one(sql: &str) -> Statement {
-        crate::pgwire_handler::parser::parse_sql(sql)
-            .unwrap()
-            .into_iter()
-            .next()
-            .unwrap()
     }
 
     /// Run a statement through transaction control, as the handler does.
@@ -547,15 +528,7 @@ mod tests {
 
     fn buffered_write(table: &str, primary: &str, replicas: &[&str]) -> BufferedWrite {
         BufferedWrite {
-            shard: ShardMeta {
-                shard_id: format!("{table}-0"),
-                table_name: table.to_string(),
-                primary_node_id: primary.to_string(),
-                replica_node_ids: replicas.iter().map(|r| r.to_string()).collect(),
-                hash_bucket: 0,
-                range_lower: String::new(),
-                range_upper: String::new(),
-            },
+            shard: crate::catalog::catalog_test_helper::shard_meta(table, 0, primary, replicas),
             statement: BatchStatement {
                 sql: format!("INSERT INTO {table}_shard0 VALUES (1)"),
                 params: Vec::new(),
@@ -700,7 +673,7 @@ mod tests {
             .begin_transaction(&[], None, true, &session)
             .await
             .unwrap_err();
-        let (code, message) = reported(err);
+        let (code, message) = user_error(err);
         assert_eq!(code, "0A000");
         assert!(message.contains("BEGIN ... END"), "got: {message}");
         assert!(
@@ -726,7 +699,7 @@ mod tests {
             "DELETE FROM orders WHERE id = 1",
             "COPY orders FROM '/tmp/orders.csv' (FORMAT CSV)",
         ] {
-            let (code, _) = reported(allows(&handler, &session, sql).await.unwrap_err());
+            let (code, _) = user_error(allows(&handler, &session, sql).await.unwrap_err());
             assert_eq!(code, "25006", "`{sql}` must be refused as read-only");
         }
         for sql in [
@@ -757,7 +730,7 @@ mod tests {
             "ALTER VIEW v AS SELECT 2",
             "DROP VIEW v",
         ] {
-            let (code, message) = reported(allows(&handler, &session, sql).await.unwrap_err());
+            let (code, message) = user_error(allows(&handler, &session, sql).await.unwrap_err());
             assert_eq!(code, "0A000", "`{sql}` must be refused inside a block");
             assert!(message.contains("ROLLBACK"), "got: {message}");
             assert!(
@@ -785,7 +758,7 @@ mod tests {
             "COPY orders TO '/tmp/orders.csv' (FORMAT CSV)",
             "COPY (SELECT id FROM customers JOIN orders USING (id)) TO '/tmp/j.csv' (FORMAT CSV)",
         ] {
-            let (code, message) = reported(allows(&handler, &session, sql).await.unwrap_err());
+            let (code, message) = user_error(allows(&handler, &session, sql).await.unwrap_err());
             assert_eq!(code, "0A000", "`{sql}` must be refused inside a block");
             assert!(message.contains("COMMIT"), "got: {message}");
         }
@@ -858,7 +831,7 @@ mod tests {
             ("UPDATE orders SET amount = 1 WHERE id = 1", "UPDATE"),
             ("DELETE FROM orders WHERE id = 1", "DELETE"),
         ] {
-            let (code, message) = reported(allows(&handler, &session, sql).await.unwrap_err());
+            let (code, message) = user_error(allows(&handler, &session, sql).await.unwrap_err());
             assert_eq!(code, "0A000");
             assert!(message.contains(named), "got: {message}");
         }
@@ -869,7 +842,7 @@ mod tests {
             "DROP TABLE orders",
             "TRUNCATE TABLE orders",
         ] {
-            let (code, message) = reported(allows(&handler, &session, sql).await.unwrap_err());
+            let (code, message) = user_error(allows(&handler, &session, sql).await.unwrap_err());
             assert_eq!(code, "0A000", "`{sql}` must be refused inside a block");
             assert!(message.contains("DDL"), "got: {message}");
         }
@@ -888,7 +861,7 @@ mod tests {
             .await
             .push_write(buffered_write("orders", "node-1", &[]));
 
-        let (code, message) = reported(
+        let (code, message) = user_error(
             allows(&handler, &session, "SELECT * FROM orders")
                 .await
                 .unwrap_err(),
@@ -926,7 +899,7 @@ mod tests {
             // The target table is read as much as any other when it is its own source.
             "INSERT INTO orders (id) SELECT id + 1 FROM orders",
         ] {
-            let (code, message) = reported(allows(&handler, &session, sql).await.unwrap_err());
+            let (code, message) = user_error(allows(&handler, &session, sql).await.unwrap_err());
             assert_eq!(code, "0A000", "`{sql}` must be refused inside a block");
             assert!(message.contains("COMMIT"), "got: {message}");
         }
@@ -959,7 +932,7 @@ mod tests {
             "INSERT INTO orders (id) VALUES (1)",
             "CREATE TABLE t (id INTEGER)",
         ] {
-            let (code, _) = reported(allows(&handler, &session, sql).await.unwrap_err());
+            let (code, _) = user_error(allows(&handler, &session, sql).await.unwrap_err());
             assert_eq!(code, "25P02", "`{sql}` must be refused in a failed block");
         }
 
@@ -991,7 +964,7 @@ mod tests {
             buffered_write("customers", "node-3", &["node-4"]),
         ];
 
-        let (code, message) = reported(handler.flush_transaction(writes).await.unwrap_err());
+        let (code, message) = user_error(handler.flush_transaction(writes).await.unwrap_err());
         assert_eq!(code, "0A000");
         assert!(
             message.contains("2 independent shard groups"),
@@ -1022,7 +995,7 @@ mod tests {
     #[test]
     fn and_chain_is_refused_rather_than_quietly_dropped() {
         assert!(reject_chain(false, "COMMIT").is_ok());
-        let (code, message) = reported(reject_chain(true, "COMMIT").unwrap_err());
+        let (code, message) = user_error(reject_chain(true, "COMMIT").unwrap_err());
         assert_eq!(code, "0A000");
         assert!(message.contains("COMMIT AND CHAIN"), "got: {message}");
         assert!(
@@ -1035,7 +1008,7 @@ mod tests {
     fn a_transaction_modifier_is_refused_by_name() {
         assert!(reject_modifier(None, "BEGIN").is_ok());
         let (code, message) =
-            reported(reject_modifier(Some(TransactionModifier::Exclusive), "BEGIN").unwrap_err());
+            user_error(reject_modifier(Some(TransactionModifier::Exclusive), "BEGIN").unwrap_err());
         assert_eq!(code, "0A000");
         assert!(message.contains("BEGIN EXCLUSIVE"), "got: {message}");
     }
@@ -1044,17 +1017,17 @@ mod tests {
     // that matches the state the session is actually in.
     #[test]
     fn transaction_state_errors_carry_the_expected_sqlstate() {
-        assert_eq!(reported(in_failed_transaction()).0, "25P02");
-        assert_eq!(reported(read_only_transaction("INSERT")).0, "25006");
-        assert_eq!(reported(no_active_transaction("SAVEPOINT")).0, "25P01");
-        assert_eq!(reported(unknown_savepoint("sp")).0, "3B001");
+        assert_eq!(user_error(in_failed_transaction()).0, "25P02");
+        assert_eq!(user_error(read_only_transaction("INSERT")).0, "25006");
+        assert_eq!(user_error(no_active_transaction("SAVEPOINT")).0, "25P01");
+        assert_eq!(user_error(unknown_savepoint("sp")).0, "3B001");
     }
 
     #[test]
     fn savepoint_errors_name_the_savepoint_and_the_command() {
-        let (_, message) = reported(unknown_savepoint("sp1"));
+        let (_, message) = user_error(unknown_savepoint("sp1"));
         assert!(message.contains("\"sp1\""), "got: {message}");
-        let (_, message) = reported(no_active_transaction("RELEASE SAVEPOINT"));
+        let (_, message) = user_error(no_active_transaction("RELEASE SAVEPOINT"));
         assert!(message.contains("RELEASE SAVEPOINT"), "got: {message}");
     }
 }

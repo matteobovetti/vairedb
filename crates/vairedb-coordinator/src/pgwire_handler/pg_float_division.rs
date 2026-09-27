@@ -154,8 +154,9 @@ mod tests {
     use datafusion::arrow::array::{Float32Array, Float64Array, Int32Array, RecordBatch};
     use datafusion::arrow::datatypes::{Field, Schema};
     use datafusion::execution::context::SessionContext;
-    use datafusion::prelude::SessionConfig;
     use vairedb_common::float_div::FLOAT_DIV_UDF_NAME;
+
+    use super::super::read_path_test_helper;
 
     /// A context holding `t(f float8, g float8, r float4, n int4)` with one row per
     /// argument list, and the checked division registered the way every read-path context
@@ -182,13 +183,11 @@ mod tests {
             ],
         )
         .expect("the test batch is well formed");
-        // `parse_float_as_decimal`, because that is how the read path reads a literal —
-        // without it `0.0` would be a `Float64` here and a `numeric` in production.
-        let mut config = SessionConfig::new();
-        config.options_mut().sql_parser.parse_float_as_decimal = true;
-        let mut ctx = SessionContext::new_with_config(config);
-        vairedb_common::float_div::register_float_division(&mut ctx)
-            .expect("registering the checked division");
+        // The read path's own context, not one assembled here: `parse_float_as_decimal` is
+        // what makes `0.0` arrive as `numeric` rather than `Float64`, and the checked
+        // division has to be in the registry for the guarded plan to resolve. Both were
+        // set by hand in this module and nowhere else — see [`read_path_test_helper::context`].
+        let ctx = read_path_test_helper::context();
         ctx.register_batch("t", batch)
             .expect("registering the test table");
         ctx

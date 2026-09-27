@@ -9,7 +9,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tokio::sync::Mutex;
-use tonic::transport::Channel;
 
 use vairedb_common::proto::vairedb::v1::{
     ExecuteWriteRequest, VdbErrorCode, WriteOperation, WriteParam, WriteStatement,
@@ -20,7 +19,32 @@ use crate::catalog::{MetadataCatalog, NodeState, ShardMeta};
 use crate::channel_pool::ChannelPool;
 
 use crate::error::{CoordinatorError, NodeError, Result};
-use crate::replication::retry_config::{MAX_PENDING_RETRIES, RetryConfig};
+
+/// Per-node cap on queued retries; bounds memory when a node stays unreachable.
+/// Writes beyond the cap are dropped and reconciled when the node rejoins.
+const MAX_PENDING_RETRIES: usize = 4096;
+/// Default base delay (ms) for the first retry; doubles with each attempt.
+pub const DEFAULT_INITIAL_RETRY_MS: u64 = 100;
+/// Default ceiling (ms) that exponential backoff is clamped to.
+pub const DEFAULT_MAX_RETRY_MS: u64 = 5000;
+
+/// Backoff parameters for retrying writes to lagging replica nodes.
+#[derive(Debug, Clone, Copy)]
+pub struct RetryConfig {
+    /// Base delay in milliseconds; the backoff doubles per attempt from here.
+    pub initial_retry_ms: u64,
+    /// Upper bound in milliseconds that the computed backoff is capped to.
+    pub max_retry_ms: u64,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        Self {
+            initial_retry_ms: DEFAULT_INITIAL_RETRY_MS,
+            max_retry_ms: DEFAULT_MAX_RETRY_MS,
+        }
+    }
+}
 
 /// One statement of a write, already rewritten to shard-local SQL.
 #[derive(Debug, Clone)]
@@ -31,20 +55,30 @@ pub struct BatchStatement {
     pub shard_id: String,
 }
 
-/// A write that failed to reach a replica node and is queued for re-delivery.
-/// Carries everything needed to resend it independently and `attempt` drives the
-/// backoff schedule.
-#[derive(Debug, Clone)]
-pub(crate) struct PendingRetry {
-    pub(crate) node_address: String,
-    pub(crate) node_id: String,
-    pub(crate) write_id: String,
-    pub(crate) statements: Vec<BatchStatement>,
-    /// Re-send the statements as one transaction, as the original write did.
-    pub(crate) atomic: bool,
-    pub(crate) shard_id: String,
-    /// Number of retry attempts already made; used to compute the next backoff.
-    pub(crate) attempt: u32,
+/// Everything a node must be told to apply a write, and the only thing a resend
+/// needs: the initial fan-out and the retry queue ship the identical batch, which
+/// is what makes a tailed write the same write rather than a reconstruction of it.
+///
+/// Shared as an `Arc` because every target of a fan-out is sent the same batch —
+/// the SQL and bind parameters are not copied per node, nor again per queued retry.
+#[derive(Debug)]
+struct WriteBatch {
+    write_id: String,
+    /// Names the batch as a whole in node errors; the per-statement shard ids ride
+    /// along on the statements themselves.
+    shard_id: String,
+    statements: Vec<BatchStatement>,
+    /// Apply the statements as one transaction: all of them take effect or none.
+    atomic: bool,
+}
+
+/// A write that failed to reach a node and is queued for re-delivery. `attempt`
+/// drives the backoff schedule.
+struct PendingRetry {
+    node_address: String,
+    node_id: String,
+    batch: Arc<WriteBatch>,
+    attempt: u32,
 }
 
 /// Coordinates quorum writes to a shard's nodes and owns the per-node queues of
@@ -87,11 +121,10 @@ impl ReplicationManager {
         write_id: &str,
         quorum_size: usize,
     ) -> Result<u64> {
-        let shard_id = crate::util::shard_table_name(&shard.table_name, shard.hash_bucket);
         let statements = vec![BatchStatement {
             sql: sql.to_string(),
             params: params.to_vec(),
-            shard_id,
+            shard_id: crate::util::shard_table_name(&shard.table_name, shard.hash_bucket),
         }];
 
         let rows = self
@@ -122,7 +155,6 @@ impl ReplicationManager {
 
     /// Fan `statements` out to the shard's primary and replicas in parallel and
     /// collect the per-statement row counts (the max reported by any acking node).
-    /// `atomic` asks each node to apply them as one transaction.
     async fn fan_out(
         &self,
         shard: &ShardMeta,
@@ -131,98 +163,66 @@ impl ReplicationManager {
         quorum_size: usize,
         atomic: bool,
     ) -> Result<Vec<u64>> {
-        let node_addresses = self.resolve_node_addresses(shard)?;
-        let primary_address = node_addresses
-            .get(&shard.primary_node_id)
-            .ok_or_else(|| CoordinatorError::ShardUnavailable(shard.shard_id.clone()))?
-            .clone();
+        let addresses = self.catalog.node_address_map()?;
+        let targets = replication_targets(shard, &addresses)?;
 
-        let mut all_targets: Vec<(String, String)> =
-            vec![(shard.primary_node_id.clone(), primary_address.clone())];
-        for replica_id in &shard.replica_node_ids {
-            if let Some(addr) = node_addresses.get(replica_id) {
-                all_targets.push((replica_id.clone(), addr.clone()));
-            }
-        }
+        let batch = Arc::new(WriteBatch {
+            write_id: write_id.to_string(),
+            shard_id: crate::util::shard_table_name(&shard.table_name, shard.hash_bucket),
+            statements,
+            atomic,
+        });
 
-        // Names the batch as a whole in node errors; per-statement shard ids ride
-        // along on the statements themselves.
-        let shard_id = crate::util::shard_table_name(&shard.table_name, shard.hash_bucket);
-
-        let statements = Arc::new(statements);
-
-        let mut handles = Vec::new();
-        for (node_id, addr) in &all_targets {
-            let pool = Arc::clone(&self.pool);
-            let addr = addr.clone();
-            let statements = Arc::clone(&statements);
-            let write_id = write_id.to_string();
-            let shard_id = shard_id.clone();
-            let node_id = node_id.clone();
-
-            let handle = tokio::spawn(async move {
-                let channel = pool.get(&addr).await.map_err(|e| {
-                    tracing::warn!(node_id = %node_id, address = %addr, error = %e, "connection failed");
-                    NodeError {
-                        message: "connection to storage node failed".to_string(),
-                        error_code: VdbErrorCode::NodeUnavailable as i32,
-                        shard_id: shard_id.clone(),
-                        node_id: node_id.clone(),
-                    }
-                })?;
-                let result = send_write_to_node(
-                    channel,
-                    &write_id,
-                    &statements,
-                    atomic,
-                    &shard_id,
-                    &node_id,
-                )
-                .await;
-                Ok::<_, NodeError>((node_id, addr, result))
-            });
-            handles.push(handle);
-        }
+        let handles: Vec<_> = targets
+            .into_iter()
+            .map(|(node_id, address)| {
+                let pool = Arc::clone(&self.pool);
+                let batch = Arc::clone(&batch);
+                tokio::spawn(async move {
+                    let outcome = send_write(&pool, &address, &batch, &node_id).await;
+                    (node_id, address, outcome)
+                })
+            })
+            .collect();
 
         let mut ack_count = 0usize;
-        let mut rows_affected = vec![0u64; statements.len()];
+        let mut rows_affected = vec![0u64; batch.statements.len()];
         let mut primary_acked = false;
         let mut lagging_nodes: Vec<(String, String)> = Vec::new();
         let mut primary_error: Option<NodeError> = None;
 
         for handle in handles {
-            match handle.await {
-                Ok(Ok((node_id, _addr, Ok(rows)))) => {
-                    ack_count += 1;
-                    merge_rows_affected(&mut rows_affected, &rows);
-                    if node_id == shard.primary_node_id {
-                        primary_acked = true;
-                    }
-                }
-                Ok(Ok((node_id, addr, Err(e)))) => {
-                    if node_id == shard.primary_node_id {
-                        primary_error = Some(e);
-                    }
-                    lagging_nodes.push((node_id, addr));
-                }
-                Ok(Err(e)) => {
-                    if e.node_id == shard.primary_node_id {
-                        primary_error = Some(e);
-                    } else if let Some(addr) = node_addresses.get(&e.node_id) {
-                        lagging_nodes.push((e.node_id, addr.clone()));
-                    }
-                }
+            let (node_id, address, outcome) = match handle.await {
+                Ok(outcome) => outcome,
                 Err(join_err) => {
                     tracing::error!("replication task panicked: {}", join_err);
+                    continue;
+                }
+            };
+
+            match outcome {
+                Ok(rows) => {
+                    ack_count += 1;
+                    merge_rows_affected(&mut rows_affected, &rows);
+                    primary_acked |= node_id == shard.primary_node_id;
+                }
+                Err(node_error) => {
+                    // The primary is queued alongside the replicas, which costs
+                    // nothing: a write the primary refused returns below, before
+                    // any queue is touched.
+                    if node_id == shard.primary_node_id {
+                        primary_error = Some(node_error);
+                    }
+                    lagging_nodes.push((node_id, address));
                 }
             }
         }
 
         if !primary_acked {
-            if let Some(node_err) = primary_error {
-                return Err(CoordinatorError::NodeExecFailed(Box::new(node_err)));
-            }
-            return Err(CoordinatorError::ShardUnavailable(shard.shard_id.clone()));
+            return Err(match primary_error {
+                Some(node_error) => CoordinatorError::NodeExecFailed(Box::new(node_error)),
+                None => CoordinatorError::ShardUnavailable(shard.shard_id.clone()),
+            });
         }
 
         if ack_count < quorum_size {
@@ -233,41 +233,23 @@ impl ReplicationManager {
         }
 
         if !lagging_nodes.is_empty() {
-            self.enqueue_retries(lagging_nodes, write_id, &statements, atomic, &shard_id)
-                .await;
+            self.enqueue_retries(lagging_nodes, &batch).await;
         }
 
         Ok(rows_affected)
     }
 
-    /// Build a `node_id -> gRPC address` map for resolving a shard's targets from
-    /// the catalog.
-    fn resolve_node_addresses(&self, _shard: &ShardMeta) -> Result<HashMap<String, String>> {
-        let address_map = self.catalog.get_node_address_map()?;
-        Ok(address_map)
-    }
-
     /// Queue a missed write for each lagging node so the background loop can
     /// re-deliver it later.
-    async fn enqueue_retries(
-        &self,
-        lagging_nodes: Vec<(String, String)>,
-        write_id: &str,
-        statements: &[BatchStatement],
-        atomic: bool,
-        shard_id: &str,
-    ) {
+    async fn enqueue_retries(&self, lagging_nodes: Vec<(String, String)>, batch: &Arc<WriteBatch>) {
         let mut retries = self.pending_retries.lock().await;
-        for (node_id, address) in lagging_nodes {
+        for (node_id, node_address) in lagging_nodes {
             push_pending_retry(
                 &mut retries,
                 PendingRetry {
-                    node_address: address,
+                    node_address,
                     node_id,
-                    write_id: write_id.to_string(),
-                    statements: statements.to_vec(),
-                    atomic,
-                    shard_id: shard_id.to_string(),
+                    batch: Arc::clone(batch),
                     attempt: 0,
                 },
             );
@@ -297,8 +279,7 @@ impl ReplicationManager {
                     // A node that is still Dead can't accept the write yet. Leave its
                     // queue intact so the missed write is replayed once it rejoins
                     // (heartbeat flips it back to Alive); skip it this round.
-                    let node_state = catalog.get_node(node_id);
-                    if let Ok(Some(node)) = node_state
+                    if let Ok(Some(node)) = catalog.get_node(node_id)
                         && node.state == NodeState::Dead as i32
                     {
                         continue;
@@ -321,30 +302,13 @@ impl ReplicationManager {
 
                     tokio::spawn(async move {
                         tokio::time::sleep(Duration::from_millis(backoff)).await;
-                        let channel = match pool.get(&entry.node_address).await {
-                            Ok(ch) => ch,
-                            Err(_) => {
-                                let mut retries = pending.lock().await;
-                                push_pending_retry(&mut retries, entry);
-                                return;
-                            }
-                        };
-                        match send_write_to_node(
-                            channel,
-                            &entry.write_id,
-                            &entry.statements,
-                            entry.atomic,
-                            &entry.shard_id,
-                            &entry.node_id,
-                        )
-                        .await
+                        match send_write(&pool, &entry.node_address, &entry.batch, &entry.node_id)
+                            .await
                         {
-                            Ok(_) => {
-                                tracing::debug!(
-                                    "tail replication succeeded for node {}",
-                                    entry.node_id
-                                );
-                            }
+                            Ok(_) => tracing::debug!(
+                                "tail replication succeeded for node {}",
+                                entry.node_id
+                            ),
                             Err(_) => {
                                 let mut retries = pending.lock().await;
                                 push_pending_retry(&mut retries, entry);
@@ -357,11 +321,33 @@ impl ReplicationManager {
     }
 }
 
+/// The nodes a write to `shard` must reach: its primary first, then whichever of
+/// its replicas the catalog still has an address for. A replica the catalog has
+/// forgotten is simply not a target — it holds no current data to keep current —
+/// but a primary with no address means the shard cannot be written at all.
+fn replication_targets(
+    shard: &ShardMeta,
+    addresses: &HashMap<String, String>,
+) -> Result<Vec<(String, String)>> {
+    let primary_address = addresses
+        .get(&shard.primary_node_id)
+        .ok_or_else(|| CoordinatorError::ShardUnavailable(shard.shard_id.clone()))?;
+
+    let mut targets = vec![(shard.primary_node_id.clone(), primary_address.clone())];
+    targets.extend(
+        shard
+            .replica_node_ids
+            .iter()
+            .filter_map(|id| addresses.get(id).map(|addr| (id.clone(), addr.clone()))),
+    );
+    Ok(targets)
+}
+
 /// Re-enqueue `entry` onto its node's pending-retry queue, dropping it if the
 /// queue is already at [`MAX_PENDING_RETRIES`]. The cap bounds memory when a
 /// node stays unreachable; a dropped tail write is reconciled when the node
-/// rejoins. Single definition shared by the initial enqueue and both retry-loop
-/// failure paths.
+/// rejoins. Single definition shared by the initial enqueue and the retry-loop
+/// failure path.
 fn push_pending_retry(retries: &mut HashMap<String, VecDeque<PendingRetry>>, entry: PendingRetry) {
     let queue = retries.entry(entry.node_id.clone()).or_default();
     if queue.len() < MAX_PENDING_RETRIES {
@@ -370,29 +356,25 @@ fn push_pending_retry(retries: &mut HashMap<String, VecDeque<PendingRetry>>, ent
 }
 
 /// Exponential backoff (ms) for a given attempt: `initial_retry_ms * 2^attempt`,
-/// clamped to `max_retry_ms`. The exponent is capped at 10 to avoid overflow.
+/// clamped to `max_retry_ms`. The exponent is capped so that a node unreachable
+/// for a long time keeps waiting the ceiling rather than overflowing.
 fn compute_backoff(attempt: u32, config: &RetryConfig) -> u64 {
-    let backoff = config.initial_retry_ms * 2u64.pow(attempt.min(10));
-    backoff.min(config.max_retry_ms)
+    config
+        .initial_retry_ms
+        .saturating_mul(2u64.pow(attempt.min(10)))
+        .min(config.max_retry_ms)
 }
 
-/// Send `statements` to one node over `channel` and return the rows affected by
-/// each, in order. `atomic` asks the node to apply them as one transaction. Maps
-/// tonic transport status to a `VdbErrorCode`, and surfaces a node-reported
-/// failure (or a missing result) as a `NodeError`.
-async fn send_write_to_node(
-    channel: Channel,
-    write_id: &str,
-    statements: &[BatchStatement],
-    atomic: bool,
-    shard_id: &str,
-    node_id: &str,
-) -> std::result::Result<Vec<u64>, NodeError> {
-    let mut client = WriteServiceClient::new(channel);
-
-    let request = tonic::Request::new(ExecuteWriteRequest {
-        write_id: write_id.to_string(),
-        statements: statements
+/// The gRPC request that carries `batch` to a node.
+///
+/// Every statement is tagged `Insert` regardless of what it does: the node
+/// dispatches on the SQL text it is handed, so the operation kind decides nothing
+/// and only the `atomic` flag changes how the batch is applied.
+fn write_request(batch: &WriteBatch) -> tonic::Request<ExecuteWriteRequest> {
+    tonic::Request::new(ExecuteWriteRequest {
+        write_id: batch.write_id.clone(),
+        statements: batch
+            .statements
             .iter()
             .map(|stmt| WriteStatement {
                 sql: stmt.sql.clone(),
@@ -401,52 +383,70 @@ async fn send_write_to_node(
                 params: stmt.params.clone(),
             })
             .collect(),
-        atomic,
-    });
+        atomic: batch.atomic,
+    })
+}
 
-    let response = client.execute_write(request).await.map_err(|e| {
-        let error_code = match e.code() {
-            tonic::Code::Unavailable | tonic::Code::DeadlineExceeded => {
-                VdbErrorCode::NodeUnavailable as i32
-            }
-            tonic::Code::NotFound => VdbErrorCode::ShardNotFound as i32,
-            tonic::Code::ResourceExhausted => VdbErrorCode::WriteQueueFull as i32,
-            _ => VdbErrorCode::InternalError as i32,
-        };
-        NodeError {
-            message: vairedb_common::error::sanitize_message(e.message()),
-            error_code,
-            shard_id: shard_id.to_string(),
-            node_id: node_id.to_string(),
-        }
+/// Apply `batch` on one node and report the rows each of its statements affected.
+///
+/// Unreachable, refused by the transport, and refused by the node itself all come
+/// back as one `NodeError`, because the caller does the same thing with all three:
+/// none of them leaves the node holding the write, so all three mean "queue it".
+async fn send_write(
+    pool: &ChannelPool,
+    node_address: &str,
+    batch: &WriteBatch,
+    node_id: &str,
+) -> std::result::Result<Vec<u64>, NodeError> {
+    let node_error = |message: String, error_code: i32| NodeError {
+        message,
+        error_code,
+        shard_id: batch.shard_id.clone(),
+        node_id: node_id.to_string(),
+    };
+
+    let channel = pool.get(node_address).await.map_err(|e| {
+        tracing::warn!(node_id = %node_id, address = %node_address, error = %e, "connection failed");
+        node_error(
+            "connection to storage node failed".to_string(),
+            VdbErrorCode::NodeUnavailable as i32,
+        )
     })?;
-    let resp = response.into_inner();
 
-    if resp.results.is_empty() {
-        return Err(NodeError {
-            message: "no results returned".to_string(),
-            error_code: 0,
-            shard_id: shard_id.to_string(),
-            node_id: node_id.to_string(),
-        });
+    let response = WriteServiceClient::new(channel)
+        .execute_write(write_request(batch))
+        .await
+        .map_err(|e| {
+            let error_code = match e.code() {
+                tonic::Code::Unavailable | tonic::Code::DeadlineExceeded => {
+                    VdbErrorCode::NodeUnavailable as i32
+                }
+                tonic::Code::NotFound => VdbErrorCode::ShardNotFound as i32,
+                tonic::Code::ResourceExhausted => VdbErrorCode::WriteQueueFull as i32,
+                _ => VdbErrorCode::InternalError as i32,
+            };
+            node_error(
+                vairedb_common::error::sanitize_message(e.message()),
+                error_code,
+            )
+        })?;
+    let results = response.into_inner().results;
+
+    if results.is_empty() {
+        return Err(node_error("no results returned".to_string(), 0));
     }
 
     // Any failed statement fails the whole call: for an atomic batch nothing was
     // applied, and for a single statement there is nothing else to report.
-    if let Some(failed) = resp.results.iter().find(|result| !result.success) {
+    if let Some(failed) = results.iter().find(|result| !result.success) {
         let error = failed.error.as_ref();
-        return Err(NodeError {
-            message: error
-                .map(|e| e.message.clone())
-                .unwrap_or_else(|| "unknown error".to_string()),
-            error_code: error.map(|e| e.code).unwrap_or(0),
-            shard_id: shard_id.to_string(),
-            node_id: node_id.to_string(),
-        });
+        return Err(node_error(
+            error.map_or_else(|| "unknown error".to_string(), |e| e.message.clone()),
+            error.map_or(0, |e| e.code),
+        ));
     }
 
-    Ok(resp
-        .results
+    Ok(results
         .iter()
         .map(|result| result.rows_affected as u64)
         .collect())
@@ -463,82 +463,34 @@ fn merge_rows_affected(rows_affected: &mut [u64], node_rows: &[u64]) {
 
 #[cfg(test)]
 mod tests {
-    use crate::replication::retry_config::{DEFAULT_INITIAL_RETRY_MS, DEFAULT_MAX_RETRY_MS};
-
     use super::*;
 
-    fn default_config() -> RetryConfig {
-        RetryConfig::default()
+    /// The schedule a lagging replica is retried on. Attempt 0 is never waited —
+    /// the loop increments before computing — so the first resend waits the base
+    /// delay, and from there each attempt doubles until the ceiling flattens it.
+    #[test]
+    fn backoff_doubles_per_attempt_until_it_reaches_the_ceiling() {
+        let schedule: Vec<u64> = (0..8)
+            .map(|attempt| compute_backoff(attempt, &RetryConfig::default()))
+            .collect();
+
+        assert_eq!(schedule, vec![100, 200, 400, 800, 1600, 3200, 5000, 5000]);
     }
 
+    /// A node unreachable for hours keeps waiting the ceiling: the exponent is
+    /// capped rather than allowed to run away, so there is no attempt count that
+    /// turns into an overflow or an unbounded sleep.
     #[test]
-    fn test_compute_backoff_first_attempt() {
-        let backoff = compute_backoff(1, &default_config());
-        assert_eq!(backoff, 200);
-    }
-
-    #[test]
-    fn test_compute_backoff_second_attempt() {
-        let backoff = compute_backoff(2, &default_config());
-        assert_eq!(backoff, 400);
-    }
-
-    #[test]
-    fn test_compute_backoff_third_attempt() {
-        let backoff = compute_backoff(3, &default_config());
-        assert_eq!(backoff, 800);
-    }
-
-    #[test]
-    fn test_compute_backoff_capped_at_max() {
-        let backoff = compute_backoff(20, &default_config());
-        assert_eq!(backoff, DEFAULT_MAX_RETRY_MS);
-    }
-
-    #[test]
-    fn test_compute_backoff_at_boundary() {
-        let config = default_config();
-        let backoff = compute_backoff(10, &config);
-        let expected = config.initial_retry_ms * 2u64.pow(10);
-        assert_eq!(backoff, expected.min(config.max_retry_ms));
-    }
-
-    #[test]
-    fn test_compute_backoff_zero_attempt() {
-        let backoff = compute_backoff(0, &default_config());
-        assert_eq!(backoff, DEFAULT_INITIAL_RETRY_MS);
-    }
-
-    #[test]
-    fn test_compute_backoff_increases_monotonically() {
-        let config = default_config();
-        let mut prev = 0u64;
-        for attempt in 0..20 {
-            let backoff = compute_backoff(attempt, &config);
-            assert!(backoff >= prev);
-            prev = backoff;
-        }
-    }
-
-    #[test]
-    fn test_compute_backoff_never_exceeds_max() {
-        let config = default_config();
-        for attempt in 0..100 {
-            let backoff = compute_backoff(attempt, &config);
-            assert!(backoff <= config.max_retry_ms);
-        }
-    }
-
-    #[test]
-    fn test_compute_backoff_custom_config() {
+    fn backoff_stays_at_the_ceiling_however_many_attempts_were_made() {
         let config = RetryConfig {
             initial_retry_ms: 50,
             max_retry_ms: 1000,
         };
+
         assert_eq!(compute_backoff(0, &config), 50);
-        assert_eq!(compute_backoff(1, &config), 100);
-        assert_eq!(compute_backoff(2, &config), 200);
-        assert_eq!(compute_backoff(20, &config), 1000);
+        for attempt in [11, 64, u32::MAX] {
+            assert_eq!(compute_backoff(attempt, &config), 1000, "attempt {attempt}");
+        }
     }
 
     #[test]
@@ -553,12 +505,5 @@ mod tests {
         let mut totals = vec![0, 0, 0];
         merge_rows_affected(&mut totals, &[4]);
         assert_eq!(totals, vec![4, 0, 0]);
-    }
-
-    #[test]
-    fn test_retry_config_default() {
-        let config = RetryConfig::default();
-        assert_eq!(config.initial_retry_ms, DEFAULT_INITIAL_RETRY_MS);
-        assert_eq!(config.max_retry_ms, DEFAULT_MAX_RETRY_MS);
     }
 }

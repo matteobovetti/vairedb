@@ -491,15 +491,8 @@ pub(super) fn result_fields(plan: &LogicalPlan, format: &Format) -> PgWireResult
 
 #[cfg(test)]
 mod tests {
+    use super::super::read_path_test_helper::parse_rewritten as parse;
     use super::*;
-
-    fn parse(sql: &str) -> Statement {
-        parser::parse_sql(sql)
-            .unwrap_or_else(|e| panic!("`{sql}` should parse: {e}"))
-            .into_iter()
-            .next()
-            .unwrap()
-    }
 
     fn classify(sql: &str) -> Inspection {
         inspection(&parse(sql)).unwrap_or_else(|e| panic!("`{sql}` should be accepted: {e}"))
@@ -636,17 +629,17 @@ mod tests {
         }
     }
 
-    /// The rewrite has to reach the *prepared* statement, not just the parsed one:
-    /// a plan built from an unprepared `EXPLAIN` would print a query with its views
-    /// unexpanded and its schema-qualified relations unresolved.
     /// A catalog in a temp file: preparation reads it to expand views, so it needs
     /// a real one even when the statement names no view.
     fn empty_catalog() -> Arc<MetadataCatalog> {
-        Arc::new(crate::pgwire_handler::test_catalog::scratch_catalog(
+        Arc::new(crate::catalog::catalog_test_helper::scratch_catalog(
             "introspection",
         ))
     }
 
+    /// The rewrite has to reach the *prepared* statement, not just the parsed one:
+    /// a plan built from an unprepared `EXPLAIN` would print a query with its views
+    /// unexpanded and its schema-qualified relations unresolved.
     #[test]
     fn preparation_reaches_the_query_inside_an_explain() {
         let catalog = empty_catalog();

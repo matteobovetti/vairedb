@@ -2,7 +2,5 @@
 //! retry/backoff loop that tails missed writes to lagging replicas.
 
 mod replication;
-mod retry_config;
 
-pub use replication::{BatchStatement, ReplicationManager};
-pub use retry_config::RetryConfig;
+pub use replication::{BatchStatement, ReplicationManager, RetryConfig};

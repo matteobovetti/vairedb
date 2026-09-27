@@ -814,7 +814,24 @@ pub(super) async fn handle_session_param(
 }
 
 /// Apply a `SET` (or the `SET … TO DEFAULT` a `RESET` became).
+///
+/// PostgreSQL tags a `RESET` as `RESET` and a `SET x TO DEFAULT` as `SET`. They arrive
+/// here as the same AST, so both are tagged `SET`: the tag carries no row count and no
+/// client branches on it, whereas conflating the two *values* would be a real
+/// difference. Every accepted form shares that one tag, which is why the tag is built
+/// once here and [`apply_to`] answers with nothing.
 async fn apply_set(set: &Set, session: &SessionState) -> PgWireResult<Response> {
+    apply_to(set, &mut *session.params().await)?;
+    Ok(Response::Execution(Tag::new("SET")))
+}
+
+/// Decide what a `SET` does to one connection's parameters.
+///
+/// Split from [`apply_set`] because none of it needs the session lock or the wire
+/// response — it is the registry and the refusals, which is the part worth testing
+/// directly. The tests used to re-implement this branch tree beside it rather than call
+/// it, so a `SET` form reaching the wrong arm here would have been invisible to them.
+fn apply_to(set: &Set, params: &mut SessionParams) -> PgWireResult<()> {
     // `SET TIME ZONE <v>` is PostgreSQL's spelled-out synonym for
     // `SET timezone TO <v>`, and sqlparser gives it a variant of its own.
     if let Set::SetTimeZone { local, value } = set {
@@ -822,8 +839,7 @@ async fn apply_set(set: &Set, session: &SessionState) -> PgWireResult<Response> 
             return Err(set_local_error());
         }
         let text = single_value_text(value).ok_or_else(|| non_literal_value("TimeZone"))?;
-        session.params().await.set("TimeZone", &text)?;
-        return Ok(Response::Execution(Tag::new("SET")));
+        return params.set("TimeZone", &text);
     }
 
     let Set::SingleAssignment {
@@ -847,24 +863,17 @@ async fn apply_set(set: &Set, session: &SessionState) -> PgWireResult<Response> 
     }
 
     let name = param_name(variable);
-    let mut params = session.params().await;
 
     if is_default_keyword(values) {
         if name.eq_ignore_ascii_case(RESET_ALL) {
             params.reset_all();
-        } else {
-            params.reset(&name)?;
+            return Ok(());
         }
-        // PostgreSQL tags a `RESET` as `RESET` and a `SET x TO DEFAULT` as `SET`.
-        // They arrive here as the same AST, so both are tagged `SET`: the tag
-        // carries no row count and no client branches on it, whereas conflating the
-        // two *values* would be a real difference.
-        return Ok(Response::Execution(Tag::new("SET")));
+        return params.reset(&name);
     }
 
     let value = value_text(values).ok_or_else(|| non_literal_value(&name))?;
-    params.set(&name, &value)?;
-    Ok(Response::Execution(Tag::new("SET")))
+    params.set(&name, &value)
 }
 
 /// The `SET` forms VaireDB does not model, named for the refusal.
@@ -935,16 +944,8 @@ mod tests {
 
     use pgwire::api::DefaultClient;
 
+    use super::super::write_path_test_helper::{parse_one, user_error};
     use super::*;
-
-    /// The SQLSTATE an error carries. What a client branches on, so it is what the
-    /// tests assert rather than the message.
-    fn sqlstate(err: &PgWireError) -> String {
-        match err {
-            PgWireError::UserError(info) => info.code.clone(),
-            other => panic!("expected a user error, got {other}"),
-        }
-    }
 
     fn a_client() -> DefaultClient<()> {
         DefaultClient::new(
@@ -953,49 +954,19 @@ mod tests {
         )
     }
 
-    /// Parse `sql` as the one statement it is, with the plain PostgreSQL dialect —
-    /// or via [`parse_reset`], which is where `RESET` is recognized.
-    fn parse_one(sql: &str) -> Statement {
-        if let Some(mut statements) = parse_reset(sql) {
-            return statements.remove(0);
-        }
-        let mut statements = crate::sqlparser::parser::Parser::parse_sql(
-            &crate::sqlparser::dialect::PostgreSqlDialect {},
-            sql,
-        )
-        .unwrap_or_else(|e| panic!("`{sql}` should parse: {e}"));
-        assert_eq!(statements.len(), 1, "`{sql}` should be one statement");
-        statements.remove(0)
-    }
-
-    /// Apply a `SET`/`RESET` to `params` the way the handler does, so the tests
-    /// exercise the AST shapes a client actually sends rather than calling
-    /// [`SessionParams::set`] directly.
+    /// Apply the `SET`/`RESET` `sql` to `params` through [`apply_to`], the function
+    /// the handler itself reaches.
+    ///
+    /// This used to re-implement `apply_to`'s branch tree — `SetTimeZone`, then
+    /// `SingleAssignment`, then the `DEFAULT`/`RESET ALL` split — beside it, and parse
+    /// with a hand-built `PostgreSqlDialect` parser rather than [`parser::parse_sql`].
+    /// So neither half of what production does was under test: a `SET` form landing in
+    /// the wrong arm, or a statement the real parser respells on the way in, both
+    /// passed. Both halves are now the real ones.
     fn apply(params: &mut SessionParams, sql: &str) -> PgWireResult<()> {
         match parse_one(sql) {
-            Statement::Set(Set::SetTimeZone {
-                local: false,
-                value,
-            }) => {
-                let text =
-                    single_value_text(&value).ok_or_else(|| non_literal_value("TimeZone"))?;
-                params.set("TimeZone", &text)
-            }
-            Statement::Set(Set::SingleAssignment {
-                variable, values, ..
-            }) => {
-                let name = param_name(&variable);
-                if is_default_keyword(&values) {
-                    if name.eq_ignore_ascii_case(RESET_ALL) {
-                        params.reset_all();
-                        return Ok(());
-                    }
-                    return params.reset(&name);
-                }
-                let value = value_text(&values).ok_or_else(|| non_literal_value(&name))?;
-                params.set(&name, &value)
-            }
-            other => panic!("`{sql}` is not a plain SET: {other:?}"),
+            Statement::Set(set) => apply_to(&set, params),
+            other => panic!("`{sql}` is not a SET: {other:?}"),
         }
     }
 
@@ -1080,7 +1051,7 @@ mod tests {
             "SET SESSION application_name = 'explicit-scope'",
         ] {
             apply(&mut params, sql)
-                .unwrap_or_else(|e| panic!("`{sql}` should be accepted: {}", sqlstate(&e)));
+                .unwrap_or_else(|e| panic!("`{sql}` should be accepted: {}", user_error(e).0));
         }
     }
 
@@ -1104,7 +1075,7 @@ mod tests {
         ] {
             let err = apply(&mut params, sql).expect_err(&format!("`{sql}` should be refused"));
             assert_eq!(
-                sqlstate(&err),
+                user_error(err).0,
                 "22023",
                 "`{sql}` should be an invalid parameter *value*, not a missing feature"
             );
@@ -1134,7 +1105,11 @@ mod tests {
             "SET plpgsql.extra_errors = 'all'",
         ] {
             let err = apply(&mut params, sql).expect_err(&format!("`{sql}` should be refused"));
-            assert_eq!(sqlstate(&err), "42704", "`{sql}` names no known parameter");
+            assert_eq!(
+                user_error(err).0,
+                "42704",
+                "`{sql}` names no known parameter"
+            );
         }
     }
 
@@ -1148,7 +1123,7 @@ mod tests {
         ] {
             let err = apply(&mut params, sql).expect_err(&format!("`{sql}` should be refused"));
             assert_eq!(
-                sqlstate(&err),
+                user_error(err).0,
                 "55P02",
                 "`{sql}` names a parameter fixed at startup"
             );
@@ -1170,7 +1145,7 @@ mod tests {
         ] {
             let err = apply(&mut params, sql).expect_err(&format!("`{sql}` should be refused"));
             assert_eq!(
-                sqlstate(&err),
+                user_error(err).0,
                 "0A000",
                 "`{sql}` should be a missing feature"
             );
@@ -1194,7 +1169,7 @@ mod tests {
             "RESET ROLE",
         ] {
             apply(&mut params, sql)
-                .unwrap_or_else(|e| panic!("`{sql}` should succeed: {}", sqlstate(&e)));
+                .unwrap_or_else(|e| panic!("`{sql}` should succeed: {}", user_error(e).0));
         }
     }
 
@@ -1261,7 +1236,7 @@ mod tests {
         let mut params = SessionParams::default();
         let err = apply(&mut params, "SET application_name = 1 + 1")
             .expect_err("an arithmetic expression is not a setting");
-        assert_eq!(sqlstate(&err), "22023");
+        assert_eq!(user_error(err).0, "22023");
     }
 
     #[test]
@@ -1276,7 +1251,7 @@ mod tests {
         // `SET LOCAL` is refused for a reason of its own: its scope is the
         // transaction, and the coordinator's block holds no parameter snapshot to
         // restore, so an accepted value would outlive the block that scoped it.
-        assert_eq!(sqlstate(&set_local_error()), "0A000");
+        assert_eq!(user_error(set_local_error()).0, "0A000");
         assert_eq!(
             other_set_form(&Set::SetRole {
                 context_modifier: None,
@@ -1284,7 +1259,7 @@ mod tests {
             }),
             "SET ROLE"
         );
-        assert_eq!(sqlstate(&unsupported_set_form("SET ROLE")), "0A000");
+        assert_eq!(user_error(unsupported_set_form("SET ROLE")).0, "0A000");
     }
 
     #[test]
@@ -1388,15 +1363,12 @@ mod tests {
         let Err(err) = show_target(&variable) else {
             panic!("`SHOW no such thing` names no parameter");
         };
-        assert_eq!(sqlstate(&err), "42704");
-        match &err {
-            PgWireError::UserError(info) => assert!(
-                info.message.contains("no such thing"),
-                "the refusal should name what the client asked for: {}",
-                info.message
-            ),
-            other => panic!("expected a user error, got {other}"),
-        }
+        let (code, message) = user_error(err);
+        assert_eq!(code, "42704");
+        assert!(
+            message.contains("no such thing"),
+            "the refusal should name what the client asked for: {message}"
+        );
     }
 
     #[test]

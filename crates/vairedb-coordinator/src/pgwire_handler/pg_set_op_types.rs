@@ -381,6 +381,8 @@ mod tests {
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::prelude::SessionContext;
 
+    use super::super::read_path_test_helper;
+
     /// `l(id int4, k int4, v text)` and `r(id int4, w text)`, plus `wide(big int8, d
     /// float8, b boolean)` — one table per group the check partitions by, so a mismatch
     /// can be built out of any two of them.
@@ -434,24 +436,17 @@ mod tests {
         ctx
     }
 
-    /// The verdict on `sql` at the point `plan_select` asks for it: planned, not yet
-    /// coerced. `Err` carries the client-facing message.
-    async fn verdict(sql: &str) -> Result<(), String> {
-        let ctx = ctx();
-        let plan = ctx.state().create_logical_plan(sql).await.unwrap();
-        reject_incompatible_set_operation_types(&plan).map_err(|e| e.to_string())
-    }
-
+    /// Both verdicts are taken through the whole read path, because this check's scope is
+    /// defined against the passes around it: `coerce_types` downstream is what makes an
+    /// unrefused mismatch a wrong answer, and `pg_set_op_multiplicity` upstream rewrites
+    /// the very shapes read here. Calling the check on a plan DataFusion produced alone
+    /// tested none of that.
     async fn refusal(sql: &str) -> String {
-        verdict(sql)
-            .await
-            .expect_err(&format!("`{sql}` must be refused"))
+        read_path_test_helper::refusal(&ctx(), sql).await
     }
 
     async fn accepted(sql: &str) {
-        if let Err(e) = verdict(sql).await {
-            panic!("`{sql}` must be accepted, got: {e}");
-        }
+        read_path_test_helper::accepted(&ctx(), sql).await
     }
 
     // The defect: an integer branch and a text branch, in either order, which PostgreSQL
@@ -720,7 +715,9 @@ mod tests {
     }
 
     // The refusal is a read, not a rewrite: an accepted plan has to be the plan the caller
-    // already holds, unchanged.
+    // already holds, unchanged. The one test here that calls the check directly, because
+    // the claim is about this pass in isolation — the read path's later passes rewrite the
+    // plan by design, so a before/after comparison across the chain proves nothing.
     #[tokio::test]
     async fn an_accepted_plan_is_untouched() {
         let ctx = ctx();

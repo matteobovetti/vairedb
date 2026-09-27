@@ -806,8 +806,7 @@ mod tests {
     use datafusion::sql::parser::Statement as DFStatement;
 
     use crate::pgwire_handler::pg_using_join_merge::merge_using_join_keys;
-    use crate::sqlparser::dialect::PostgreSqlDialect;
-    use crate::sqlparser::parser::Parser;
+    use crate::pgwire_handler::read_path_test_helper::parse_verbatim;
 
     /// The two tables the merge module's tests use: keys 1–3 in common, `4` only on the
     /// left and `5` only on the right, so a full join has an unmatched row on each side.
@@ -857,19 +856,9 @@ mod tests {
         ctx.register_batch(name, batch).unwrap();
     }
 
-    /// Parse one statement the way the read path does.
-    fn parse(sql: &str) -> Statement {
-        Parser::new(&PostgreSqlDialect {})
-            .try_with_sql(sql)
-            .unwrap()
-            .parse_statements()
-            .unwrap()
-            .remove(0)
-    }
-
     /// The statement this rewrite hands the planner, back as SQL text.
     fn rewritten(sql: &str) -> Result<String, String> {
-        let mut stmt = parse(sql);
+        let mut stmt = parse_verbatim(sql);
         match split_qualified_using_keys(&mut stmt) {
             Ok(()) => Ok(stmt.to_string()),
             Err(e) => Err(e.to_string()),
@@ -883,7 +872,7 @@ mod tests {
     /// defined.
     async fn answer(sql: &str) -> Vec<String> {
         let ctx = ctx();
-        let mut stmt = parse(sql);
+        let mut stmt = parse_verbatim(sql);
         split_qualified_using_keys(&mut stmt).expect("the statement is not refused");
         let plan = ctx
             .state()
@@ -961,7 +950,7 @@ mod tests {
     #[tokio::test]
     async fn the_merged_column_keeps_the_key_as_its_label() {
         let ctx = ctx();
-        let mut stmt = parse("SELECT id, l.id AS l_id FROM l FULL JOIN r USING (id)");
+        let mut stmt = parse_verbatim("SELECT id, l.id AS l_id FROM l FULL JOIN r USING (id)");
         split_qualified_using_keys(&mut stmt).unwrap();
         let plan = ctx
             .state()
@@ -1056,7 +1045,7 @@ mod tests {
         ] {
             assert_eq!(
                 rewritten(sql).unwrap(),
-                parse(sql).to_string(),
+                parse_verbatim(sql).to_string(),
                 "for `{sql}`"
             );
         }
@@ -1081,7 +1070,7 @@ mod tests {
         ] {
             assert_eq!(
                 rewritten(sql).unwrap(),
-                parse(sql).to_string(),
+                parse_verbatim(sql).to_string(),
                 "for `{sql}`"
             );
         }
@@ -1094,7 +1083,7 @@ mod tests {
     #[tokio::test]
     async fn a_natural_join_is_left_to_the_merge() {
         let sql = "SELECT l.id, r.id FROM l NATURAL FULL JOIN r";
-        assert_eq!(rewritten(sql).unwrap(), parse(sql).to_string());
+        assert_eq!(rewritten(sql).unwrap(), parse_verbatim(sql).to_string());
         // Still the merged value under both qualifiers, which is what the `USING` spelling
         // of the same join now answers correctly.
         assert_eq!(
@@ -1168,7 +1157,7 @@ mod tests {
     fn a_shadowed_qualifier_does_not_respell_the_join() {
         let sql = "SELECT id FROM l FULL JOIN r USING (id) \
                    WHERE id IN (SELECT l.id FROM r AS l)";
-        assert_eq!(rewritten(sql).unwrap(), parse(sql).to_string());
+        assert_eq!(rewritten(sql).unwrap(), parse_verbatim(sql).to_string());
     }
 
     // A correlated qualifier one level down is *not* shadowed, so it does respell the join

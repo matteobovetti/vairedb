@@ -42,15 +42,24 @@
 //! with a lifetime the callers cannot give it — `for_tests()` returns a handler by
 //! value and `catalog_with()` returns an `Arc`, and neither has anywhere to keep
 //! one.
+//!
+//! ## Why it sits at the crate root
+//!
+//! The leak was never specific to one module — every module whose tests need a
+//! catalog can reproduce it, and one that could not reach this fixture did: the
+//! failure detector's tests had rebuilt the pid-and-counter scheme verbatim. A
+//! fixture scoped to `pgwire_handler` is an invitation to write the bug a second
+//! time, so this is `pub(crate)` and is how a unit test in this crate gets a
+//! catalog.
 
-use crate::catalog::MetadataCatalog;
+use crate::catalog::{ColumnDef, MetadataCatalog, ShardMeta, ShardStrategy, TableMeta};
 
 /// A `MetadataCatalog` with nothing in it, for one test.
 ///
 /// `tag` names the calling module and appears in the file name; it is a debugging
 /// aid only, since the file is unlinked immediately and two callers passing the
 /// same tag are still given different catalogs.
-pub(super) fn scratch_catalog(tag: &str) -> MetadataCatalog {
+pub(crate) fn scratch_catalog(tag: &str) -> MetadataCatalog {
     use std::sync::atomic::{AtomicU32, Ordering};
     static COUNTER: AtomicU32 = AtomicU32::new(0);
 
@@ -72,6 +81,56 @@ pub(super) fn scratch_catalog(tag: &str) -> MetadataCatalog {
     let _ = std::fs::remove_file(&path);
 
     catalog
+}
+
+/// A sharded table for a test to put in a catalog: `columns` in the order given, each a
+/// nullable `INTEGER`, hash-sharded on `shard_key`.
+///
+/// The literal this replaces was written 30 times across 12 modules, and the copies had
+/// already drifted on the parts no test states an opinion about: three left `shard_count`
+/// at `Default`, i.e. **zero**, and `..Default::default()` leaves `shard_strategy` at
+/// `Unspecified`. Neither is a table `ddl::plan_create_table` can produce — it always
+/// writes `Hash` and a `shard_count` of at least one. A fixture is only evidence about
+/// production if it is shaped like production, so those two are pinned here, and the
+/// column shape — the part a COPY or a DML test does assert on — stays the caller's.
+pub(crate) fn table_meta(name: &str, columns: &[&str], shard_key: &str) -> TableMeta {
+    TableMeta {
+        table_name: name.to_string(),
+        columns: columns
+            .iter()
+            .map(|c| ColumnDef {
+                name: (*c).to_string(),
+                data_type: "INTEGER".to_string(),
+                nullable: true,
+                ..Default::default()
+            })
+            .collect(),
+        shard_strategy: ShardStrategy::Hash as i32,
+        shard_key: shard_key.to_string(),
+        shard_count: 2,
+        replication_factor: 1,
+        ..Default::default()
+    }
+}
+
+/// One hash shard of `table`: bucket `bucket`, primary on `primary`, replicated to
+/// `replicas`.
+///
+/// Named and shaped after what [`MetadataCatalog::assign_shards`] writes, which is the only
+/// producer of shard records in production: a `logical_shard_id` of `shard<bucket>` and no
+/// range bounds. Two of the five literals this replaces had drifted to a `shard_id` of
+/// `<table>-<bucket>` — harmless while no test reads the field, and exactly the kind of
+/// fixture that stops being evidence the moment one does.
+pub(crate) fn shard_meta(table: &str, bucket: u32, primary: &str, replicas: &[&str]) -> ShardMeta {
+    ShardMeta {
+        shard_id: crate::util::logical_shard_id(bucket),
+        table_name: table.to_string(),
+        primary_node_id: primary.to_string(),
+        replica_node_ids: replicas.iter().map(|r| (*r).to_string()).collect(),
+        hash_bucket: bucket,
+        range_lower: String::new(),
+        range_upper: String::new(),
+    }
 }
 
 #[cfg(test)]

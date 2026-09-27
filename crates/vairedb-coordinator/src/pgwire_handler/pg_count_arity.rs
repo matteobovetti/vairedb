@@ -177,11 +177,12 @@ mod tests {
     use datafusion::datasource::MemTable;
     use datafusion::prelude::SessionContext;
 
+    use super::super::read_path_test_helper;
     use super::*;
 
     /// `w(n int4, g text)`, matching the table the oracle values in the module doc were
     /// measured against.
-    async fn context() -> SessionContext {
+    fn context() -> SessionContext {
         let schema = Arc::new(Schema::new(vec![
             Field::new("n", DataType::Int32, true),
             Field::new("g", DataType::Utf8, true),
@@ -208,17 +209,22 @@ mod tests {
         ctx
     }
 
+    /// The read path's verdict on `sql`: the refusal message, or `None` if it answers.
+    ///
+    /// Taken through the whole read path and not by calling this check on a plan
+    /// DataFusion produced alone, because the order matters here more than anywhere: the
+    /// refusal has to name the argument types while `count` is still spelled the way the
+    /// client spelled it, so it runs before every other pass — which is a property of the
+    /// chain and invisible to a test that is the only caller.
+    /// A refusal is a `UserError`; a planning failure is not, and reading one as the other
+    /// is how the "wherever it is written" test below would keep passing on a `count` the
+    /// check had stopped finding.
     async fn refusal(sql: &str) -> Option<String> {
-        let ctx = context().await;
-        let plan = ctx
-            .state()
-            .create_logical_plan(sql)
-            .await
-            .unwrap_or_else(|e| panic!("{sql} did not plan: {e}"));
-        reject_multi_argument_count(&plan).err().map(|e| match e {
-            PgWireError::UserError(info) => info.message.clone(),
-            other => panic!("{sql} was refused as {other:?}"),
-        })
+        match read_path_test_helper::plan(&context(), sql).await {
+            Ok(_) => None,
+            Err(PgWireError::UserError(info)) => Some(info.message.clone()),
+            Err(other) => panic!("`{sql}` failed without refusing the client: {other}"),
+        }
     }
 
     /// The two spellings PostgreSQL 16.15 refuses, with the types it names them by.

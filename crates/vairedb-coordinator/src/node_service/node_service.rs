@@ -3,7 +3,6 @@
 //! liveness in the metadata catalog, which the failure detector reads.
 
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
 use tokio_stream::wrappers::ReceiverStream;
@@ -16,7 +15,7 @@ use vairedb_common::proto::vairedb::v1::{
 
 use crate::catalog::{MetadataCatalog, NodeMeta, NodeState};
 use crate::error::CoordinatorError;
-use crate::util::now_unix_secs;
+use crate::util::now_timestamp;
 
 /// gRPC service handling core-node lifecycle: registration, heartbeat streaming,
 /// and failure reports. All liveness state is persisted to the metadata catalog.
@@ -47,24 +46,20 @@ impl NodeService for NodeServiceImpl {
             req.advertised_address
         );
 
-        let now = now_unix_secs();
+        // Registering counts as being heard from, so both stamps are the same
+        // reading: a registered_at later than the first heartbeat would make the
+        // node look silent for the difference.
+        let now = now_timestamp();
 
         let node_meta = NodeMeta {
             node_id: req.node_id.clone(),
             advertised_address: req.advertised_address.clone(),
             state: NodeState::Alive as i32,
-            last_heartbeat: Some(prost_types::Timestamp {
-                seconds: now as i64,
-                nanos: 0,
-            }),
-            registered_at: Some(prost_types::Timestamp {
-                seconds: now as i64,
-                nanos: 0,
-            }),
+            last_heartbeat: Some(now),
+            registered_at: Some(now),
         };
 
         self.catalog.put_node(&node_meta).map_err(|e| {
-            use crate::error::CoordinatorError;
             tracing::error!(node_id = %req.node_id, error = %e, "failed to register node");
             match e {
                 CoordinatorError::CatalogStorage(_) | CoordinatorError::CatalogCommit(_) => {
@@ -124,13 +119,8 @@ impl NodeService for NodeServiceImpl {
                     }
                 };
 
-                let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
-
                 let response = HeartbeatResponse {
-                    timestamp: Some(prost_types::Timestamp {
-                        seconds: now.as_secs() as i64,
-                        nanos: now.subsec_nanos() as i32,
-                    }),
+                    timestamp: Some(now_timestamp()),
                     action: action.into(),
                 };
 

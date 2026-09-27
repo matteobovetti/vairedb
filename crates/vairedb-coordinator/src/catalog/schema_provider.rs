@@ -15,19 +15,25 @@ use datafusion::datasource::memory::MemTable;
 use crate::catalog::{MetadataCatalog, ShardStrategy};
 use crate::util::node_state_str;
 
-/// The virtual tables exposed under the `vairedb_catalog` schema. This is the
-/// single source of truth for which relations exist: `table_names`, `table`, and
-/// `table_exist` all derive from it, so adding a table means adding one arm to
-/// [`VaireDbCatalogSchema::build_provider`] and one entry here — never editing
-/// three separate match/list sites.
-const VIRTUAL_TABLES: [&str; 7] = [
-    "schemas",
-    "tables",
-    "views",
-    "columns",
-    "shards",
-    "nodes",
-    "anonymization_secret",
+/// Materializes one virtual table from the live catalog state.
+type VirtualTableBuilder = fn(&VaireDbCatalogSchema) -> Arc<dyn TableProvider>;
+
+/// The virtual tables exposed under the `vairedb_catalog` schema, each paired with
+/// its builder. `table_names`, `table` and `table_exist` all derive from this one
+/// list, which makes both halves of the old split unrepresentable: a name with no
+/// builder is a relation DataFusion believes in and then cannot read, and a builder
+/// with no name is a table only a query that already knows it can reach.
+const VIRTUAL_TABLES: [(&str, VirtualTableBuilder); 7] = [
+    ("schemas", VaireDbCatalogSchema::build_schemas_provider),
+    ("tables", VaireDbCatalogSchema::build_tables_provider),
+    ("views", VaireDbCatalogSchema::build_views_provider),
+    ("columns", VaireDbCatalogSchema::build_columns_provider),
+    ("shards", VaireDbCatalogSchema::build_shards_provider),
+    ("nodes", VaireDbCatalogSchema::build_nodes_provider),
+    (
+        "anonymization_secret",
+        VaireDbCatalogSchema::build_anonymization_secret_provider,
+    ),
 ];
 
 /// `SchemaProvider` exposing the metadata catalog's contents as virtual tables.
@@ -49,20 +55,14 @@ impl VaireDbCatalogSchema {
     }
 
     /// Build the in-memory provider for one virtual table, or `None` for an
-    /// unknown name. Each arm supplies only the table's schema and column arrays;
-    /// the shared [`make_memtable`] handles batch assembly and the empty-table
-    /// fallback so that pattern lives in exactly one place.
+    /// unknown name. Each builder supplies only the table's schema and column
+    /// arrays; the shared [`make_memtable`] handles batch assembly so that pattern
+    /// lives in exactly one place.
     fn build_provider(&self, name: &str) -> Option<Arc<dyn TableProvider>> {
-        match name {
-            "schemas" => Some(self.build_schemas_provider()),
-            "tables" => Some(self.build_tables_provider()),
-            "views" => Some(self.build_views_provider()),
-            "columns" => Some(self.build_columns_provider()),
-            "shards" => Some(self.build_shards_provider()),
-            "nodes" => Some(self.build_nodes_provider()),
-            "anonymization_secret" => Some(self.build_anonymization_secret_provider()),
-            _ => None,
-        }
+        VIRTUAL_TABLES
+            .iter()
+            .find(|(table, _)| *table == name)
+            .map(|(_, build)| build(self))
     }
 
     /// Build the `schemas` virtual table: the namespaces someone created. The
@@ -84,7 +84,7 @@ impl VaireDbCatalogSchema {
         let mut created_ats: Vec<Option<i64>> = Vec::with_capacity(schemas.len());
         for s in &schemas {
             names.push(s.schema_name.as_str());
-            created_ats.push(s.created_at.as_ref().map(|ts| ts.seconds * 1_000_000));
+            created_ats.push(micros(s.created_at.as_ref()));
         }
 
         make_memtable(
@@ -125,7 +125,7 @@ impl VaireDbCatalogSchema {
             keys.push(t.shard_key.as_str());
             counts.push(t.shard_count as i32);
             repl_factors.push(t.replication_factor as i32);
-            created_ats.push(t.created_at.as_ref().map(|ts| ts.seconds * 1_000_000));
+            created_ats.push(micros(t.created_at.as_ref()));
         }
 
         make_memtable(
@@ -169,12 +169,8 @@ impl VaireDbCatalogSchema {
         for v in &views {
             names.push(v.view_name.as_str());
             definitions.push(v.definition.as_str());
-            columns.push(if v.columns.is_empty() {
-                None
-            } else {
-                Some(v.columns.join(","))
-            });
-            created_ats.push(v.created_at.as_ref().map(|ts| ts.seconds * 1_000_000));
+            columns.push((!v.columns.is_empty()).then(|| v.columns.join(",")));
+            created_ats.push(micros(v.created_at.as_ref()));
         }
 
         make_memtable(
@@ -205,20 +201,16 @@ impl VaireDbCatalogSchema {
         let mut ordinals = Vec::new();
         let mut data_types = Vec::new();
         let mut nullables = Vec::new();
-        let mut defaults: Vec<Option<String>> = Vec::new();
+        let mut defaults: Vec<Option<&str>> = Vec::new();
 
         for t in &tables {
             for (i, col) in t.columns.iter().enumerate() {
-                tbl_names.push(t.table_name.clone());
-                col_names.push(col.name.clone());
+                tbl_names.push(t.table_name.as_str());
+                col_names.push(col.name.as_str());
                 ordinals.push((i + 1) as i32);
-                data_types.push(col.data_type.clone());
+                data_types.push(col.data_type.as_str());
                 nullables.push(col.nullable);
-                defaults.push(if col.default_expr.is_empty() {
-                    None
-                } else {
-                    Some(col.default_expr.clone())
-                });
+                defaults.push(non_empty(&col.default_expr));
             }
         }
 
@@ -253,8 +245,8 @@ impl VaireDbCatalogSchema {
         let mut primary_nodes = Vec::with_capacity(shards.len());
         let mut replica_nodes = Vec::with_capacity(shards.len());
         let mut hash_buckets = Vec::with_capacity(shards.len());
-        let mut range_lowers: Vec<Option<String>> = Vec::with_capacity(shards.len());
-        let mut range_uppers: Vec<Option<String>> = Vec::with_capacity(shards.len());
+        let mut range_lowers: Vec<Option<&str>> = Vec::with_capacity(shards.len());
+        let mut range_uppers: Vec<Option<&str>> = Vec::with_capacity(shards.len());
 
         for p in &shards {
             shard_ids.push(p.shard_id.as_str());
@@ -262,16 +254,8 @@ impl VaireDbCatalogSchema {
             primary_nodes.push(p.primary_node_id.as_str());
             replica_nodes.push(p.replica_node_ids.join(","));
             hash_buckets.push(p.hash_bucket as i32);
-            range_lowers.push(if p.range_lower.is_empty() {
-                None
-            } else {
-                Some(p.range_lower.clone())
-            });
-            range_uppers.push(if p.range_upper.is_empty() {
-                None
-            } else {
-                Some(p.range_upper.clone())
-            });
+            range_lowers.push(non_empty(&p.range_lower));
+            range_uppers.push(non_empty(&p.range_upper));
         }
 
         make_memtable(
@@ -347,8 +331,8 @@ impl VaireDbCatalogSchema {
             node_ids.push(n.node_id.as_str());
             addresses.push(n.advertised_address.as_str());
             states.push(node_state_str(n.state));
-            heartbeats.push(n.last_heartbeat.as_ref().map(|ts| ts.seconds * 1_000_000));
-            registered.push(n.registered_at.as_ref().map(|ts| ts.seconds * 1_000_000));
+            heartbeats.push(micros(n.last_heartbeat.as_ref()));
+            registered.push(micros(n.registered_at.as_ref()));
         }
 
         make_memtable(
@@ -372,14 +356,32 @@ fn make_memtable(
     schema: Arc<Schema>,
     columns: Vec<datafusion::arrow::array::ArrayRef>,
 ) -> Arc<dyn TableProvider> {
-    let batch = RecordBatch::try_new(Arc::clone(&schema), columns).unwrap();
-    Arc::new(MemTable::try_new(schema, vec![vec![batch]]).unwrap())
+    let batch = RecordBatch::try_new(Arc::clone(&schema), columns)
+        .expect("the builder's arrays match the schema it declared");
+    Arc::new(
+        MemTable::try_new(schema, vec![vec![batch]]).expect("one batch of the table's own schema"),
+    )
+}
+
+/// A protobuf timestamp as the epoch microseconds the Arrow column holds, or `None`
+/// for an unset one.
+fn micros(ts: Option<&prost_types::Timestamp>) -> Option<i64> {
+    ts.map(|ts| ts.seconds * 1_000_000)
+}
+
+/// `value`, unless it is empty — which is how a protobuf record spells "unset" for
+/// a string field, and what a nullable catalog column has to surface as NULL.
+fn non_empty(value: &str) -> Option<&str> {
+    (!value.is_empty()).then_some(value)
 }
 
 #[async_trait]
 impl SchemaProvider for VaireDbCatalogSchema {
     fn table_names(&self) -> Vec<String> {
-        VIRTUAL_TABLES.iter().map(|s| s.to_string()).collect()
+        VIRTUAL_TABLES
+            .iter()
+            .map(|(name, _)| name.to_string())
+            .collect()
     }
 
     async fn table(&self, name: &str) -> datafusion::error::Result<Option<Arc<dyn TableProvider>>> {
@@ -387,7 +389,7 @@ impl SchemaProvider for VaireDbCatalogSchema {
     }
 
     fn table_exist(&self, name: &str) -> bool {
-        VIRTUAL_TABLES.contains(&name)
+        VIRTUAL_TABLES.iter().any(|(table, _)| *table == name)
     }
 }
 

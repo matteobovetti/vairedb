@@ -4,7 +4,9 @@
 
 use std::collections::HashMap;
 
-use crate::sqlparser::ast::{AssignmentTarget, Expr, SetExpr, Statement, Value};
+use crate::sqlparser::ast::{
+    Assignment, AssignmentTarget, Expr, Insert, ObjectName, SetExpr, Statement, Value,
+};
 use crate::util::insert_column_ident;
 
 use super::{HMAC_SHA256_ALGO, Secret, SecretResolver, hmac_sha256_hex};
@@ -14,10 +16,15 @@ use super::{HMAC_SHA256_ALGO, Secret, SecretResolver, hmac_sha256_hex};
 /// statements and columns absent from the map are left untouched.
 ///
 /// Returns `Err` with a client-facing message if a referenced secret is missing,
-/// declares an unsupported algorithm, or if an anonymized column is given a value
-/// that cannot be hashed at rewrite time (a bind placeholder or a non-literal
-/// expression). NULL values are preserved as NULL — a hash of "nothing" would be
-/// misleading and would defeat nullability.
+/// declares an unsupported algorithm, or if an anonymized column is written by a
+/// form whose plaintext is not hashable at rewrite time: a bind placeholder, a
+/// non-literal expression, or a multi-column `SET (…) = (…)`. NULL values are
+/// preserved as NULL — a hash of "nothing" would be misleading and would defeat
+/// nullability.
+///
+/// Every such form is **refused**, never passed over. A column the rewrite cannot
+/// reach is a column whose plaintext reaches a storage node, which is the one
+/// outcome this module exists to prevent; a refusal is the weaker failure.
 pub fn anonymize_statement(
     stmt: &mut Statement,
     anonymized_columns: &HashMap<String, String>,
@@ -28,77 +35,127 @@ pub fn anonymize_statement(
     }
 
     match stmt {
-        Statement::Insert(insert) => {
-            // Column names are matched case-insensitively: the map is keyed on
-            // lowercased identifiers, so `EMAIL` still resolves to the `email`
-            // rule. A case mismatch must never silently skip hashing.
-            let mut target_positions: Vec<(usize, &String)> = Vec::new();
-            for (idx, col) in insert.columns.iter().enumerate() {
-                // A column-list entry that is not a bare identifier (a dotted
-                // composite-field target) cannot be matched against the rule map.
-                // Refuse rather than skip: skipping would write plaintext into a
-                // column declared anonymized.
-                let name = insert_column_ident(col).ok_or_else(|| {
-                    format!("unsupported column reference '{col}' in INSERT column list")
-                })?;
-                if let Some(sid) = anonymized_columns.get(&name.value.to_ascii_lowercase()) {
-                    target_positions.push((idx, sid));
-                }
-            }
-
-            if target_positions.is_empty() {
-                return Ok(());
-            }
-
-            // Resolve each distinct secret once, up front, rather than per value:
-            // a bulk INSERT of N rows over K anonymized columns would otherwise do
-            // N*K catalog reads for the same handful of ids.
-            let secrets = resolve_secrets(target_positions.iter().map(|(_, sid)| *sid), resolver)?;
-
-            let Some(source) = insert.source.as_mut() else {
-                return Ok(());
-            };
-            let SetExpr::Values(values) = source.body.as_mut() else {
-                // An `INSERT ... SELECT` has its rows materialized into literal
-                // `VALUES` before it reaches here, so a query source at this point
-                // means something new routed around that. Refuse rather than let a
-                // non-VALUES source pass through silently un-anonymized.
-                return Err("anonymized columns require an INSERT ... VALUES statement".to_string());
-            };
-
-            for row in &mut values.rows {
-                for (idx, secret_id) in &target_positions {
-                    if let Some(expr) = row.get_mut(*idx) {
-                        anonymize_expr(expr, &secrets[secret_id.as_str()])?;
-                    }
-                }
-            }
-            Ok(())
-        }
+        Statement::Insert(insert) => anonymize_insert(insert, anonymized_columns, resolver),
         Statement::Update(update) => {
-            for assignment in &mut update.assignments {
-                let col_name = match &assignment.target {
-                    AssignmentTarget::ColumnName(name) => {
-                        name.0.last().and_then(|p| p.as_ident()).map(|i| &i.value)
-                    }
-                    AssignmentTarget::Tuple(_) => None,
-                };
-                if let Some(name) = col_name
-                    && let Some(secret_id) = anonymized_columns.get(&name.to_ascii_lowercase())
-                {
-                    let secret = resolve_secret(secret_id, resolver)?;
-                    anonymize_expr(&mut assignment.value, &secret)?;
-                }
-            }
-            Ok(())
+            anonymize_assignments(&mut update.assignments, anonymized_columns, resolver)
         }
         _ => Ok(()),
     }
 }
 
+/// Hash the anonymized columns of an `INSERT ... VALUES`, in every row.
+fn anonymize_insert(
+    insert: &mut Insert,
+    anonymized_columns: &HashMap<String, String>,
+    resolver: &dyn SecretResolver,
+) -> Result<(), String> {
+    let mut target_positions: Vec<(usize, &String)> = Vec::new();
+    for (idx, col) in insert.columns.iter().enumerate() {
+        if let Some(sid) = column_secret(col, anonymized_columns)? {
+            target_positions.push((idx, sid));
+        }
+    }
+
+    if target_positions.is_empty() {
+        return Ok(());
+    }
+
+    let secrets = resolve_secrets(target_positions.iter().map(|(_, sid)| *sid), resolver)?;
+
+    let Some(source) = insert.source.as_mut() else {
+        return Ok(());
+    };
+    let SetExpr::Values(values) = source.body.as_mut() else {
+        // An `INSERT ... SELECT` has its rows materialized into literal `VALUES`
+        // before it reaches here, so a query source at this point means something new
+        // routed around that. Refuse rather than let a non-VALUES source pass through
+        // silently un-anonymized.
+        return Err("anonymized columns require an INSERT ... VALUES statement".to_string());
+    };
+
+    for row in &mut values.rows {
+        for (idx, secret_id) in &target_positions {
+            if let Some(expr) = row.get_mut(*idx) {
+                anonymize_expr(expr, &secrets[secret_id.as_str()])?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Hash the anonymized columns an `UPDATE` assigns to.
+///
+/// Which assignments need hashing is decided before any of them is rewritten, so
+/// that each distinct secret is resolved once — a statement setting K anonymized
+/// columns from one secret did K catalog reads when this walked and mutated in a
+/// single pass.
+fn anonymize_assignments(
+    assignments: &mut [Assignment],
+    anonymized_columns: &HashMap<String, String>,
+    resolver: &dyn SecretResolver,
+) -> Result<(), String> {
+    let mut targets: Vec<(usize, &String)> = Vec::new();
+    for (idx, assignment) in assignments.iter().enumerate() {
+        match &assignment.target {
+            AssignmentTarget::ColumnName(name) => {
+                if let Some(sid) = column_secret(name, anonymized_columns)? {
+                    targets.push((idx, sid));
+                }
+            }
+            // `SET (a, b) = (x, y)` assigns from a single row constructor, so the
+            // value to hash is one element of this assignment's value rather than
+            // the whole of it — and in the `= (SELECT …)` form it is not in the AST
+            // at all. The form is refused when it names an anonymized column instead
+            // of being passed over, which is what shipped the plaintext.
+            AssignmentTarget::Tuple(names) => {
+                for name in names {
+                    if column_secret(name, anonymized_columns)?.is_some() {
+                        return Err(format!(
+                            "anonymized column '{name}' cannot be assigned by a multi-column \
+                             SET (…) = (…); assign it in a SET clause of its own"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+
+    if targets.is_empty() {
+        return Ok(());
+    }
+
+    let secrets = resolve_secrets(targets.iter().map(|(_, sid)| *sid), resolver)?;
+    for (idx, secret_id) in targets {
+        anonymize_expr(&mut assignments[idx].value, &secrets[secret_id.as_str()])?;
+    }
+    Ok(())
+}
+
+/// The secret id `column` is declared anonymized under, or `None` if it is not.
+///
+/// Matching is case-insensitive — the map is keyed on lowercased identifiers, so
+/// `EMAIL` still resolves to the `email` rule and a case mismatch never skips
+/// hashing.
+///
+/// A reference that is not a bare identifier — a dotted composite-field target — is
+/// refused rather than skipped. Skipping would write plaintext into a column
+/// declared anonymized, and resolving it by its last part would hash it under
+/// another column's rule.
+fn column_secret<'a>(
+    column: &ObjectName,
+    anonymized_columns: &'a HashMap<String, String>,
+) -> Result<Option<&'a String>, String> {
+    let ident = insert_column_ident(column).ok_or_else(|| {
+        format!("unsupported column reference '{column}' on a table with anonymized columns")
+    })?;
+    Ok(anonymized_columns.get(&ident.value.to_ascii_lowercase()))
+}
+
 /// Resolve and validate every distinct secret id in `ids` once, returning a map
-/// from id to its [`Secret`]. Resolving up front (rather than per value) keeps a
-/// bulk INSERT to at-most-K catalog reads instead of one per hashed value.
+/// from id to its [`Secret`]. Resolving up front, rather than per value, keeps a
+/// statement to at-most-K catalog reads instead of one per hashed value — a bulk
+/// INSERT of N rows over K anonymized columns would otherwise do N*K reads for the
+/// same handful of ids.
 fn resolve_secrets<'a>(
     ids: impl Iterator<Item = &'a String>,
     resolver: &dyn SecretResolver,
@@ -308,30 +365,59 @@ mod tests {
         assert!(!sql.contains("a@x.com"), "plaintext leaked: {sql}");
     }
 
+    /// An UPDATE's assignment is hashed however the client spelled the column: the
+    /// map is keyed on the lowercased name (as `parse_anonymized_columns` produces),
+    /// so a case mismatch must not be the thing that skips hashing.
     #[test]
-    fn update_column_case_mismatch_still_hashes() {
-        let mut stmt = parse_one("UPDATE t SET EMAIL = 'new@x.com' WHERE id = 1");
-        let resolver = StaticResolver::with("sid", HMAC_SHA256_ALGO, "key");
-        anonymize_statement(&mut stmt, &anon_map(&[("email", "sid")]), &resolver).unwrap();
-        let sql = write_sql_cl::statement_to_sql(&stmt);
-        assert!(
-            sql.contains(&hmac_sha256_hex("key", "new@x.com")),
-            "got: {sql}"
-        );
-        assert!(!sql.contains("new@x.com"), "plaintext leaked: {sql}");
+    fn update_hashes_its_assignment_in_any_case() {
+        for sql in [
+            "UPDATE t SET email = 'new@x.com' WHERE id = 1",
+            "UPDATE t SET EMAIL = 'new@x.com' WHERE id = 1",
+        ] {
+            let mut stmt = parse_one(sql);
+            let resolver = StaticResolver::with("sid", HMAC_SHA256_ALGO, "key");
+            anonymize_statement(&mut stmt, &anon_map(&[("email", "sid")]), &resolver).unwrap();
+            let rewritten = write_sql_cl::statement_to_sql(&stmt);
+            assert!(
+                rewritten.contains(&hmac_sha256_hex("key", "new@x.com")),
+                "`{sql}` was not hashed: {rewritten}"
+            );
+            assert!(
+                !rewritten.contains("new@x.com"),
+                "plaintext leaked from `{sql}`: {rewritten}"
+            );
+        }
     }
 
+    /// A multi-column `SET (a, b) = (x, y)` names its columns in the assignment
+    /// target and carries their values in one row constructor, so a per-assignment
+    /// rewrite has no single value to hash. It used to be passed over silently,
+    /// which wrote the plaintext of an anonymized column to the shard; it is refused
+    /// now, and the refusal names the column.
+    ///
+    /// Scoped to anonymized columns only: the same form over columns the table does
+    /// not anonymize loses no clause and must still answer.
     #[test]
-    fn update_hashes_assigned_anonymized_column() {
-        let mut stmt = parse_one("UPDATE t SET email = 'new@x.com' WHERE id = 1");
+    fn update_refuses_a_multi_column_assignment_to_an_anonymized_column() {
         let resolver = StaticResolver::with("sid", HMAC_SHA256_ALGO, "key");
-        anonymize_statement(&mut stmt, &anon_map(&[("email", "sid")]), &resolver).unwrap();
-        let sql = write_sql_cl::statement_to_sql(&stmt);
+        let anonymized = anon_map(&[("email", "sid")]);
+
+        let mut stmt = parse_one("UPDATE t SET (email, name) = ('a@x.com', 'Alice') WHERE id = 1");
+        let err = anonymize_statement(&mut stmt, &anonymized, &resolver)
+            .expect_err("an anonymized column cannot be hashed inside a row constructor");
+        assert!(err.contains("email"), "the column must be named: {err}");
         assert!(
-            sql.contains(&hmac_sha256_hex("key", "new@x.com")),
-            "got: {sql}"
+            err.contains("SET"),
+            "the message must say which form was refused: {err}"
         );
-        assert!(!sql.contains("new@x.com"), "plaintext leaked: {sql}");
+
+        let mut untouched = parse_one("UPDATE t SET (id, name) = (2, 'Alice') WHERE id = 1");
+        anonymize_statement(&mut untouched, &anonymized, &resolver)
+            .expect("a multi-column assignment over non-anonymized columns still answers");
+        assert!(
+            write_sql_cl::statement_to_sql(&untouched).contains("Alice"),
+            "a non-anonymized value must pass through unchanged"
+        );
     }
 
     #[test]

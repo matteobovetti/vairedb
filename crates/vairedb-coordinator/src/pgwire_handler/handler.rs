@@ -230,7 +230,9 @@ impl VaireDbQueryHandler {
     /// actually ships a write will fail to resolve a shard, which is what makes
     /// this cheap enough to build per test.
     pub(super) fn for_tests(allow_cross_shard_transactions: bool) -> Self {
-        let catalog = Arc::new(super::test_catalog::scratch_catalog("handler"));
+        let catalog = Arc::new(crate::catalog::catalog_test_helper::scratch_catalog(
+            "handler",
+        ));
         let pool = Arc::new(ChannelPool::new());
         let replication_manager = Arc::new(ReplicationManager::new(
             Arc::clone(&catalog),
@@ -757,14 +759,11 @@ impl VaireDbQueryHandler {
 
 #[cfg(test)]
 mod tests {
+    use super::super::read_path_test_helper::parse_rewritten;
     use super::*;
 
     fn label_of(sql: &str) -> &'static str {
-        let stmt = parser::parse_sql(sql)
-            .unwrap_or_else(|e| panic!("`{sql}` should parse: {e}"))
-            .into_iter()
-            .next()
-            .unwrap();
+        let stmt = parse_rewritten(sql);
         unsupported_statement_label(&stmt)
     }
 
@@ -811,11 +810,7 @@ mod tests {
             "RESET application_name",
             "RESET ALL",
         ] {
-            let stmt = parser::parse_sql(sql)
-                .unwrap_or_else(|e| panic!("`{sql}` should parse: {e}"))
-                .into_iter()
-                .next()
-                .unwrap();
+            let stmt = parse_rewritten(sql);
             assert_eq!(
                 query_router::classify_statement(&stmt),
                 QueryType::SessionParam,
@@ -848,11 +843,7 @@ mod tests {
             "DESC t",
             "DESCRIBE SELECT 1",
         ] {
-            let stmt = parser::parse_sql(sql)
-                .unwrap_or_else(|e| panic!("`{sql}` should parse: {e}"))
-                .into_iter()
-                .next()
-                .unwrap();
+            let stmt = parse_rewritten(sql);
             assert_eq!(
                 query_router::classify_statement(&stmt),
                 QueryType::Explain,
@@ -873,11 +864,7 @@ mod tests {
 
     #[test]
     fn the_error_message_quotes_the_command_name() {
-        let stmt = parser::parse_sql("COMMENT ON TABLE t IS 'x'")
-            .unwrap()
-            .into_iter()
-            .next()
-            .unwrap();
+        let stmt = parse_rewritten("COMMENT ON TABLE t IS 'x'");
         let msg = unsupported_statement_error(&stmt).to_string();
         assert!(msg.contains("COMMENT ON"), "got: {msg}");
     }
@@ -892,11 +879,7 @@ mod tests {
             ("CREATE DOMAIN d AS INTEGER", "no user-defined types"),
             ("ALTER TYPE ty ADD VALUE 'c'", "no user-defined types"),
         ] {
-            let stmt = parser::parse_sql(sql)
-                .unwrap_or_else(|e| panic!("`{sql}` should parse: {e}"))
-                .into_iter()
-                .next()
-                .unwrap();
+            let stmt = parse_rewritten(sql);
             let msg = unsupported_statement_error(&stmt).to_string();
             assert!(msg.contains(reason), "`{sql}` got: {msg}");
         }

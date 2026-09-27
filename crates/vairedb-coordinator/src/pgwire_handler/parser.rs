@@ -28,6 +28,7 @@ use std::sync::{Arc, OnceLock};
 use arrow_pg::datatypes::into_pg_type;
 use async_trait::async_trait;
 use datafusion::common::TableReference;
+use datafusion::error::DataFusionError;
 use datafusion::execution::context::SessionContext;
 use datafusion::logical_expr::LogicalPlan;
 use datafusion::sql::parser::Statement as DFStatement;
@@ -533,6 +534,36 @@ pub(super) async fn plan_select(
         .statement_to_plan(DFStatement::Statement(Box::new(prepared)))
         .await
         .map_err(|e| enrich_datafusion_error(&e, &select_ctx))?;
+    let plan = apply_read_path_passes(ctx, plan, &select_ctx)?;
+    Ok((plan, select_ctx))
+}
+
+/// Every pass the read path runs on a planned SELECT, in the one order they are allowed
+/// to run in.
+///
+/// Separate from [`plan_select`] because the two answer different questions: that
+/// function is *what the read path does* — prepare the AST, plan it, fix the plan up — and
+/// this one is *the order the fixes go in*, which is the part with an argument behind
+/// every line. Each pass carries the reason it sits where it does, and those reasons are
+/// pairwise ("before `coerce_types`", "paired with its own refusal, in that order"), so
+/// the sequence read top to bottom is the only place the whole constraint set is legible.
+/// A `PlanPass` trait and an ordered registry would scatter it back across eleven files,
+/// each pass holding a priority number that means nothing on its own — which is why this
+/// is a function body and not a registry.
+///
+/// Two shapes appear. A rewrite returns a new plan and is enriched, because its failure is
+/// a planning failure the client reads in context. A refusal borrows the plan and returns
+/// `()`, because its error is already the client-facing message — enriching it would
+/// bury the refusal behind a planner's wording.
+fn apply_read_path_passes(
+    ctx: &SessionContext,
+    plan: LogicalPlan,
+    select_ctx: &ErrorContext,
+) -> PgWireResult<LogicalPlan> {
+    // Taken by reference at each call site, so the one closure serves all of them: every
+    // rewrite below reports its failure against the same statement.
+    let enrich = |e: DataFusionError| enrich_datafusion_error(&e, select_ctx);
+
     // Straight after the planner, and before any pass that could rewrite the call: the
     // refusal names the argument *types* the way PostgreSQL does, so it needs the schema the
     // planner has just resolved and the `count` still spelled the way the client spelled it.
@@ -541,14 +572,12 @@ pub(super) async fn plan_select(
     // On the plan and not on the session, because this changes a result column's *type*
     // and the type the client is told is read off this plan — by Describe and by the row
     // encoder both. See `pg_aggregate_widening`.
-    let plan = pg_aggregate_widening::widen_bigint_aggregates(plan)
-        .map_err(|e| enrich_datafusion_error(&e, &select_ctx))?;
+    let plan = pg_aggregate_widening::widen_bigint_aggregates(plan).map_err(&enrich)?;
     // On the plan and **after** the planner, because the merged column PostgreSQL's
     // `USING` promises only exists once names are resolved and wildcards expanded: it is
     // the columns the planner has already picked that this puts the merged value into.
     // See `pg_using_join_merge`.
-    let plan = pg_using_join_merge::merge_using_join_keys(plan)
-        .map_err(|e| enrich_datafusion_error(&e, &select_ctx))?;
+    let plan = pg_using_join_merge::merge_using_join_keys(plan).map_err(&enrich)?;
     // Also on the plan, and for the same reason: an untyped `$N` is decoded using the type
     // this plan reports, so a type the plan does not carry yet is one the client's value
     // never gets. See `pg_param_types`.
@@ -558,8 +587,7 @@ pub(super) async fn plan_select(
     // is type-checked by the analyzer like any other. On the plan and not on the AST
     // because `a / b` is an error at `numeric` and an infinity at `float8`, and the parse
     // cannot tell the two apart. See `pg_float_division`.
-    let plan = pg_float_division::guard_float_division(plan)
-        .map_err(|e| enrich_datafusion_error(&e, &select_ctx))?;
+    let plan = pg_float_division::guard_float_division(plan).map_err(&enrich)?;
     // Before the optimizer, and only before it: decorrelation is the pass that turns a
     // `NOT IN (subquery)` into the anti join whose NULL handling is what diverges, so
     // afterwards there is no `InSubquery` left to judge. Reads nullability, which is why it
@@ -571,8 +599,7 @@ pub(super) async fn plan_select(
     // executes, so afterwards there is no quantified comparison left to lower. The refusal
     // reads the *residue* of the lowering, so the two are a pair and the order is fixed. See
     // `pg_quantified_subqueries`.
-    let plan = pg_quantified_subqueries::lower_quantified_subqueries(plan)
-        .map_err(|e| enrich_datafusion_error(&e, &select_ctx))?;
+    let plan = pg_quantified_subqueries::lower_quantified_subqueries(plan).map_err(&enrich)?;
     pg_quantified_subqueries::reject_unlowered_quantified_subqueries(&plan)?;
     // After that lowering, because it is the other pass that builds an `Expr::Exists` — and
     // builds it only in a predicate position this one leaves alone. Before the optimizer,
@@ -580,8 +607,7 @@ pub(super) async fn plan_select(
     // planner has no form for what is left there; and before `coerce_types`, so the `count(*)`
     // comparison and the three-valued `CASE` this builds are type-checked like any other
     // expression. Paired with its own refusal, in that order. See `pg_projection_subqueries`.
-    let plan = pg_projection_subqueries::lower_projection_subqueries(plan)
-        .map_err(|e| enrich_datafusion_error(&e, &select_ctx))?;
+    let plan = pg_projection_subqueries::lower_projection_subqueries(plan).map_err(&enrich)?;
     pg_projection_subqueries::reject_unlowered_projection_subqueries(&plan)?;
     // Before `coerce_types`, and only before it: coercion is the pass that inserts the casts
     // making a set operation's branches agree, so afterwards there is no disagreement left to
@@ -593,8 +619,7 @@ pub(super) async fn plan_select(
     // which is why it is here on the plan rather than beside the AST pass that marks the
     // operations for it. See `pg_set_op_multiplicity`.
     let plan = pg_set_op_multiplicity::preserve_set_operation_multiplicity(plan)?;
-    let plan = coerce_types(ctx, plan, &select_ctx)?;
-    Ok((plan, select_ctx))
+    coerce_types(ctx, plan, select_ctx)
 }
 
 /// Run DataFusion's analyzer, so the plan the rest of the read path holds carries the
@@ -860,6 +885,246 @@ pub(super) fn ordered_param_types(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
+    use datafusion::arrow::array::{Float64Array, Int32Array, Int64Array, RecordBatch};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::prelude::SessionContext;
+
+    use super::super::read_path_test_helper;
+
+    /// `l(id int4 not null, k int4, f float8, big int8)` joined to `r(id int4 not null,
+    /// k int4)`, on a context configured the way the read path's own is.
+    ///
+    /// The nullabilities are the fixture's whole point: `id` non-nullable and `k` nullable
+    /// is what lets one statement reach both sides of a nullability-dependent pass, and
+    /// `f`/`big` are what let the same statement carry a float division and a widened
+    /// aggregate. The chain is only testable as a chain if one statement can need several
+    /// passes at once.
+    fn context() -> SessionContext {
+        let ctx = read_path_test_helper::context();
+        let l = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("k", DataType::Int32, true),
+            Field::new("f", DataType::Float64, true),
+            Field::new("big", DataType::Int64, true),
+        ]));
+        let r = Arc::new(Schema::new(vec![
+            Field::new("id", DataType::Int32, false),
+            Field::new("k", DataType::Int32, true),
+        ]));
+        ctx.register_batch(
+            "l",
+            RecordBatch::try_new(
+                l,
+                vec![
+                    Arc::new(Int32Array::from(vec![1, 2])),
+                    Arc::new(Int32Array::from(vec![Some(1), None])),
+                    Arc::new(Float64Array::from(vec![Some(4.0), Some(9.0)])),
+                    Arc::new(Int64Array::from(vec![
+                        Some(4611686018427387904),
+                        Some(4611686018427387904),
+                    ])),
+                ],
+            )
+            .expect("a batch"),
+        )
+        .expect("registered");
+        ctx.register_batch(
+            "r",
+            RecordBatch::try_new(
+                r,
+                vec![
+                    Arc::new(Int32Array::from(vec![1, 2])),
+                    Arc::new(Int32Array::from(vec![Some(1), None])),
+                ],
+            )
+            .expect("a batch"),
+        )
+        .expect("registered");
+        ctx
+    }
+
+    /// The statement a client sends, answered: planned through the whole read path and
+    /// then executed, so a pass that leaves a plan the engine cannot run is a failure here
+    /// rather than a `Describe` that lies.
+    async fn answer(sql: &str) -> Vec<RecordBatch> {
+        let ctx = context();
+        let plan = read_path_test_helper::plan(&ctx, sql)
+            .await
+            .unwrap_or_else(|e| panic!("`{sql}` was not planned: {e}"));
+        ctx.execute_logical_plan(plan)
+            .await
+            .unwrap_or_else(|e| panic!("`{sql}` planned but did not run: {e}"))
+            .collect()
+            .await
+            .unwrap_or_else(|e| panic!("`{sql}` failed while running: {e}"))
+    }
+
+    /// Three rewrites on one statement, composed: the `USING` key merged, `sum` over a
+    /// `bigint` widened to `numeric`, and the float division replaced by the checked call.
+    ///
+    /// What this says that the three per-pass tests cannot: they compose in the order
+    /// [`super::apply_read_path_passes`] runs them and the result is still a plan the
+    /// engine accepts. Each pass rewrites the plan the previous one produced, so "passes
+    /// A, B and C each work" is not the claim — `A; B; C` is.
+    #[tokio::test]
+    async fn the_rewrites_compose_on_one_statement() {
+        let batches = answer(
+            "SELECT id, sum(big) AS total, sum(f / 2) AS scaled \
+             FROM l JOIN r USING (id) GROUP BY id ORDER BY id",
+        )
+        .await;
+
+        let schema = batches[0].schema();
+        // One `id`, not the two a `USING` join leaves behind.
+        assert_eq!(
+            schema.fields().len(),
+            3,
+            "the USING key was not merged: {:?}",
+            schema.fields()
+        );
+        // `sum(bigint)` is `numeric` in PostgreSQL, and the widening is what makes it so
+        // here — in `Int64` these two rows overflow to a negative total.
+        assert!(
+            matches!(schema.field(1).data_type(), DataType::Decimal128(_, _)),
+            "sum(big) was advertised as {}",
+            schema.field(1).data_type()
+        );
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+    }
+
+    /// The float division's divisor is an integer literal, so the checked call only
+    /// resolves once its arguments are coerced — which is why `coerce_types` runs *after*
+    /// the guard and not before.
+    ///
+    /// Asserted by executing rather than by reading the plan: an uncoerced argument is a
+    /// plan DataFusion still prints and then refuses to run, which is exactly the failure
+    /// a plan-shape assertion would miss.
+    #[tokio::test]
+    async fn the_coercion_runs_after_the_rewrites_that_need_it() {
+        let batches = answer("SELECT f / 2 AS half FROM l ORDER BY 1").await;
+        assert_eq!(batches.iter().map(|b| b.num_rows()).sum::<usize>(), 2);
+    }
+
+    /// A refusal still fires when rewrites have reshaped the plan ahead of it.
+    ///
+    /// [`super::pg_not_in_nulls`] runs eighth, after the `USING` merge and the aggregate
+    /// widening have both rebuilt the plan around it. A refusal that stops recognizing its
+    /// own shape does not fail loudly — it silently answers the row PostgreSQL excludes,
+    /// which is the ⛔ class. Its own tests give it a plan no earlier pass has touched, so
+    /// this is the only place that composition is asserted.
+    #[tokio::test]
+    async fn a_refusal_still_fires_behind_the_rewrites_that_precede_it() {
+        let ctx = context();
+        let message = read_path_test_helper::refusal(
+            &ctx,
+            "SELECT sum(big) FROM l JOIN r USING (id) \
+             WHERE l.k NOT IN (SELECT k FROM r WHERE r.id > l.id)",
+        )
+        .await;
+        assert!(
+            message.contains("NOT IN"),
+            "the refusal was not the NOT IN one: {message}"
+        );
+
+        // And the neighbouring statement that loses no clause still answers, so the
+        // refusal is scoped to the nullable key and not to the join it sits in.
+        read_path_test_helper::accepted(
+            &ctx,
+            "SELECT sum(big) FROM l JOIN r USING (id) \
+             WHERE l.id NOT IN (SELECT id FROM r WHERE r.k = l.k)",
+        )
+        .await;
+    }
+
+    /// A write comes back verbatim and the same expression on a read does not — the one
+    /// invariant this module exists for, in one test.
+    ///
+    /// `'l'::regclass` is rewritten by the pg-compat parser into a lookup against the
+    /// emulated catalog, which is what makes a driver's introspection planable. On a write
+    /// that rewrite does not adapt the statement, it changes the row: the value shipped to
+    /// a shard's DuckDB would be the rewritten expression rather than what the client sent.
+    /// So the two verdicts are asserted against each other rather than separately — a
+    /// regression that dropped the verbatim re-parse would leave a test on the write alone
+    /// passing if the rewrite had also stopped firing.
+    #[test]
+    fn a_write_keeps_the_clients_own_expression_where_a_read_does_not() {
+        // Compared case-insensitively: sqlparser renders a type keyword in upper case, so
+        // the cast a write keeps comes back as `::REGCLASS`. The claim is that the
+        // expression survives, not how the renderer spells its keywords.
+        let write = super::parse_sql("INSERT INTO t (a) VALUES ('l'::regclass)")
+            .expect("the insert parses")
+            .remove(0)
+            .to_string()
+            .to_ascii_lowercase();
+        assert!(
+            write.contains("'l'::regclass"),
+            "the insert no longer carries the client's own cast: {write}"
+        );
+
+        let read = super::parse_sql("SELECT 'l'::regclass")
+            .expect("the select parses")
+            .remove(0)
+            .to_string()
+            .to_ascii_lowercase();
+        assert!(
+            !read.contains("'l'::regclass"),
+            "the read path stopped rewriting the cast, so the write assertion above proves \
+             nothing: {read}"
+        );
+    }
+
+    /// A write whose expression would mean something else on DuckDB is refused at the
+    /// parse, not at the shard.
+    ///
+    /// This is the check the write branch of [`super::parse_sql`] exists to run: control
+    /// leaves the loop there, so a write reaches no later expression check at all. DuckDB
+    /// does not enforce a `VARCHAR(n)` length, so the cast would neither truncate nor pad
+    /// and the untruncated value would be stored — a wrong row rather than an error.
+    #[test]
+    fn a_write_whose_expression_diverges_on_duckdb_is_refused_at_the_parse() {
+        let error = super::parse_sql("INSERT INTO t (a) VALUES (CAST('abcdef' AS VARCHAR(3)))")
+            .expect_err("the length-bearing cast is refused");
+        assert!(
+            error.to_string().contains("CAST to"),
+            "refused as something else: {error}"
+        );
+
+        // The neighbouring cast that loses no clause still parses, which is what keeps the
+        // refusal scoped to the length rather than to casting.
+        super::parse_sql("INSERT INTO t (a) VALUES (CAST('abcdef' AS TEXT))")
+            .expect("an unlengthed cast still parses");
+    }
+
+    /// The two statements no parser in the tree has, respelled on the text before either
+    /// parse runs.
+    ///
+    /// Both are PostgreSQL statements with an exact equivalent the parsers do have, so the
+    /// respelling is what makes them work at all — and it happens ahead of the branch, so
+    /// neither path can disagree about what the client asked for.
+    #[test]
+    fn a_statement_neither_parser_has_is_respelled_before_either_parse() {
+        for (sql, expected) in [
+            // `= DEFAULT` rather than `TO DEFAULT`: the two are the same statement in
+            // PostgreSQL and this is the spelling sqlparser renders.
+            ("RESET search_path", "SET search_path = DEFAULT"),
+            (
+                "ALTER TABLE sales.orders SET SCHEMA archive",
+                "ALTER TABLE sales.orders RENAME TO archive.orders",
+            ),
+        ] {
+            let parsed = super::parse_sql(sql)
+                .unwrap_or_else(|e| panic!("`{sql}` did not parse: {e}"))
+                .remove(0)
+                .to_string();
+            assert!(
+                parsed.eq_ignore_ascii_case(expected),
+                "`{sql}` was respelled as `{parsed}`, not `{expected}`"
+            );
+        }
+    }
+
     /// The whole-path assertion for the ANY/ALL normalization: `parse_sql` returns the
     /// statement early unless one of its cheap guards fires, so a fix inside
     /// [`compat_rewrite`] is only reachable if the guard is wired in. This test is on

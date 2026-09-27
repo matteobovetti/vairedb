@@ -165,12 +165,8 @@ pub(super) fn sequence_error(what: &str) -> pgwire::error::PgWireError {
 
 #[cfg(test)]
 mod tests {
+    use super::super::write_path_test_helper::parse_one;
     use super::*;
-    use crate::pgwire_handler::parser::parse_sql;
-
-    fn parse_one(sql: &str) -> Statement {
-        parse_sql(sql).unwrap().into_iter().next().unwrap()
-    }
 
     /// The message a statement is refused with, or `None` if it is allowed.
     fn rejection(sql: &str) -> Option<String> {

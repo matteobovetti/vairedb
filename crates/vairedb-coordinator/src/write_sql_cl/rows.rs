@@ -2,24 +2,21 @@
 //! statements — the primitive behind every write whose rows the client did not
 //! spell out (`INSERT ... SELECT`, `CREATE TABLE AS SELECT`, `COPY ... FROM`).
 //!
-//! The coordinator hashes a row's shard key *before* the write leaves it, so a
-//! row whose values it cannot see cannot be placed; that is the single reason
-//! those statements are refused today (see
-//! [`super::validate_insert_shard_key`]). Running the source query on the read
-//! path first and rendering its rows back as literals removes the reason: what
-//! reaches the write path is then an ordinary multi-row `INSERT ... VALUES`, so
-//! the shard-key check, the `ON CONFLICT` check, the anonymization rewrite, the
+//! The coordinator hashes a row's shard key *before* the write leaves it, so a row
+//! whose values it cannot see cannot be placed — the single reason those statements
+//! are refused today (see [`super::validate_insert_shard_key`]). Running the source
+//! query on the read path first and rendering its rows back as literals removes the
+//! reason: what reaches the write path is an ordinary multi-row `INSERT ... VALUES`,
+//! so the shard-key check, the `ON CONFLICT` check, the anonymization rewrite, the
 //! per-shard row split and the exact row count all apply unchanged.
 //!
 //! Literals rather than bind parameters, deliberately: the anonymization rewrite
-//! replaces a plaintext value with its digest and cannot digest a value it does
-//! not hold, so a parameterized rendering would either fail on every anonymized
-//! table or ship plaintext to a shard.
+//! cannot digest a value it does not hold, so a parameterized rendering would either
+//! fail on every anonymized table or ship plaintext to a shard.
 //!
-//! A cell is rendered with [`arrow_array_value_to_string`] — the same renderer
-//! the read path encodes a text result column with — so a value that
-//! round-trips through this path hashes to the shard a literal of the same value
-//! routes to, and a client reading the row back sees what it sent.
+//! A cell is rendered with [`arrow_array_value_to_string`], the renderer the read path
+//! encodes a text result column with, so a round-tripped value hashes to the shard a
+//! literal of the same value routes to and reads back as what the client sent.
 
 use datafusion::arrow::array::{Array, RecordBatch};
 use datafusion::arrow::datatypes::DataType;
@@ -121,10 +118,9 @@ fn cell_literal(col: &dyn Array, row: usize, kind: LiteralKind) -> Expr {
 /// client's statement did not spell out as an INSERT at all — `COPY ... FROM`,
 /// `CREATE TABLE ... AS SELECT`.
 ///
-/// Every identifier is emitted quoted, so a name whose case the catalog kept
-/// survives to the shard instead of being folded there. The placeholder row this
-/// carries is never written: [`insert_statements_from_batches`] replaces the
-/// source with the materialized rows.
+/// Every identifier is quoted, so a name whose case the catalog kept survives to the
+/// shard instead of being folded there. The placeholder row is never written —
+/// [`insert_statements_from_batches`] replaces the source with the materialized rows.
 pub fn insert_template(table: &str, columns: &[&str]) -> std::result::Result<Statement, String> {
     if columns.is_empty() {
         return Err("INSERT must specify an explicit column list".to_string());
@@ -155,12 +151,11 @@ fn quoted(ident: &str) -> String {
 /// Build the `INSERT ... VALUES` statements that write `batches` into the target
 /// of `template`, in chunks of `rows_per_statement` rows.
 ///
-/// `template` supplies everything but the rows: the target table, the column
-/// list (which must already be resolved — its length is what the source rows are
-/// matched against, positionally, as PostgreSQL matches them) and any
-/// `ON CONFLICT` clause. Its query source is discarded, along with the
-/// `ORDER BY`/`LIMIT`/`WITH` that belonged to it — those shaped the rows already
-/// materialized in `batches` and must not be re-applied to the VALUES list.
+/// `template` supplies everything but the rows: the target table, the column list
+/// (already resolved — its length is what source rows are matched against
+/// positionally, as PostgreSQL matches them) and any `ON CONFLICT` clause. Its query
+/// source is discarded along with the `ORDER BY`/`LIMIT`/`WITH` that belonged to it:
+/// those shaped the rows now in `batches` and must not be re-applied to the VALUES.
 ///
 /// Returns an empty vector when the source produced no rows: nothing to write is
 /// not an error, it is `INSERT 0`.
@@ -256,13 +251,8 @@ mod tests {
     };
     use datafusion::arrow::datatypes::{Field, Schema, TimeUnit};
 
+    use super::super::{parse_one, statement_to_sql};
     use super::*;
-    use crate::pgwire_handler::parser::parse_sql;
-    use crate::write_sql_cl::statement_to_sql;
-
-    fn parse_one(sql: &str) -> Statement {
-        parse_sql(sql).unwrap().into_iter().next().unwrap()
-    }
 
     fn batch(fields: Vec<Field>, columns: Vec<Arc<dyn Array>>) -> RecordBatch {
         RecordBatch::try_new(Arc::new(Schema::new(fields)), columns).unwrap()

@@ -8,6 +8,10 @@
 //! not describe the configuration is a missing or misspelled field inside it. Handing both
 //! back as one `Box<dyn Error>` left the operator to tell them apart from
 //! `No such file or directory (os error 2)`, which does not even name the file it looked for.
+//!
+//! There is a third thing to do about a configuration, and it is why [`Validate`] exists:
+//! the file was read, it is the right shape, and the values in it describe a node that
+//! cannot work.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -31,6 +35,29 @@ pub enum ConfigError {
         path: PathBuf,
         source: serde_yaml::Error,
     },
+    /// The file was read, it is the configuration the node needs, and a value in it would
+    /// stop the node from working — see [`Validate`]. There is no underlying error to carry:
+    /// nothing failed, the file simply says something the node will not do.
+    Unusable { path: PathBuf, reason: String },
+}
+
+/// A configuration that can rule itself out.
+///
+/// Deserializing proves the file has the right *shape*, not that a node can run on it:
+/// `heartbeat_timeout_secs: 0` is a perfectly good `u64`. What such a value does is never a
+/// clear report at the point of use. Some are a panic inside a task spawned seconds after
+/// startup, where the only trace is a backtrace in one task and the visible symptom is a
+/// node that went quiet. The worse ones are no panic at all — a coordinator that buries
+/// every node on its first scan is a healthy-looking process that refuses to create a
+/// table. Neither names the field, and the field is the whole of the fix.
+///
+/// The bound is on [`from_file`] rather than left to each caller to remember, so a
+/// configuration type cannot be loaded without having decided what an unusable one looks
+/// like — even where the answer is `Ok(())`.
+pub trait Validate {
+    /// `Err` names the offending field and says what the value would do. It is read by an
+    /// operator and never matched on, so the wording is free to be a sentence.
+    fn validate(&self) -> Result<(), String>;
 }
 
 impl fmt::Display for ConfigError {
@@ -50,6 +77,13 @@ impl fmt::Display for ConfigError {
                 "{} is not a valid VaireDB configuration: {source}",
                 path.display()
             ),
+            // The reason already names the field; the path says which of several node
+            // configurations on the host it was read from.
+            ConfigError::Unusable { path, reason } => write!(
+                f,
+                "{} cannot be used as a VaireDB configuration: {reason}",
+                path.display()
+            ),
         }
     }
 }
@@ -59,20 +93,27 @@ impl std::error::Error for ConfigError {
         match self {
             ConfigError::Unreadable { source, .. } => Some(source),
             ConfigError::Invalid { source, .. } => Some(source),
+            ConfigError::Unusable { .. } => None,
         }
     }
 }
 
-/// Read the file at `path` and deserialize its YAML contents into `T`.
-pub fn from_file<T: DeserializeOwned>(path: &Path) -> Result<T, ConfigError> {
+/// Read the file at `path`, deserialize its YAML contents into `T`, and refuse it unless `T`
+/// says it can be run on.
+pub fn from_file<T: DeserializeOwned + Validate>(path: &Path) -> Result<T, ConfigError> {
     let contents = std::fs::read_to_string(path).map_err(|source| ConfigError::Unreadable {
         path: path.to_path_buf(),
         source,
     })?;
-    serde_yaml::from_str(&contents).map_err(|source| ConfigError::Invalid {
+    let config: T = serde_yaml::from_str(&contents).map_err(|source| ConfigError::Invalid {
         path: path.to_path_buf(),
         source,
-    })
+    })?;
+    config.validate().map_err(|reason| ConfigError::Unusable {
+        path: path.to_path_buf(),
+        reason,
+    })?;
+    Ok(config)
 }
 
 #[cfg(test)]
@@ -85,6 +126,18 @@ mod tests {
     #[derive(Debug, Deserialize)]
     struct Settings {
         listen_addr: String,
+    }
+
+    /// A rule with the shape the real ones have: a value YAML is happy with that the thing
+    /// using it is not. An empty address is a bind that fails much later, in a message that
+    /// does not mention the configuration.
+    impl Validate for Settings {
+        fn validate(&self) -> Result<(), String> {
+            if self.listen_addr.is_empty() {
+                return Err("listen_addr is empty, so there is nothing to bind to".to_string());
+            }
+            Ok(())
+        }
     }
 
     /// A YAML file that lives only as long as the test that wrote it.
@@ -126,7 +179,7 @@ mod tests {
         }
     }
 
-    /// The path the other three are the failure of. Without this one, nothing here would
+    /// The path the other four are the failure of. Without this one, nothing here would
     /// notice a `from_file` that never returned `Ok` at all — every assertion below is about
     /// an error, and a function that only ever errors satisfies all of them.
     #[test]
@@ -182,12 +235,36 @@ mod tests {
         assert!(matches!(err, ConfigError::Invalid { .. }), "got: {err:?}");
     }
 
+    /// A file that parses into the configuration and still describes something unworkable is
+    /// refused here rather than at the point of use, and the reason carries the field. This
+    /// is the variant with no `serde` error to lean on: if the rule did not run, the value
+    /// would reach whatever consumes it and fail there, where the message cannot mention a
+    /// configuration file at all.
+    #[test]
+    fn values_the_configuration_cannot_be_run_on_are_unusable_and_name_the_field() {
+        let file = TempYaml::new("vairedb-config-unusable", "listen_addr: \"\"\n");
+
+        let err = from_file::<Settings>(file.path()).expect_err("an empty address is unusable");
+
+        assert!(matches!(err, ConfigError::Unusable { .. }), "got: {err:?}");
+        let message = err.to_string();
+        assert!(message.contains("listen_addr"), "got: {message}");
+        assert!(
+            message.contains("vairedb-config-unusable"),
+            "got: {message}"
+        );
+    }
+
     /// The cause, not only the sentence. `Display` is what a node prints on the way out, but
     /// a caller that walks the chain — `{:#}` through an `anyhow`-style wrapper, or a log
     /// layer that records `source()` — has to reach the `io` or `serde_yaml` error underneath
     /// rather than a dead end, which is the whole reason `source` is implemented above.
+    ///
+    /// `Unusable` is the exception and is asserted as one: nothing failed underneath it, so a
+    /// cause invented to fill the slot would only tell the operator to look somewhere there
+    /// is nothing to find.
     #[test]
-    fn both_variants_keep_their_cause_reachable() {
+    fn each_variant_with_a_cause_keeps_it_reachable() {
         let unreadable = from_file::<Settings>(Path::new("/nonexistent/vairedb-test.yml"))
             .expect_err("a missing file cannot be read");
         assert!(unreadable.source().is_some(), "got: {unreadable:?}");
@@ -196,5 +273,10 @@ mod tests {
         let invalid =
             from_file::<Settings>(file.path()).expect_err("the YAML does not match Settings");
         assert!(invalid.source().is_some(), "got: {invalid:?}");
+
+        let file = TempYaml::new("vairedb-config-cause-chain-unusable", "listen_addr: \"\"\n");
+        let unusable =
+            from_file::<Settings>(file.path()).expect_err("an empty address is unusable");
+        assert!(unusable.source().is_none(), "got: {unusable:?}");
     }
 }

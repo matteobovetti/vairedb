@@ -198,20 +198,14 @@ fn call(name: &str, args: Vec<Expr>) -> Expr {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sqlparser::ast::{Statement, visit_expressions_mut};
-    use crate::sqlparser::dialect::PostgreSqlDialect;
-    use crate::sqlparser::parser::Parser;
+    use crate::pgwire_handler::read_path_test_helper::parse_verbatim;
+    use crate::sqlparser::ast::visit_expressions_mut;
     use std::ops::ControlFlow;
 
     /// Apply the clamp everywhere in `sql` and render the statement back, which is exactly
     /// what the write path does with it.
     fn clamped(sql: &str) -> String {
-        let mut stmt: Statement = Parser::new(&PostgreSqlDialect {})
-            .try_with_sql(sql)
-            .unwrap()
-            .parse_statements()
-            .unwrap()
-            .remove(0);
+        let mut stmt = parse_verbatim(sql);
         let _ = visit_expressions_mut(&mut stmt, |expr| {
             if let Expr::CompoundFieldAccess { access_chain, .. } = expr {
                 clamp_to_pg_semantics(access_chain);

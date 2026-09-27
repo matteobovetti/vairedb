@@ -411,10 +411,9 @@ fn folded(ident: &Ident) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::catalog::catalog_test_helper::scratch_catalog;
     use crate::catalog::{ColumnDef, TableMeta};
-    use crate::pgwire_handler::test_catalog::scratch_catalog;
-    use crate::sqlparser::dialect::PostgreSqlDialect;
-    use crate::sqlparser::parser::Parser;
+    use crate::pgwire_handler::read_path_test_helper::parse_verbatim;
 
     /// `l(c, lv)`, `r(c, rv)` and `w(n, g)` — the three tables the `NATURAL` cases need a
     /// column list for. `l` and `r` share `c` and nothing else, which is what makes
@@ -441,9 +440,7 @@ mod tests {
 
     fn rewritten(sql: &str) -> String {
         let catalog = catalog();
-        let mut stmt = Parser::parse_sql(&PostgreSqlDialect {}, sql)
-            .expect("parsed")
-            .remove(0);
+        let mut stmt = parse_verbatim(sql);
         qualify_using_keys_in_where(&mut stmt, &catalog);
         stmt.to_string()
     }

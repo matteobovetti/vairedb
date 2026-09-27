@@ -41,7 +41,7 @@ use std::sync::Arc;
 use bytes::Bytes;
 use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::csv::WriterBuilder;
-use datafusion::arrow::datatypes::{Field, Schema, SchemaRef};
+use datafusion::arrow::datatypes::SchemaRef;
 use pgwire::api::results::{CopyResponse, Response, Tag};
 use pgwire::error::{PgWireError, PgWireResult};
 use pgwire::messages::copy::CopyData;
@@ -50,13 +50,10 @@ use tokio::io::AsyncReadExt;
 use vairedb_common::proto::vairedb::v1::VdbErrorCode;
 
 use crate::catalog::MetadataCatalog;
-use crate::error::CoordinatorError;
 use crate::pgwire_handler::column_labels;
 use crate::pgwire_handler::copy_parquet;
 use crate::pgwire_handler::copy_stream::CopySink;
-use crate::pgwire_handler::error_enrichment::{
-    ErrorContext, enrich_coordinator_error, make_vdb_error,
-};
+use crate::pgwire_handler::error_enrichment::{ErrorContext, make_vdb_error, require_table};
 use crate::pgwire_handler::handler::VaireDbQueryHandler;
 use crate::pgwire_handler::parser::parse_sql;
 use crate::pgwire_handler::query_router::{
@@ -163,6 +160,18 @@ const FILE_CHUNK_BYTES: usize = 64 * 1024;
 /// imports in the same number of statements whichever file it arrived in.
 pub(super) const ROWS_PER_BATCH: usize = 10 * write_sql_cl::ROWS_PER_STATEMENT;
 
+/// The command tag a finished COPY reports: `COPY n`.
+///
+/// One place, because the tag is wire text a client parses and the count is the only
+/// number in it. Five call sites across two modules spelled it out, and the narrowing
+/// `with_rows` requires — a row count is a `u64` everywhere it is produced — now happens
+/// once rather than at each of them. The `Tag` and not a `Response`, because the streaming
+/// import sends it as a `CommandComplete` of its own; the envelope differs, the tag does
+/// not.
+pub(super) fn copy_tag(rows: u64) -> Tag {
+    Tag::new("COPY").with_rows(rows as usize)
+}
+
 impl VaireDbQueryHandler {
     /// Run a `COPY`, in whichever of the four directions the statement named.
     ///
@@ -207,16 +216,7 @@ impl VaireDbQueryHandler {
             CopyOutSource::Table { name, columns } => {
                 // Reported before the query is planned so a missing table is a
                 // table error rather than whatever the planner makes of it.
-                let ctx = ErrorContext::for_table(name);
-                if self
-                    .catalog
-                    .get_table(name)
-                    .map_err(|e| enrich_coordinator_error(&e, &ctx, &self.catalog))?
-                    .is_none()
-                {
-                    let err = CoordinatorError::TableNotFound(name.clone());
-                    return Err(enrich_coordinator_error(&err, &ctx, &self.catalog));
-                }
+                require_table(&self.catalog, name, &ErrorContext::for_table(name))?;
                 select_from_table(name, columns)?
             }
             CopyOutSource::Query(query) => Statement::Query(query.clone()),
@@ -232,11 +232,11 @@ impl VaireDbQueryHandler {
         match (endpoint, format) {
             (CopyEndpoint::File(path), CopyFormat::Csv(dialect)) => {
                 write_csv_file(path.clone(), batches, dialect.clone()).await?;
-                Ok(Response::Execution(Tag::new("COPY").with_rows(rows)))
+                Ok(Response::Execution(copy_tag(rows as u64)))
             }
             (CopyEndpoint::File(path), CopyFormat::Parquet) => {
                 copy_parquet::write_file(path.clone(), schema, batches).await?;
-                Ok(Response::Execution(Tag::new("COPY").with_rows(rows)))
+                Ok(Response::Execution(copy_tag(rows as u64)))
             }
             (CopyEndpoint::Client, CopyFormat::Csv(dialect)) => {
                 let columns = schema.fields().len();
@@ -277,18 +277,14 @@ impl VaireDbQueryHandler {
                 let rows = self
                     .copy_from_parquet_file(table, columns, path, session)
                     .await?;
-                Ok(Response::Execution(
-                    Tag::new("COPY").with_rows(rows as usize),
-                ))
+                Ok(Response::Execution(copy_tag(rows)))
             }
             (endpoint, CopyFormat::Csv(dialect)) => {
                 let sink = open_copy_sink(&self.catalog, table, columns, dialect)?;
                 match endpoint {
                     CopyEndpoint::File(path) => {
                         let rows = self.copy_from_file(sink, path, session).await?;
-                        Ok(Response::Execution(
-                            Tag::new("COPY").with_rows(rows as usize),
-                        ))
+                        Ok(Response::Execution(copy_tag(rows)))
                     }
                     CopyEndpoint::Client => Ok(begin_copy_from_client(sink, session).await),
                 }
@@ -345,15 +341,7 @@ impl VaireDbQueryHandler {
         path: &str,
         session: &SessionState,
     ) -> PgWireResult<u64> {
-        let ctx = ErrorContext::for_table(table);
-        let table_meta = self
-            .catalog
-            .get_table(table)
-            .map_err(|e| enrich_coordinator_error(&e, &ctx, &self.catalog))?
-            .ok_or_else(|| {
-                let err = CoordinatorError::TableNotFound(table.to_string());
-                enrich_coordinator_error(&err, &ctx, &self.catalog)
-            })?;
+        let table_meta = require_table(&self.catalog, table, &ErrorContext::for_table(table))?;
 
         readable_file(path)?;
         let mut file = copy_parquet::ParquetFile::open(path).await?;
@@ -434,14 +422,7 @@ fn open_copy_sink(
     columns: &[String],
     dialect: &CsvDialect,
 ) -> PgWireResult<CopySink> {
-    let ctx = ErrorContext::for_table(table);
-    let table_meta = catalog
-        .get_table(table)
-        .map_err(|e| enrich_coordinator_error(&e, &ctx, catalog))?
-        .ok_or_else(|| {
-            let err = CoordinatorError::TableNotFound(table.to_string());
-            enrich_coordinator_error(&err, &ctx, catalog)
-        })?;
+    let table_meta = require_table(catalog, table, &ErrorContext::for_table(table))?;
 
     CopySink::open(table, columns, dialect, &table_meta)
 }
@@ -554,22 +535,10 @@ fn collapse_anonymous_labels(
     schema: SchemaRef,
     batches: Vec<RecordBatch>,
 ) -> PgWireResult<(SchemaRef, Vec<RecordBatch>)> {
-    if !schema
-        .fields()
-        .iter()
-        .any(|f| column_labels::wire_label(f.name()).is_some())
-    {
+    let Some(collapsed) = column_labels::wire_labels(&schema) else {
         return Ok((schema, batches));
-    }
-    let fields: Vec<Field> = schema
-        .fields()
-        .iter()
-        .map(|f| match column_labels::wire_label(f.name()) {
-            Some(name) => f.as_ref().clone().with_name(name),
-            None => f.as_ref().clone(),
-        })
-        .collect();
-    let collapsed = Arc::new(Schema::new_with_metadata(fields, schema.metadata().clone()));
+    };
+    let collapsed = Arc::new(collapsed);
     let batches = batches
         .into_iter()
         .map(|batch| {
@@ -1047,14 +1016,9 @@ pub(super) fn file_error(verb: &str, path: &str, cause: &impl std::fmt::Display)
 
 #[cfg(test)]
 mod tests {
+    use super::super::write_path_test_helper::{parse_one, user_error};
     use super::*;
     use pgwire::error::PgWireError;
-
-    fn parse_one(sql: &str) -> Statement {
-        let mut stmts = parse_sql(sql).unwrap_or_else(|e| panic!("failed to parse `{sql}`: {e}"));
-        assert_eq!(stmts.len(), 1, "`{sql}` must parse to one statement");
-        stmts.remove(0)
-    }
 
     fn plan(sql: &str) -> CopyPlan {
         plan_copy(&parse_one(sql)).unwrap_or_else(|e| panic!("`{sql}` must plan: {e}"))
@@ -1062,10 +1026,7 @@ mod tests {
 
     /// The SQLSTATE and message a refused COPY reports.
     fn rejection(sql: &str) -> (String, String) {
-        match plan_copy(&parse_one(sql)).expect_err("`{sql}` must be refused") {
-            PgWireError::UserError(info) => (info.code.clone(), info.message.clone()),
-            other => panic!("expected a user-facing error, got {other:?}"),
-        }
+        user_error(plan_copy(&parse_one(sql)).expect_err("`{sql}` must be refused"))
     }
 
     #[test]
@@ -1420,28 +1381,13 @@ mod tests {
 
     // --- the handler, against an empty catalog and no reachable nodes ---
 
-    use crate::catalog::{ColumnDef, TableMeta};
+    use crate::catalog::catalog_test_helper::table_meta;
 
     /// Register a table sharded by `id` so a COPY can resolve it.
     fn register(handler: &VaireDbQueryHandler, name: &str, columns: &[&str]) {
         handler
             .catalog
-            .put_table(&TableMeta {
-                table_name: name.to_string(),
-                columns: columns
-                    .iter()
-                    .map(|c| ColumnDef {
-                        name: c.to_string(),
-                        data_type: "INTEGER".to_string(),
-                        nullable: true,
-                        default_expr: String::new(),
-                    })
-                    .collect(),
-                shard_key: "id".to_string(),
-                shard_count: 2,
-                replication_factor: 1,
-                ..Default::default()
-            })
+            .put_table(&table_meta(name, columns, "id"))
             .unwrap();
     }
 
@@ -1455,32 +1401,130 @@ mod tests {
         path.to_str().unwrap().to_string()
     }
 
-    /// The SQLSTATE and message a COPY reports to the client.
-    async fn copy_rejection(handler: &VaireDbQueryHandler, sql: &str) -> (String, String) {
-        let session = SessionState::default();
-        let err = handler
-            .handle_copy(&parse_one(sql), &session)
+    /// Write a Parquet file naming `columns` and holding one row, returning its path.
+    /// Written through the export path, so what the import reads is what an export
+    /// produces.
+    async fn write_parquet(name: &str, columns: &[&str]) -> String {
+        use std::sync::Arc;
+
+        use datafusion::arrow::array::StringArray;
+        use datafusion::arrow::datatypes::{DataType, Field, Schema};
+
+        let schema = Arc::new(Schema::new(
+            columns
+                .iter()
+                .map(|c| Field::new(*c, DataType::Utf8, true))
+                .collect::<Vec<_>>(),
+        ));
+        let batch = RecordBatch::try_new(
+            SchemaRef::clone(&schema),
+            columns
+                .iter()
+                .map(|c| Arc::new(StringArray::from(vec![*c])) as _)
+                .collect(),
+        )
+        .unwrap();
+
+        let path = std::env::temp_dir()
+            .join(format!(
+                "vairedb_copy_test_{}_{name}.parquet",
+                std::process::id()
+            ))
+            .to_str()
+            .unwrap()
+            .to_string();
+        copy_parquet::write_file(path.clone(), schema, vec![batch])
             .await
-            .err()
-            .unwrap_or_else(|| panic!("`{sql}` must be rejected"));
-        match err {
-            PgWireError::UserError(info) => (info.code.clone(), info.message.clone()),
-            other => panic!("expected a user-facing error, got {other:?}"),
+            .unwrap();
+        path
+    }
+
+    /// A format `COPY ... FROM` can read, paired with the fixture writer for it.
+    ///
+    /// The import lane is shared past the file: a file becomes record batches and the
+    /// batches go to the INSERT lane. So "CSV refuses this" and "Parquet refuses this" are
+    /// one claim about that lane, and the pairs of tests this replaces each said less than
+    /// the single test does — that both formats refuse it *identically*. Two of them had
+    /// already noticed, in comments reading "the same message as the CSV lane" and "as with
+    /// CSV", which is a duplicated assertion admitting to being one.
+    ///
+    /// What is *not* stated over both formats stays separate below, because it is not the
+    /// same claim: a width mismatch needs a file whose columns are unnamed, and Parquet
+    /// files always name theirs.
+    #[derive(Copy, Clone, Debug)]
+    enum Format {
+        Csv,
+        Parquet,
+    }
+
+    const FORMATS: [Format; 2] = [Format::Csv, Format::Parquet];
+
+    impl Format {
+        /// The options clause naming this format. CSV carries `HEADER` so that, as a
+        /// Parquet schema does, the file names its own columns.
+        fn clause(self) -> &'static str {
+            match self {
+                Format::Csv => "(FORMAT CSV, HEADER)",
+                Format::Parquet => "(FORMAT PARQUET)",
+            }
+        }
+
+        fn extension(self) -> &'static str {
+            match self {
+                Format::Csv => "csv",
+                Format::Parquet => "parquet",
+            }
+        }
+
+        /// A one-row file whose columns are `columns`, each row holding the column's own
+        /// name as its value — the values are never asserted on, only the mapping is.
+        async fn file(self, name: &str, columns: &[&str]) -> String {
+            match self {
+                Format::Csv => {
+                    let row = columns.join(",");
+                    write_csv(name, &format!("{row}\n{row}\n"))
+                }
+                Format::Parquet => write_parquet(name, columns).await,
+            }
+        }
+
+        /// A path of this format that was never written.
+        fn absent_path(self) -> String {
+            std::env::temp_dir()
+                .join(format!("vairedb_copy_does_not_exist.{}", self.extension()))
+                .to_str()
+                .unwrap()
+                .to_string()
         }
     }
 
-    // Both directions name the table they could not find, rather than failing later
-    // as a planner or file error.
+    /// The SQLSTATE and message a COPY reports to the client.
+    async fn copy_rejection(handler: &VaireDbQueryHandler, sql: &str) -> (String, String) {
+        let session = SessionState::default();
+        user_error(
+            handler
+                .handle_copy(&parse_one(sql), &session)
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("`{sql}` must be rejected")),
+        )
+    }
+
+    // The table is resolved before the file is opened, so both directions name the table
+    // they could not find rather than failing later as a planner or file error. Asserted
+    // against a file that does exist, so "42P01" cannot be the file's absence wearing the
+    // wrong code.
     #[tokio::test]
     async fn a_copy_of_an_unknown_table_is_a_table_error() {
         let handler = VaireDbQueryHandler::for_tests(false);
-        for sql in [
-            "COPY nowhere TO '/tmp/nowhere.csv' (FORMAT CSV)",
-            "COPY nowhere FROM '/tmp/nowhere.csv' (FORMAT CSV)",
-        ] {
-            let (code, msg) = copy_rejection(&handler, sql).await;
-            assert_eq!(code, "42P01", "`{sql}`");
-            assert!(msg.contains("nowhere"), "`{sql}` got: {msg}");
+        for format in FORMATS {
+            let path = format.file("unknown_table", &["id", "v"]).await;
+            for direction in ["TO", "FROM"] {
+                let sql = format!("COPY nowhere {direction} '{path}' {}", format.clause());
+                let (code, msg) = copy_rejection(&handler, &sql).await;
+                assert_eq!(code, "42P01", "`{sql}`");
+                assert!(msg.contains("nowhere"), "`{sql}` got: {msg}");
+            }
         }
     }
 
@@ -1491,34 +1535,35 @@ mod tests {
         let handler = VaireDbQueryHandler::for_tests(false);
         register(&handler, "orders", &["id", "v"]);
 
-        let missing = std::env::temp_dir().join("vairedb_copy_does_not_exist.csv");
-        let (_code, msg) = copy_rejection(
-            &handler,
-            &format!(
-                "COPY orders FROM '{}' (FORMAT CSV, HEADER)",
-                missing.display()
-            ),
-        )
-        .await;
-        assert!(msg.contains("coordinator"), "got: {msg}");
-        assert!(msg.contains("vairedb_copy_does_not_exist"), "got: {msg}");
+        for format in FORMATS {
+            let sql = format!(
+                "COPY orders FROM '{}' {}",
+                format.absent_path(),
+                format.clause()
+            );
+            let (_code, msg) = copy_rejection(&handler, &sql).await;
+            assert!(msg.contains("coordinator"), "`{sql}` got: {msg}");
+            assert!(
+                msg.contains("vairedb_copy_does_not_exist"),
+                "`{sql}` got: {msg}"
+            );
+        }
     }
 
-    // A header naming a column the table does not have is refused by name: the
+    // A file naming a column the table does not have is refused by name: the
     // alternative is dropping the field, which loses data without saying so.
     #[tokio::test]
     async fn a_file_column_the_table_does_not_have_is_refused() {
         let handler = VaireDbQueryHandler::for_tests(false);
         register(&handler, "orders", &["id", "v"]);
-        let path = write_csv("unknown_column", "id,nope\n1,x\n");
 
-        let (code, msg) = copy_rejection(
-            &handler,
-            &format!("COPY orders FROM '{path}' (FORMAT CSV, HEADER)"),
-        )
-        .await;
-        assert_eq!(code, "42703");
-        assert!(msg.contains("nope"), "got: {msg}");
+        for format in FORMATS {
+            let path = format.file("unknown_column", &["id", "nope"]).await;
+            let sql = format!("COPY orders FROM '{path}' {}", format.clause());
+            let (code, msg) = copy_rejection(&handler, &sql).await;
+            assert_eq!(code, "42703", "`{sql}` got: {msg}");
+            assert!(msg.contains("nope"), "`{sql}` got: {msg}");
+        }
     }
 
     // Every row is placed by hashing its shard key, so a file without that column
@@ -1527,16 +1572,15 @@ mod tests {
     async fn an_import_without_the_shard_key_is_refused() {
         let handler = VaireDbQueryHandler::for_tests(false);
         register(&handler, "orders", &["id", "v"]);
-        let path = write_csv("no_shard_key", "v\nx\n");
 
-        let (code, msg) = copy_rejection(
-            &handler,
-            &format!("COPY orders (v) FROM '{path}' (FORMAT CSV, HEADER)"),
-        )
-        .await;
-        assert_eq!(code, "42601");
-        assert!(msg.contains("shard key"), "got: {msg}");
-        assert!(msg.contains("\"id\""), "got: {msg}");
+        for format in FORMATS {
+            let path = format.file("no_shard_key", &["v"]).await;
+            let sql = format!("COPY orders FROM '{path}' {}", format.clause());
+            let (code, msg) = copy_rejection(&handler, &sql).await;
+            assert_eq!(code, "42601", "`{sql}` got: {msg}");
+            assert!(msg.contains("shard key"), "`{sql}` got: {msg}");
+            assert!(msg.contains("\"id\""), "`{sql}` got: {msg}");
+        }
     }
 
     // A file wider than the columns it is being mapped onto would silently shift
@@ -1788,150 +1832,22 @@ mod tests {
 
     // The rows in the file are read, mapped and validated; what stops this import
     // is that the cluster has no shards to ship them to — reported as such, with
-    // nothing written.
+    // nothing written. This is what makes the four refusals above scoped rather than
+    // total: a check that refused everything would pass all of them and fail here.
     #[tokio::test]
     async fn a_valid_import_gets_as_far_as_routing_the_rows() {
         let handler = VaireDbQueryHandler::for_tests(false);
         register(&handler, "orders", &["id", "v"]);
-        let path = write_csv("routable", "id,v\n1,x\n2,y\n");
 
-        // No shards are assigned in a test handler, so routing is where it stops.
-        let (_code, msg) = copy_rejection(
-            &handler,
-            &format!("COPY orders FROM '{path}' (FORMAT CSV, HEADER)"),
-        )
-        .await;
-        assert!(
-            !msg.contains("column") && !msg.contains("shard key"),
-            "the file must have been read and mapped, got: {msg}"
-        );
-    }
-
-    // --- the handler, importing Parquet ---
-
-    /// Write a Parquet file naming `columns` and holding one row, returning its path.
-    /// Written through the export path, so what the import reads is what an export
-    /// produces.
-    async fn write_parquet(name: &str, columns: &[&str]) -> String {
-        use std::sync::Arc;
-
-        use datafusion::arrow::array::StringArray;
-        use datafusion::arrow::datatypes::{DataType, Field, Schema};
-
-        let schema = Arc::new(Schema::new(
-            columns
-                .iter()
-                .map(|c| Field::new(*c, DataType::Utf8, true))
-                .collect::<Vec<_>>(),
-        ));
-        let batch = RecordBatch::try_new(
-            SchemaRef::clone(&schema),
-            columns
-                .iter()
-                .map(|c| Arc::new(StringArray::from(vec![*c])) as _)
-                .collect(),
-        )
-        .unwrap();
-
-        let path = std::env::temp_dir()
-            .join(format!(
-                "vairedb_copy_test_{}_{name}.parquet",
-                std::process::id()
-            ))
-            .to_str()
-            .unwrap()
-            .to_string();
-        copy_parquet::write_file(path.clone(), schema, vec![batch])
-            .await
-            .unwrap();
-        path
-    }
-
-    // The table is resolved before the file is opened, so an import into a table that
-    // does not exist says so rather than reporting whatever the file turned out to be.
-    #[tokio::test]
-    async fn a_parquet_import_of_an_unknown_table_is_a_table_error() {
-        let handler = VaireDbQueryHandler::for_tests(false);
-        let path = write_parquet("unknown_table", &["id", "v"]).await;
-
-        let (code, msg) = copy_rejection(
-            &handler,
-            &format!("COPY nowhere FROM '{path}' (FORMAT PARQUET)"),
-        )
-        .await;
-        assert_eq!(code, "42P01");
-        assert!(msg.contains("nowhere"), "got: {msg}");
-    }
-
-    // The same message as the CSV lane: the path is the coordinator's, not the
-    // client's, and a client hunting for it locally would not find it.
-    #[tokio::test]
-    async fn a_missing_parquet_file_is_reported_against_the_coordinator() {
-        let handler = VaireDbQueryHandler::for_tests(false);
-        register(&handler, "orders", &["id", "v"]);
-
-        let missing = std::env::temp_dir().join("vairedb_copy_does_not_exist.parquet");
-        let (_code, msg) = copy_rejection(
-            &handler,
-            &format!("COPY orders FROM '{}' (FORMAT PARQUET)", missing.display()),
-        )
-        .await;
-        assert!(msg.contains("coordinator"), "got: {msg}");
-        assert!(msg.contains("vairedb_copy_does_not_exist"), "got: {msg}");
-    }
-
-    // A Parquet file names its own columns, so a column the table does not have is
-    // refused by name — dropping it would lose data without saying so.
-    #[tokio::test]
-    async fn a_parquet_column_the_table_does_not_have_is_refused() {
-        let handler = VaireDbQueryHandler::for_tests(false);
-        register(&handler, "orders", &["id", "v"]);
-        let path = write_parquet("unknown_column", &["id", "nope"]).await;
-
-        let (code, msg) = copy_rejection(
-            &handler,
-            &format!("COPY orders FROM '{path}' (FORMAT PARQUET)"),
-        )
-        .await;
-        assert_eq!(code, "42703");
-        assert!(msg.contains("nope"), "got: {msg}");
-    }
-
-    // Every row is placed by hashing its shard key, so a file without that column has
-    // nowhere to go. Refused before a single row is read.
-    #[tokio::test]
-    async fn a_parquet_import_without_the_shard_key_is_refused() {
-        let handler = VaireDbQueryHandler::for_tests(false);
-        register(&handler, "orders", &["id", "v"]);
-        let path = write_parquet("no_shard_key", &["v"]).await;
-
-        let (code, msg) = copy_rejection(
-            &handler,
-            &format!("COPY orders FROM '{path}' (FORMAT PARQUET)"),
-        )
-        .await;
-        assert_eq!(code, "42601");
-        assert!(msg.contains("shard key"), "got: {msg}");
-        assert!(msg.contains("\"id\""), "got: {msg}");
-    }
-
-    // As with CSV: the file is opened, its columns mapped and validated, and what
-    // stops the import is that the cluster has no shards to ship the rows to.
-    #[tokio::test]
-    async fn a_valid_parquet_import_gets_as_far_as_routing_the_rows() {
-        let handler = VaireDbQueryHandler::for_tests(false);
-        register(&handler, "orders", &["id", "v"]);
-        let path = write_parquet("routable", &["id", "v"]).await;
-
-        // No shards are assigned in a test handler, so routing is where it stops.
-        let (_code, msg) = copy_rejection(
-            &handler,
-            &format!("COPY orders FROM '{path}' (FORMAT PARQUET)"),
-        )
-        .await;
-        assert!(
-            !msg.contains("column") && !msg.contains("shard key"),
-            "the file must have been read and mapped, got: {msg}"
-        );
+        for format in FORMATS {
+            let path = format.file("routable", &["id", "v"]).await;
+            // No shards are assigned in a test handler, so routing is where it stops.
+            let sql = format!("COPY orders FROM '{path}' {}", format.clause());
+            let (_code, msg) = copy_rejection(&handler, &sql).await;
+            assert!(
+                !msg.contains("column") && !msg.contains("shard key"),
+                "`{sql}`: the file must have been read and mapped, got: {msg}"
+            );
+        }
     }
 }

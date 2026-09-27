@@ -290,17 +290,11 @@ fn undefined_window(name: &Ident) -> PgWireError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sqlparser::dialect::PostgreSqlDialect;
-    use crate::sqlparser::parser::Parser;
+    use crate::pgwire_handler::read_path_test_helper::parse_verbatim;
 
     /// Parse one statement, expand it, and render the result back to SQL.
     fn expanded(sql: &str) -> Result<String, String> {
-        let mut stmt: Statement = Parser::new(&PostgreSqlDialect {})
-            .try_with_sql(sql)
-            .unwrap()
-            .parse_statements()
-            .unwrap()
-            .remove(0);
+        let mut stmt = parse_verbatim(sql);
         match expand_named_windows(&mut stmt) {
             Ok(()) => Ok(stmt.to_string()),
             Err(e) => Err(e.to_string()),

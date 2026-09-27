@@ -82,22 +82,23 @@ pub(super) async fn encode_dataframe_response(
 /// nested inside a list keeps arrow-pg's mapping, since its element OID is derived
 /// separately.
 pub(crate) fn wire_schema(schema: &Schema) -> Schema {
-    if !schema.fields().iter().any(|f| {
-        wire_type(f.data_type()).is_some() || column_labels::wire_label(f.name()).is_some()
-    }) {
+    // Names first and then types, in two passes rather than one: the two are independent,
+    // and the naming rule belongs to the module that invented the names.
+    let relabelled = column_labels::wire_labels(schema);
+    let schema = relabelled.as_ref().unwrap_or(schema);
+    if !schema
+        .fields()
+        .iter()
+        .any(|f| wire_type(f.data_type()).is_some())
+    {
         return schema.clone();
     }
     let fields: Vec<Field> = schema
         .fields()
         .iter()
-        .map(|f| {
-            let name = column_labels::wire_label(f.name()).unwrap_or(f.name());
-            match wire_type(f.data_type()) {
-                Some(wire) => Field::new(name, wire, f.is_nullable()),
-                // `with_name` rather than `Field::new`, so a field sent as itself keeps
-                // whatever metadata it carries.
-                None => f.as_ref().clone().with_name(name),
-            }
+        .map(|f| match wire_type(f.data_type()) {
+            Some(wire) => Field::new(f.name(), wire, f.is_nullable()),
+            None => f.as_ref().clone(),
         })
         .collect();
     Schema::new_with_metadata(fields, schema.metadata().clone())
@@ -569,6 +570,28 @@ mod tests {
         assert_eq!(wire_schema(&schema), schema);
     }
 
+    /// The other half of this schema's job, and the only place it is undone: the plan keeps
+    /// two columns called `?column?` apart by numbering them, and a client is told the one
+    /// name PostgreSQL has for both. A column whose type also has to be converted is
+    /// renamed as well — one pass must not shadow the other.
+    #[test]
+    fn hands_back_the_label_the_plan_numbered_to_keep_unique() {
+        let schema = Schema::new(vec![
+            Field::new("?column?", DataType::Int32, true),
+            Field::new("?column?\u{0}2", DataType::Int32, true),
+            Field::new("rn\u{0}2", DataType::UInt64, false),
+            Field::new("named", DataType::Int32, true),
+        ]);
+
+        let wire = wire_schema(&schema);
+
+        assert_eq!(
+            wire.fields().iter().map(|f| f.name()).collect::<Vec<_>>(),
+            vec!["?column?", "?column?", "rn", "named"]
+        );
+        assert_eq!(wire.field(2).data_type(), &DataType::Int64);
+    }
+
     /// arrow-pg's encoder writes a `List`; the two other list layouts hold the same
     /// elements but panic inside it rather than returning an error, which takes the
     /// connection with them. They are converted to `List` before an OID is derived.
@@ -676,17 +699,14 @@ mod tests {
         )
         .unwrap();
 
-        match coerce_batch_for_wire(&batch, &wire).expect_err("u64::MAX does not fit in bigint") {
-            PgWireError::UserError(info) => {
-                assert_eq!(info.code, "22003", "numeric_value_out_of_range");
-                assert!(
-                    info.message.contains("\"n\""),
-                    "the message names the column: {}",
-                    info.message
-                );
-            }
-            other => panic!("expected a client-facing error, got {other}"),
-        }
+        let (code, message) = super::super::write_path_test_helper::user_error(
+            coerce_batch_for_wire(&batch, &wire).expect_err("u64::MAX does not fit in bigint"),
+        );
+        assert_eq!(code, "22003", "numeric_value_out_of_range");
+        assert!(
+            message.contains("\"n\""),
+            "the message names the column: {message}"
+        );
     }
 
     // `SELECT NULL` plans to a `NullArray`, which holds no null buffer because it holds

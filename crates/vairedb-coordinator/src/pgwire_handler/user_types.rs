@@ -66,16 +66,8 @@ pub(super) fn user_type_error(what: &str) -> PgWireError {
 
 #[cfg(test)]
 mod tests {
+    use super::super::write_path_test_helper::parse_one;
     use super::*;
-    use crate::pgwire_handler::parser::parse_sql;
-
-    fn parse_one(sql: &str) -> Statement {
-        parse_sql(sql)
-            .unwrap_or_else(|e| panic!("failed to parse `{sql}`: {e}"))
-            .into_iter()
-            .next()
-            .unwrap()
-    }
 
     #[test]
     fn every_spelling_of_a_user_type_is_named() {

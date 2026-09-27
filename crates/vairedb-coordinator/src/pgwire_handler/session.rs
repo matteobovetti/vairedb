@@ -278,18 +278,7 @@ impl SessionState {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn shard(table: &str, bucket: u32, primary: &str, replicas: &[&str]) -> ShardMeta {
-        ShardMeta {
-            shard_id: format!("{table}-{bucket}"),
-            table_name: table.to_string(),
-            primary_node_id: primary.to_string(),
-            replica_node_ids: replicas.iter().map(|r| r.to_string()).collect(),
-            hash_bucket: bucket,
-            range_lower: String::new(),
-            range_upper: String::new(),
-        }
-    }
+    use crate::catalog::catalog_test_helper::shard_meta;
 
     fn write(
         table: &str,
@@ -298,14 +287,13 @@ mod tests {
         replicas: &[&str],
         sql: &str,
     ) -> BufferedWrite {
-        let shard = shard(table, bucket, primary, replicas);
         BufferedWrite {
             statement: BatchStatement {
                 sql: sql.to_string(),
                 params: Vec::new(),
                 shard_id: crate::util::shard_table_name(table, bucket),
             },
-            shard,
+            shard: shard_meta(table, bucket, primary, replicas),
             quorum_size: 1,
             table_name: table.to_string(),
         }

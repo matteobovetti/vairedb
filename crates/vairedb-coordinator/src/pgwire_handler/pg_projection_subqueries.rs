@@ -701,7 +701,7 @@ mod tests {
     }
 
     /// A codec for the in-memory tables these tests register, standing in for the
-    /// [`crate::scheduler::logical_codec::VaireLogicalCodec`] the cluster ships plans with.
+    /// [`crate::scheduler::VaireLogicalCodec`] the cluster ships plans with.
     #[derive(Debug)]
     struct MemTableCodec;
 

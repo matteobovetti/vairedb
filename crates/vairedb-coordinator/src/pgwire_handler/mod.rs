@@ -47,6 +47,10 @@ mod pg_set_op_types;
 mod pg_using_join_merge;
 mod pg_using_join_qualifiers;
 mod pg_using_join_where_keys;
+/// Shared way for a `pg_*` module's tests to ask the read path for a verdict, so a pass
+/// is tested through `parser::plan_select` rather than through a copy of part of it.
+#[cfg(test)]
+mod read_path_test_helper;
 mod schemas;
 mod sequences;
 mod session;
@@ -56,7 +60,9 @@ mod transaction;
 mod user_types;
 mod views;
 
+/// Shared way for a write-path module's tests to parse the statement under test the way the
+/// write path parses it, and to read back the SQLSTATE and message a client would see.
 #[cfg(test)]
-mod test_catalog;
+mod write_path_test_helper;
 
 pub use handler::*;

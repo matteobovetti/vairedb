@@ -2,6 +2,15 @@
 //! nodes silent past a suspect threshold become `Suspect`, and past the full
 //! timeout become `Dead`. Runs on a periodic loop and writes state changes to
 //! the metadata catalog.
+//!
+//! One third of the timeout is both how often the scan runs and how long a
+//! silence has to last to be suspicious, and it is derived **once**. Derived
+//! twice it was floored twice over — the interval at a second, the threshold not
+//! at all — so a timeout under three seconds gave a threshold of zero and every
+//! node, including one that had heartbeated that instant, was demoted to
+//! `Suspect` on the first scan. Nothing recovers from that on its own:
+//! `list_alive_nodes` admits only `Alive`, so shard placement then finds no node
+//! on a cluster where every node is healthy.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -14,21 +23,31 @@ use crate::util::now_unix_secs;
 /// (`Suspect`/`Dead`) when heartbeats lapse.
 pub struct FailureDetector {
     catalog: Arc<MetadataCatalog>,
-    heartbeat_timeout_secs: u64,
+    /// Silence at or past this many seconds means `Dead`.
+    dead_after_secs: u64,
+    /// Silence at or past this many seconds means `Suspect`. Never zero, so a
+    /// node that has just been heard from is never demoted.
+    suspect_after_secs: u64,
     check_interval: Duration,
 }
 
 impl FailureDetector {
-    /// Create a detector. The scan interval is derived as one third of the
-    /// timeout (at least one second), so lapses are noticed well within the
-    /// timeout window.
+    /// Create a detector from the heartbeat timeout.
+    ///
+    /// The scan interval and the suspect threshold are the same third of the
+    /// timeout, floored together at one second: the scan has to be frequent
+    /// enough to notice a lapse well inside the timeout window, and there is no
+    /// point suspecting a node sooner than we look at it. A timeout of one or
+    /// two seconds leaves no room between the two thresholds, so such a node
+    /// goes straight from `Alive` to `Dead` — which is the honest reading of a
+    /// timeout that short, and is not the same thing as suspecting every node.
     pub fn new(catalog: Arc<MetadataCatalog>, heartbeat_timeout_secs: u64) -> Self {
-        let check_interval =
-            Duration::from_secs(heartbeat_timeout_secs / 3).max(Duration::from_secs(1));
+        let third = (heartbeat_timeout_secs / 3).max(1);
         Self {
             catalog,
-            heartbeat_timeout_secs,
-            check_interval,
+            dead_after_secs: heartbeat_timeout_secs,
+            suspect_after_secs: third,
+            check_interval: Duration::from_secs(third),
         }
     }
 
@@ -45,23 +64,23 @@ impl FailureDetector {
         loop {
             tokio::time::sleep(self.check_interval).await;
 
-            if let Err(e) = self.check_nodes() {
+            if let Err(e) = self.check_nodes(now_unix_secs()) {
                 tracing::error!(error = %e, "failure detector scan error");
             }
         }
     }
 
-    /// Scan all nodes once: mark a node `Dead` if its last heartbeat is older
-    /// than the timeout, or `Suspect` if it is past one third of the timeout and
-    /// still `Alive`. Already-dead nodes are skipped; a missing heartbeat
-    /// timestamp counts as never seen (effectively dead).
-    fn check_nodes(&self) -> Result<()> {
-        let nodes = self.catalog.list_all_nodes()?;
-        let now = now_unix_secs();
-
-        let suspect_threshold = self.heartbeat_timeout_secs / 3;
-
-        for node in nodes {
+    /// Scan all nodes once against `now`: mark a node `Dead` if its last
+    /// heartbeat is at or past the timeout, or `Suspect` if it is at or past the
+    /// suspect threshold and still `Alive`. Already-dead nodes are skipped; a
+    /// missing heartbeat timestamp counts as never seen, which is effectively
+    /// dead.
+    ///
+    /// `now` is a parameter rather than read here so that a test can sit exactly
+    /// on a threshold: both comparisons are inclusive, and a scan that read its
+    /// own clock made every boundary case a race with the second hand.
+    fn check_nodes(&self, now: u64) -> Result<()> {
+        for node in self.catalog.list_all_nodes()? {
             if node.state == NodeState::Dead as i32 {
                 continue;
             }
@@ -73,7 +92,7 @@ impl FailureDetector {
                 .unwrap_or(0);
             let elapsed = now.saturating_sub(last_hb_secs);
 
-            if elapsed >= self.heartbeat_timeout_secs {
+            if elapsed >= self.dead_after_secs {
                 tracing::warn!(
                     node_id = %node.node_id,
                     elapsed_secs = elapsed,
@@ -81,7 +100,7 @@ impl FailureDetector {
                 );
                 self.catalog
                     .update_node_state(&node.node_id, NodeState::Dead)?;
-            } else if elapsed >= suspect_threshold && node.state == NodeState::Alive as i32 {
+            } else if elapsed >= self.suspect_after_secs && node.state == NodeState::Alive as i32 {
                 tracing::info!(
                     node_id = %node.node_id,
                     elapsed_secs = elapsed,
@@ -99,154 +118,135 @@ impl FailureDetector {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::{AtomicU32, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use crate::catalog::NodeMeta;
+    use crate::catalog::catalog_test_helper::scratch_catalog;
 
-    use crate::catalog::{MetadataCatalog, NodeMeta};
+    /// The instant every scan in these tests is run at. Fixed, so a node's
+    /// silence is exact and a threshold can be landed on rather than approached.
+    const NOW: u64 = 1_700_000_000;
 
-    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    /// A 30-second timeout, whose third is 10 — comfortably above the floor, so
+    /// the two thresholds are distinct and both are reachable.
+    const TIMEOUT: u64 = 30;
 
-    fn temp_db_path() -> String {
-        let id = COUNTER.fetch_add(1, Ordering::Relaxed);
-        format!(
-            "/tmp/vairedb_test_fd_unit_{}_{}.redb",
-            std::process::id(),
-            id
-        )
+    fn catalog() -> Arc<MetadataCatalog> {
+        Arc::new(scratch_catalog("failure_detector"))
     }
 
-    fn make_catalog() -> Arc<MetadataCatalog> {
-        Arc::new(MetadataCatalog::open(&temp_db_path()).unwrap())
+    /// An `Alive` node last heard from `silent_for` seconds before [`NOW`].
+    fn node_silent_for(catalog: &MetadataCatalog, node_id: &str, silent_for: u64) {
+        put_node(catalog, node_id, Some(NOW - silent_for));
     }
 
-    fn insert_node_with_heartbeat(
-        catalog: &MetadataCatalog,
-        node_id: &str,
-        heartbeat_secs_ago: u64,
-    ) {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        let last_hb = now.saturating_sub(heartbeat_secs_ago);
-
-        let node = NodeMeta {
-            node_id: node_id.to_string(),
-            advertised_address: "10.0.0.1:50041".to_string(),
-            state: NodeState::Alive as i32,
-            last_heartbeat: Some(prost_types::Timestamp {
-                seconds: last_hb as i64,
-                nanos: 0,
-            }),
-            registered_at: Some(prost_types::Timestamp {
-                seconds: now as i64,
-                nanos: 0,
-            }),
-        };
-        catalog.put_node(&node).unwrap();
+    fn put_node(catalog: &MetadataCatalog, node_id: &str, last_heartbeat_secs: Option<u64>) {
+        catalog
+            .put_node(&NodeMeta {
+                node_id: node_id.to_string(),
+                advertised_address: "10.0.0.1:50041".to_string(),
+                state: NodeState::Alive as i32,
+                last_heartbeat: last_heartbeat_secs.map(|secs| prost_types::Timestamp {
+                    seconds: secs as i64,
+                    nanos: 0,
+                }),
+                registered_at: None,
+            })
+            .unwrap();
     }
 
+    fn state_of(catalog: &MetadataCatalog, node_id: &str) -> i32 {
+        catalog.get_node(node_id).unwrap().unwrap().state
+    }
+
+    /// What a scan makes of each length of silence, including both boundaries.
+    ///
+    /// The comparisons are inclusive, so a node silent for exactly the threshold
+    /// is already demoted; the second below it is not. Asserted in one catalog
+    /// and one scan, because the states are decided per node and a scan that
+    /// handled a mixture differently than a single node would be the bug worth
+    /// catching.
     #[test]
-    fn test_failure_detector_marks_node_suspect() {
-        let catalog = make_catalog();
-        let timeout_secs = 30;
-        let suspect_threshold = timeout_secs / 3;
+    fn a_scan_demotes_each_node_by_how_long_it_has_been_silent() {
+        let third = TIMEOUT / 3;
+        let cases = [
+            ("fresh", 0, NodeState::Alive),
+            ("nearly_suspect", third - 1, NodeState::Alive),
+            ("just_suspect", third, NodeState::Suspect),
+            ("nearly_dead", TIMEOUT - 1, NodeState::Suspect),
+            ("just_dead", TIMEOUT, NodeState::Dead),
+            ("long_dead", TIMEOUT * 10, NodeState::Dead),
+        ];
 
-        insert_node_with_heartbeat(&catalog, "node-1", suspect_threshold + 1);
+        let catalog = catalog();
+        for (node_id, silent_for, _) in cases {
+            node_silent_for(&catalog, node_id, silent_for);
+        }
 
-        let detector = FailureDetector::new(Arc::clone(&catalog), timeout_secs);
-        detector.check_nodes().unwrap();
+        FailureDetector::new(Arc::clone(&catalog), TIMEOUT)
+            .check_nodes(NOW)
+            .unwrap();
 
-        let node = catalog.get_node("node-1").unwrap().unwrap();
-        assert_eq!(node.state, NodeState::Suspect as i32);
+        for (node_id, silent_for, expected) in cases {
+            assert_eq!(
+                state_of(&catalog, node_id),
+                expected as i32,
+                "a node silent for {silent_for}s of a {TIMEOUT}s timeout must be {expected:?}"
+            );
+        }
     }
 
+    /// The regression the single derivation exists for. `timeout / 3` truncates
+    /// to zero below three seconds, and a zero threshold is met by a node that
+    /// has just been heard from — so every node was suspected on the first scan,
+    /// and none could hold a shard afterwards.
     #[test]
-    fn test_failure_detector_marks_node_dead() {
-        let catalog = make_catalog();
-        let timeout_secs = 30;
+    fn a_timeout_too_short_to_have_thirds_still_leaves_a_fresh_node_alive() {
+        for timeout in [1, 2, 3] {
+            let catalog = catalog();
+            node_silent_for(&catalog, "node-1", 0);
 
-        insert_node_with_heartbeat(&catalog, "node-1", timeout_secs + 1);
+            FailureDetector::new(Arc::clone(&catalog), timeout)
+                .check_nodes(NOW)
+                .unwrap();
 
-        let detector = FailureDetector::new(Arc::clone(&catalog), timeout_secs);
-        detector.check_nodes().unwrap();
-
-        let node = catalog.get_node("node-1").unwrap().unwrap();
-        assert_eq!(node.state, NodeState::Dead as i32);
+            assert_eq!(
+                state_of(&catalog, "node-1"),
+                NodeState::Alive as i32,
+                "a node that heartbeated this instant must survive a {timeout}s timeout"
+            );
+        }
     }
 
+    /// A `Dead` node is left as it is rather than re-examined. Its heartbeat is
+    /// older than ever, so a scan that reconsidered it would rewrite the same
+    /// state on every pass; coming back is the registration path's business, not
+    /// the detector's.
     #[test]
-    fn test_failure_detector_skips_dead_nodes() {
-        let catalog = make_catalog();
-        let timeout_secs = 30;
-
-        insert_node_with_heartbeat(&catalog, "node-1", timeout_secs + 100);
+    fn a_dead_node_is_not_revisited() {
+        let catalog = catalog();
+        node_silent_for(&catalog, "node-1", TIMEOUT * 10);
         catalog
             .update_node_state("node-1", NodeState::Dead)
             .unwrap();
 
-        let detector = FailureDetector::new(Arc::clone(&catalog), timeout_secs);
-        detector.check_nodes().unwrap();
+        FailureDetector::new(Arc::clone(&catalog), TIMEOUT)
+            .check_nodes(NOW)
+            .unwrap();
 
-        let node = catalog.get_node("node-1").unwrap().unwrap();
-        assert_eq!(node.state, NodeState::Dead as i32);
+        assert_eq!(state_of(&catalog, "node-1"), NodeState::Dead as i32);
     }
 
+    /// No heartbeat at all reads as never seen, not as just seen. Treating a
+    /// missing timestamp as `now` would keep a node that never reported itself
+    /// eligible for shards forever.
     #[test]
-    fn test_failure_detector_leaves_healthy_node_alive() {
-        let catalog = make_catalog();
-        let timeout_secs = 30;
+    fn a_node_that_has_never_heartbeated_is_dead() {
+        let catalog = catalog();
+        put_node(&catalog, "no-hb-node", None);
 
-        insert_node_with_heartbeat(&catalog, "node-1", 2);
+        FailureDetector::new(Arc::clone(&catalog), TIMEOUT)
+            .check_nodes(NOW)
+            .unwrap();
 
-        let detector = FailureDetector::new(Arc::clone(&catalog), timeout_secs);
-        detector.check_nodes().unwrap();
-
-        let node = catalog.get_node("node-1").unwrap().unwrap();
-        assert_eq!(node.state, NodeState::Alive as i32);
-    }
-
-    #[test]
-    fn test_failure_detector_mixed_node_states() {
-        let catalog = make_catalog();
-        let timeout_secs = 30;
-        let suspect_threshold = timeout_secs / 3;
-
-        insert_node_with_heartbeat(&catalog, "healthy", 2);
-        insert_node_with_heartbeat(&catalog, "suspect", suspect_threshold + 1);
-        insert_node_with_heartbeat(&catalog, "dead", timeout_secs + 1);
-
-        let detector = FailureDetector::new(Arc::clone(&catalog), timeout_secs);
-        detector.check_nodes().unwrap();
-
-        let healthy = catalog.get_node("healthy").unwrap().unwrap();
-        assert_eq!(healthy.state, NodeState::Alive as i32);
-
-        let suspect = catalog.get_node("suspect").unwrap().unwrap();
-        assert_eq!(suspect.state, NodeState::Suspect as i32);
-
-        let dead = catalog.get_node("dead").unwrap().unwrap();
-        assert_eq!(dead.state, NodeState::Dead as i32);
-    }
-
-    #[test]
-    fn test_failure_detector_node_without_heartbeat_timestamp() {
-        let catalog = make_catalog();
-        let timeout_secs = 30;
-
-        let node = NodeMeta {
-            node_id: "no-hb-node".to_string(),
-            advertised_address: "10.0.0.1:50041".to_string(),
-            state: NodeState::Alive as i32,
-            last_heartbeat: None,
-            registered_at: None,
-        };
-        catalog.put_node(&node).unwrap();
-
-        let detector = FailureDetector::new(Arc::clone(&catalog), timeout_secs);
-        detector.check_nodes().unwrap();
-
-        let updated = catalog.get_node("no-hb-node").unwrap().unwrap();
-        assert_eq!(updated.state, NodeState::Dead as i32);
+        assert_eq!(state_of(&catalog, "no-hb-node"), NodeState::Dead as i32);
     }
 }

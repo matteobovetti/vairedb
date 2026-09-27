@@ -1,29 +1,73 @@
+//! Loading the coordinator's configuration from a file: what a complete file yields, and
+//! which fields it may not leave out.
+//!
+//! Reading, parsing and refusing are not asserted here. They belong to
+//! `vairedb_common::config`, which has its own tests for a file that is missing, one that is
+//! not YAML, and one whose values a node cannot run on; repeating them per crate only
+//! duplicates the coverage and leaves two places to update. What is specific to this crate
+//! is the *field set* — that a complete file yields every value, and that none of the fields
+//! has quietly acquired a default — and the rules, which are a pure function of the struct
+//! and are tested beside it in `config/config.rs`.
+
 use std::io::Write;
-use std::path::Path;
+
+use tempfile::NamedTempFile;
 
 use vairedb_coordinator::config::CoordinatorConfig;
 
-#[test]
-fn test_from_file_full() {
-    let yaml = r#"
-log_level: debug
-metadata_dir: /tmp/test_meta
-grpc_listen_addr: "127.0.0.1:9000"
-pg_listen_addr: "127.0.0.1:9001"
-heartbeat_timeout_secs: 30
-default_replication_factor: 5
-allow_cross_shard_transactions: true
-tail_retry_initial_ms: 200
-tail_retry_max_ms: 10000
-ballista_scheduler_listen_addr: "127.0.0.1:50050"
-"#;
-    let path = "/tmp/vairedb_test_config_full.yml";
-    let mut f = std::fs::File::create(path).unwrap();
-    f.write_all(yaml.as_bytes()).unwrap();
+/// A complete, valid configuration as `(field, YAML value)` pairs.
+///
+/// Every test starts from this and states only what it changes, so a field added to
+/// `CoordinatorConfig` is written here once rather than in a ten-line literal per test — the
+/// shape this file had, where a new field meant editing four near-identical blocks and the
+/// one that was missed failed as "missing field" in an unrelated test.
+fn valid_fields() -> Vec<(&'static str, &'static str)> {
+    vec![
+        ("log_level", "debug"),
+        ("metadata_dir", "/tmp/vairedb-test-meta"),
+        ("grpc_listen_addr", "\"127.0.0.1:9000\""),
+        ("pg_listen_addr", "\"127.0.0.1:9001\""),
+        ("heartbeat_timeout_secs", "30"),
+        ("default_replication_factor", "5"),
+        ("allow_cross_shard_transactions", "true"),
+        ("tail_retry_initial_ms", "200"),
+        ("tail_retry_max_ms", "10000"),
+        ("ballista_scheduler_listen_addr", "\"127.0.0.1:50050\""),
+    ]
+}
 
-    let config = CoordinatorConfig::from_file(Path::new(path)).unwrap();
+/// Write `fields` to a temp file and load it.
+///
+/// The file is a [`NamedTempFile`]: its name is unique, so two `cargo test` runs at once
+/// cannot read each other's file, and it is removed in `Drop` rather than on the last line of
+/// a test — a failing assertion panics, so cleaning up at the end leaks the file exactly when
+/// the test failed, and the next run then reads the previous run's leftovers.
+fn load(fields: &[(&str, &str)]) -> Result<CoordinatorConfig, String> {
+    let mut file = NamedTempFile::new().expect("the temp directory is writable");
+    for (field, value) in fields {
+        writeln!(file, "{field}: {value}").expect("the temp file is writable");
+    }
+
+    CoordinatorConfig::from_file(file.path()).map_err(|e| e.to_string())
+}
+
+/// The valid configuration with `field` left out.
+fn without(field: &str) -> Vec<(&'static str, &'static str)> {
+    valid_fields()
+        .into_iter()
+        .filter(|(name, _)| *name != field)
+        .collect()
+}
+
+/// Every value survives the round trip. Without this, nothing here would notice a loader that
+/// only ever failed: the other test is about an error, which a never-succeeding `from_file`
+/// satisfies on its own.
+#[test]
+fn a_complete_file_loads_every_field() {
+    let config = load(&valid_fields()).expect("the file is a complete configuration");
+
     assert_eq!(config.log_level, "debug");
-    assert_eq!(config.metadata_dir, "/tmp/test_meta");
+    assert_eq!(config.metadata_dir, "/tmp/vairedb-test-meta");
     assert_eq!(config.grpc_listen_addr, "127.0.0.1:9000");
     assert_eq!(config.pg_listen_addr, "127.0.0.1:9001");
     assert_eq!(config.heartbeat_timeout_secs, 30);
@@ -32,97 +76,22 @@ ballista_scheduler_listen_addr: "127.0.0.1:50050"
     assert_eq!(config.tail_retry_initial_ms, 200);
     assert_eq!(config.tail_retry_max_ms, 10000);
     assert_eq!(config.ballista_scheduler_listen_addr, "127.0.0.1:50050");
-
-    std::fs::remove_file(path).ok();
 }
 
+/// "All fields are required — there are no defaults" is the documented contract, and it is
+/// asserted for every field rather than for one of them.
+///
+/// A `#[serde(default)]` added to any single field would make a coordinator start on a value
+/// nobody wrote, which is the kind of thing that is only noticed in production; asserting one
+/// field would not catch it in the other nine.
 #[test]
-fn test_from_file_missing_field_errors() {
-    let yaml = r#"
-log_level: info
-metadata_dir: data/coordinator
-grpc_listen_addr: "0.0.0.0:50040"
-pg_listen_addr: "0.0.0.0:5432"
-heartbeat_timeout_secs: 15
-default_replication_factor: 3
-tail_retry_initial_ms: 100
-"#;
-    let path = "/tmp/vairedb_test_config_missing_field.yml";
-    let mut f = std::fs::File::create(path).unwrap();
-    f.write_all(yaml.as_bytes()).unwrap();
+fn no_field_has_a_default_and_leaving_any_one_out_is_refused() {
+    for (field, _) in valid_fields() {
+        let error = load(&without(field)).expect_err("a field is missing");
 
-    let result = CoordinatorConfig::from_file(Path::new(path));
-    assert!(result.is_err());
-    let err_msg = result.unwrap_err().to_string();
-    assert!(
-        err_msg.contains("missing field"),
-        "expected 'missing field' in error, got: {err_msg}"
-    );
-
-    std::fs::remove_file(path).ok();
-}
-
-#[test]
-fn test_from_file_empty_errors() {
-    let yaml = "{}";
-    let path = "/tmp/vairedb_test_config_empty.yml";
-    let mut f = std::fs::File::create(path).unwrap();
-    f.write_all(yaml.as_bytes()).unwrap();
-
-    let result = CoordinatorConfig::from_file(Path::new(path));
-    assert!(result.is_err());
-
-    std::fs::remove_file(path).ok();
-}
-
-#[test]
-fn test_from_file_not_found() {
-    let result = CoordinatorConfig::from_file(Path::new("/tmp/nonexistent_vairedb.yml"));
-    assert!(result.is_err());
-}
-
-#[test]
-fn test_from_file_invalid_yaml() {
-    let invalid_yaml = "{{{{not: valid: yaml: [[[";
-    let path = "/tmp/vairedb_test_config_invalid.yml";
-    let mut f = std::fs::File::create(path).unwrap();
-    f.write_all(invalid_yaml.as_bytes()).unwrap();
-
-    let result = CoordinatorConfig::from_file(Path::new(path));
-    assert!(result.is_err());
-
-    std::fs::remove_file(path).ok();
-}
-
-#[test]
-fn test_from_file_addresses_parseable() {
-    let yaml = r#"
-log_level: info
-metadata_dir: data/coordinator
-grpc_listen_addr: "0.0.0.0:50040"
-pg_listen_addr: "0.0.0.0:5432"
-heartbeat_timeout_secs: 15
-default_replication_factor: 3
-allow_cross_shard_transactions: false
-tail_retry_initial_ms: 100
-tail_retry_max_ms: 5000
-ballista_scheduler_listen_addr: "0.0.0.0:50050"
-"#;
-    let path = "/tmp/vairedb_test_config_parseable.yml";
-    let mut f = std::fs::File::create(path).unwrap();
-    f.write_all(yaml.as_bytes()).unwrap();
-
-    let config = CoordinatorConfig::from_file(Path::new(path)).unwrap();
-
-    let grpc_addr: std::net::SocketAddr = config.grpc_listen_addr.parse().unwrap();
-    assert_eq!(grpc_addr.port(), 50040);
-
-    let pg_addr: std::net::SocketAddr = config.pg_listen_addr.parse().unwrap();
-    assert_eq!(pg_addr.port(), 5432);
-
-    let ballista_addr: std::net::SocketAddr =
-        config.ballista_scheduler_listen_addr.parse().unwrap();
-    assert_eq!(ballista_addr.port(), 50050);
-
-    std::fs::remove_file(path).ok();
+        assert!(
+            error.contains(field),
+            "leaving out {field} must be refused by name; got: {error}"
+        );
+    }
 }

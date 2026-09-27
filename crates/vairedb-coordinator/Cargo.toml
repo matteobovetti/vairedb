@@ -48,3 +48,6 @@ tokio-stream = "0.1"
 tonic = { workspace = true }
 vairedb-common = { workspace = true }
 prost-types = { workspace = true }
+# Config tests need a real file to load, and a uniquely-named one removed on drop rather than
+# a fixed `/tmp` path cleaned up on a test's last line — which leaks it whenever the test fails.
+tempfile = "3"

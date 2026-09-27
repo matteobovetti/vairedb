@@ -185,6 +185,32 @@ async fn test_anonymized_update_stores_digest() {
         Some(hmac_sha256_hex(secret_key, "Bob").as_str())
     );
 
+    // A multi-column `SET (a, b) = (…)` names its columns in the assignment target
+    // and carries their values in one row constructor, so the per-assignment rewrite
+    // has no single value to hash. It is refused rather than passed over — passing it
+    // over is what once wrote the plaintext to the shard. The single-column form
+    // above is the neighbour that loses no clause and still answers; the refusal's
+    // wording is pinned by the unit test beside the code that writes it.
+    let err = execute(
+        &client,
+        &format!("UPDATE {tbl} SET (id, name) = (1, 'Carol') WHERE id = 1"),
+    )
+    .await
+    .expect_err("a multi-column assignment to an anonymized column must be refused");
+    assert!(
+        format!("{err}").contains("name"),
+        "the refusal must name the column: {err}"
+    );
+
+    // And the refused statement changed nothing: no plaintext, still Bob's digest.
+    let rows = simple_query_rows(&client, &format!("SELECT name FROM {tbl} WHERE id = 1"))
+        .await
+        .unwrap();
+    assert_eq!(
+        rows[0][0].as_deref(),
+        Some(hmac_sha256_hex(secret_key, "Bob").as_str())
+    );
+
     drop_table(&client, &tbl).await;
 }
 

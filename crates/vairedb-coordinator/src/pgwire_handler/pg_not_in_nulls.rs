@@ -207,13 +207,14 @@ fn unsupported(in_subquery: &InSubquery) -> PgWireError {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::sync::Arc;
 
     use datafusion::arrow::array::{Int32Array, StringArray};
     use datafusion::arrow::datatypes::{DataType, Field, Schema};
     use datafusion::arrow::record_batch::RecordBatch;
     use datafusion::prelude::SessionContext;
+
+    use super::super::read_path_test_helper;
 
     /// `l(id int4 NOT NULL, k int4, v text)` and `r(id int4 NOT NULL, k int4, w text)` — the
     /// pair the e2e `NOT IN` tests use, with `id` non-nullable so the two-valued case is
@@ -240,24 +241,16 @@ mod tests {
         ctx
     }
 
-    /// The verdict on `sql` at the point `plan_select` asks for it: planned, not yet
-    /// coerced. `Err` carries the client-facing message.
-    async fn verdict(sql: &str) -> Result<(), String> {
-        let ctx = ctx();
-        let plan = ctx.state().create_logical_plan(sql).await.unwrap();
-        reject_null_unaware_not_in(&plan).map_err(|e| e.to_string())
-    }
-
+    /// Both verdicts are taken through the whole read path rather than by calling this
+    /// pass on a plan DataFusion produced on its own, because the AST rewrite that
+    /// respells most `NOT IN` shapes runs upstream of this check: a test that skipped it
+    /// would be judging statements the check never sees.
     async fn refusal(sql: &str) -> String {
-        verdict(sql)
-            .await
-            .expect_err(&format!("`{sql}` must be refused"))
+        read_path_test_helper::refusal(&ctx(), sql).await
     }
 
     async fn accepted(sql: &str) {
-        if let Err(e) = verdict(sql).await {
-            panic!("`{sql}` must be accepted, got: {e}");
-        }
+        read_path_test_helper::accepted(&ctx(), sql).await
     }
 
     /// The gap: a correlated `NOT IN` over a nullable key, which answered one row too many.
@@ -339,26 +332,19 @@ mod tests {
     /// `count(*)`, with no `InSubquery` left to judge — so the two halves do not overlap.
     #[tokio::test]
     async fn a_respelled_not_in_has_nothing_left_to_refuse() {
-        // `parse_sql` is where the respelling happens, so this is the statement the read
-        // path would actually plan — an uncorrelated `NOT IN` over a nullable key, which
-        // this check would refuse if the rewrite had not already taken it.
+        // An uncorrelated `NOT IN` over a nullable key — which this check would refuse if
+        // the upstream rewrite had not already taken it, so the acceptance below is only
+        // meaningful alongside the assertion that the respelling happened.
         let sql = "SELECT id FROM l WHERE k NOT IN (SELECT k FROM r)";
         let stmt = crate::pgwire_handler::parser::parse_sql(sql)
-            .unwrap()
+            .expect("parses")
             .pop()
-            .unwrap();
+            .expect("one statement");
         assert!(
             !stmt.to_string().contains("NOT IN"),
             "`{sql}` should be respelled, got: {stmt}"
         );
-        let plan = ctx()
-            .state()
-            .statement_to_plan(datafusion::sql::parser::Statement::Statement(Box::new(
-                stmt,
-            )))
-            .await
-            .unwrap();
-        assert!(reject_null_unaware_not_in(&plan).is_ok());
+        accepted(sql).await;
     }
 
     /// A `NOT IN` in a select list is not this check's business either: it is answered, by

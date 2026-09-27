@@ -142,6 +142,46 @@ impl MetadataCatalog {
         Ok(results)
     }
 
+    /// Claim `key` in `table`: encode and store `value` only if `key` is free in
+    /// `table` *and* in every table of `also_taken_in`, and report whether the
+    /// claim succeeded.
+    ///
+    /// The existence checks and the write share one redb write transaction, and
+    /// redb admits a single writer at a time, so two concurrent claims of one name
+    /// cannot both observe "absent". A check-then-put sequence instead lets both
+    /// callers pass the check and both go on to assign shards and broadcast DDL —
+    /// two shard layouts for one catalog key, the second silently overwriting the
+    /// first.
+    ///
+    /// `also_taken_in` exists because relations of different kinds are stored in
+    /// separate redb tables while sharing one SQL namespace: a view name is taken
+    /// by a table of that name, and the other way round.
+    fn claim_name<M: Message>(
+        &self,
+        table: RecordTable,
+        also_taken_in: &[RecordTable],
+        key: &str,
+        value: &M,
+    ) -> Result<bool> {
+        let bytes = value.encode_to_vec();
+        let write_txn = self.db.begin_write()?;
+        let claimed = {
+            let mut taken = false;
+            for other in also_taken_in {
+                taken |= write_txn.open_table(*other)?.get(key)?.is_some();
+            }
+            let mut t = write_txn.open_table(table)?;
+            if taken || t.get(key)?.is_some() {
+                false
+            } else {
+                t.insert(key, bytes.as_slice())?;
+                true
+            }
+        };
+        write_txn.commit()?;
+        Ok(claimed)
+    }
+
     /// Read `node_id`, apply `mutate`, and write it back. Errors with
     /// `NodeNotFound` if the node is absent.
     fn modify_node(&self, node_id: &str, mutate: impl FnOnce(&mut NodeMeta)) -> Result<()> {
@@ -158,31 +198,10 @@ impl MetadataCatalog {
     }
 
     /// Claim a table name: store `meta` only if neither a table nor a view of that
-    /// name exists yet, and report whether the claim succeeded.
-    ///
-    /// The existence checks and the write share one redb write transaction, and redb
-    /// admits a single writer at a time, so two concurrent `CREATE TABLE` of the
-    /// same name cannot both observe "absent" — nor can a `CREATE TABLE` and a
-    /// `CREATE VIEW` racing for one name. Without this, a check-then-put sequence
-    /// lets both callers pass the check and both go on to assign shards and
-    /// broadcast DDL — two shard layouts for one catalog key, with the second
-    /// silently overwriting the first.
+    /// name exists yet, and report whether the claim succeeded. See
+    /// [`Self::claim_name`] for why this is one transaction.
     pub fn create_table_if_absent(&self, meta: &TableMeta) -> Result<bool> {
-        let bytes = meta.encode_to_vec();
-        let write_txn = self.db.begin_write()?;
-        let claimed = {
-            let views = write_txn.open_table(VIEWS_TABLE)?;
-            let taken_by_view = views.get(meta.table_name.as_str())?.is_some();
-            let mut t = write_txn.open_table(TABLES_TABLE)?;
-            if taken_by_view || t.get(meta.table_name.as_str())?.is_some() {
-                false
-            } else {
-                t.insert(meta.table_name.as_str(), bytes.as_slice())?;
-                true
-            }
-        };
-        write_txn.commit()?;
-        Ok(claimed)
+        self.claim_name(TABLES_TABLE, &[VIEWS_TABLE], &meta.table_name, meta)
     }
 
     /// Fetch a table's metadata by name, or `None` if it does not exist.
@@ -239,24 +258,9 @@ impl MetadataCatalog {
     /// name exists yet, and report whether the claim succeeded.
     ///
     /// Views and tables live in separate redb tables but in one relation namespace,
-    /// so the claim has to look in both — and it looks in both inside a single write
-    /// transaction, for the reason [`Self::create_table_if_absent`] gives.
+    /// so the claim has to look in both. See [`Self::claim_name`].
     pub fn create_view_if_absent(&self, meta: &ViewMeta) -> Result<bool> {
-        let bytes = meta.encode_to_vec();
-        let write_txn = self.db.begin_write()?;
-        let claimed = {
-            let tables = write_txn.open_table(TABLES_TABLE)?;
-            let taken_by_table = tables.get(meta.view_name.as_str())?.is_some();
-            let mut t = write_txn.open_table(VIEWS_TABLE)?;
-            if taken_by_table || t.get(meta.view_name.as_str())?.is_some() {
-                false
-            } else {
-                t.insert(meta.view_name.as_str(), bytes.as_slice())?;
-                true
-            }
-        };
-        write_txn.commit()?;
-        Ok(claimed)
+        self.claim_name(VIEWS_TABLE, &[TABLES_TABLE], &meta.view_name, meta)
     }
 
     /// Upsert a view's definition, keyed by its view name. Used to redefine a view
@@ -284,26 +288,14 @@ impl MetadataCatalog {
     /// Claim a schema name: store `meta` only if no schema of that name exists
     /// yet, and report whether the claim succeeded.
     ///
-    /// The check and the write share one redb write transaction, for the reason
-    /// [`Self::create_table_if_absent`] gives — two concurrent `CREATE SCHEMA` of
-    /// one name must not both see "absent" and both report success.
+    /// A schema name lives in its own namespace, so nothing else can take it; see
+    /// [`Self::claim_name`] for why the check and the write are still one
+    /// transaction.
     ///
     /// The default schema is never stored — it always exists and cannot be created —
     /// so this is only ever called for a named one.
     pub fn create_schema_if_absent(&self, meta: &SchemaMeta) -> Result<bool> {
-        let bytes = meta.encode_to_vec();
-        let write_txn = self.db.begin_write()?;
-        let claimed = {
-            let mut t = write_txn.open_table(SCHEMAS_TABLE)?;
-            if t.get(meta.schema_name.as_str())?.is_some() {
-                false
-            } else {
-                t.insert(meta.schema_name.as_str(), bytes.as_slice())?;
-                true
-            }
-        };
-        write_txn.commit()?;
-        Ok(claimed)
+        self.claim_name(SCHEMAS_TABLE, &[], &meta.schema_name, meta)
     }
 
     /// Fetch a schema's metadata by name, or `None` if it does not exist. The
@@ -344,32 +336,21 @@ impl MetadataCatalog {
     /// `vairedb_catalog.shards` view, per-shard DDL — reasonably expects. Routing
     /// does not rely on it and matches on the bucket itself; see
     /// [`write_router::shard_for_bucket`](crate::write_router::shard_for_bucket).
-    pub fn get_shards_for_table(&self, table_name: &str) -> Result<Vec<ShardMeta>> {
+    pub fn shards_for_table(&self, table_name: &str) -> Result<Vec<ShardMeta>> {
         let mut shards: Vec<ShardMeta> = self.scan_prefix(SHARDS_TABLE, table_name)?;
         shards.sort_by_key(|shard| shard.hash_bucket);
         Ok(shards)
     }
 
-    /// Delete every shard record belonging to `table_name`. Collects matching
-    /// keys in a read transaction, then removes them in one write transaction.
+    /// Delete every shard record belonging to `table_name`, in one write
+    /// transaction: selecting the keys in a read transaction first would let a
+    /// shard inserted in between survive a `DROP TABLE`.
     pub fn delete_shards_for_table(&self, table_name: &str) -> Result<()> {
         let (start, end) = prefix_range(table_name);
-        let read_txn = self.db.begin_read()?;
-        let table = read_txn.open_table(SHARDS_TABLE)?;
-        let mut keys_to_delete = Vec::new();
-        for entry in table.range(start.as_str()..end.as_str())? {
-            let entry = entry.map_err(CoordinatorError::CatalogStorage)?;
-            keys_to_delete.push(entry.0.value().to_string());
-        }
-        drop(table);
-        drop(read_txn);
-
         let write_txn = self.db.begin_write()?;
         {
             let mut table = write_txn.open_table(SHARDS_TABLE)?;
-            for key in &keys_to_delete {
-                table.remove(key.as_str())?;
-            }
+            table.retain_in(start.as_str()..end.as_str(), |_, _| false)?;
         }
         write_txn.commit()?;
         Ok(())
@@ -393,7 +374,7 @@ impl MetadataCatalog {
     }
 
     /// Return every shard record across all tables, by table name then hash
-    /// bucket — the same bucket ordering [`Self::get_shards_for_table`] uses, so
+    /// bucket — the same bucket ordering [`Self::shards_for_table`] uses, so
     /// `vairedb_catalog.shards` lists a table's shards `0, 1, 2, …` rather than
     /// lexicographically by shard id.
     pub fn list_all_shards(&self) -> Result<Vec<ShardMeta>> {
@@ -490,7 +471,7 @@ impl MetadataCatalog {
 
     /// Return a map from node id to advertised address for all registered
     /// nodes, used to resolve where to route requests.
-    pub fn get_node_address_map(&self) -> Result<HashMap<String, String>> {
+    pub fn node_address_map(&self) -> Result<HashMap<String, String>> {
         Ok(self
             .list_all_nodes()?
             .into_iter()

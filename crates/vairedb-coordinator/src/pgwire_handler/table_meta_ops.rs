@@ -919,9 +919,10 @@ fn value_to_string(v: &Value) -> String {
 mod tests {
     use std::sync::Arc;
 
+    use super::super::read_path_test_helper::parse_rewritten;
+    use super::super::write_path_test_helper::parse_alter_ops;
     use super::*;
     use crate::catalog::ShardStrategy;
-    use crate::pgwire_handler::parser;
     use crate::sqlparser::ast::Statement;
     use datafusion::arrow::datatypes::Field;
 
@@ -994,8 +995,7 @@ mod tests {
     // --- parse_create_table_config tests ---
 
     fn parse_create(sql: &str) -> CreateTable {
-        let stmts = parser::parse_sql(sql).unwrap();
-        match stmts.into_iter().next().unwrap() {
+        match parse_rewritten(sql) {
             Statement::CreateTable(create) => create,
             _ => panic!("expected CREATE TABLE statement"),
         }
@@ -1385,14 +1385,6 @@ mod tests {
             anonymized_columns: std::collections::HashMap::new(),
             indexes: Vec::new(),
             constraints: Vec::new(),
-        }
-    }
-
-    fn parse_alter_ops(sql: &str) -> Vec<AlterTableOperation> {
-        let stmts = parser::parse_sql(sql).unwrap();
-        match &stmts[0] {
-            Statement::AlterTable(alter) => alter.operations.clone(),
-            _ => panic!("expected ALTER TABLE statement"),
         }
     }
 
