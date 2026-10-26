@@ -34,7 +34,7 @@ pub const ROWS_PER_STATEMENT: usize = 1000;
 
 /// How a rendered cell is spelled as a SQL literal.
 #[derive(Clone, Copy)]
-enum LiteralKind {
+pub(super) enum LiteralKind {
     /// A bare numeric token (`42`, `-7`).
     Number,
     /// `true` / `false`.
@@ -54,7 +54,7 @@ enum LiteralKind {
 /// digits, an `Interval` as a struct-ish debug form, a `List` as `[1, 2]` — each
 /// would either fail on the shard or, worse, store something else than the row
 /// the source query produced.
-fn literal_kind(dt: &DataType) -> std::result::Result<LiteralKind, String> {
+pub(super) fn literal_kind(dt: &DataType) -> std::result::Result<LiteralKind, String> {
     Ok(match dt {
         DataType::Boolean => LiteralKind::Boolean,
         DataType::Int8
@@ -100,7 +100,7 @@ fn literal_kind(dt: &DataType) -> std::result::Result<LiteralKind, String> {
 
 /// Render the cell at `row` of `col` as the SQL literal expression that stores
 /// the same value.
-fn cell_literal(col: &dyn Array, row: usize, kind: LiteralKind) -> Expr {
+pub(super) fn cell_literal(col: &dyn Array, row: usize, kind: LiteralKind) -> Expr {
     if crate::pgwire_handler::encoding::is_null_on_the_wire(col, row) {
         return Expr::Value(Value::Null.into());
     }

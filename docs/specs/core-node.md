@@ -43,7 +43,7 @@ To bridge DataFusion with the embedded DuckDB instance, each core node provides 
 
 **Write path (INSERT/UPDATE/DELETE — outside Ballista):**
 
-Write operations do **not** flow through the Ballista/DataFusion pipeline. From the core node's perspective: it receives shard-local DML (already translated into DuckDB dialect) from the coordinator via gRPC WriteService, enqueues it in the per-node write queue, and executes it sequentially against the local DuckDB instance. See [Replication — Write path](data-distribution.md#replication) for the full end-to-end flow including parsing, dialect translation, quorum protocol, and tail replication.
+Write operations do **not** flow through the Ballista/DataFusion pipeline. From the core node's perspective: it receives shard-local DML (already translated into DuckDB dialect, or for a bulk import a columnar batch of rows to insert) from the coordinator via gRPC WriteService, enqueues it in the per-node write queue, and executes it sequentially against the local DuckDB instance. See [Replication — Write path](data-distribution.md#replication) for the full end-to-end flow including parsing, dialect translation, quorum protocol, and tail replication.
 
 **DDL path (CREATE TABLE, ALTER TABLE, DROP TABLE — outside Ballista):**
 

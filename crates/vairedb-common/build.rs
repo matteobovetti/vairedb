@@ -13,6 +13,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         println!("cargo:rerun-if-changed={proto}");
     }
 
-    tonic_prost_build::configure().compile_protos(PROTOS, &["../../proto"])?;
+    tonic_prost_build::configure()
+        // A bulk payload is sent to every replica and kept for retries, so it is a
+        // reference-counted buffer: each copy of the request shares the bytes.
+        .bytes(".vairedb.v1.BulkRows.arrow_ipc")
+        .compile_protos(PROTOS, &["../../proto"])?;
     Ok(())
 }

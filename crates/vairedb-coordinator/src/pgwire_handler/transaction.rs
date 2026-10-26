@@ -533,6 +533,7 @@ mod tests {
                 sql: format!("INSERT INTO {table}_shard0 VALUES (1)"),
                 params: Vec::new(),
                 shard_id: crate::util::shard_table_name(table, 0),
+                bulk: None,
             },
             quorum_size: 1,
             table_name: table.to_string(),

@@ -9,7 +9,7 @@ use vairedb_common::proto::vairedb::v1::{
 };
 
 use crate::error::CoreError;
-use crate::write_queue::{QueuedStatement, WriteQueueHandle};
+use crate::write_queue::{BulkInsert, QueuedStatement, WriteQueueHandle};
 
 use super::dedup_cache::DedupCache;
 use super::param_conversion::write_param_to_duckdb_value;
@@ -53,11 +53,10 @@ impl WriteServiceImpl {
         let mut results = Vec::with_capacity(req.statements.len());
 
         for stmt in &req.statements {
-            let params = duckdb_params(stmt);
-            let result = self
-                .write_queue
-                .execute_with_params(stmt.sql.clone(), params)
-                .await;
+            let result = match queued(stmt) {
+                Ok(statement) => self.write_queue.execute(statement).await,
+                Err(e) => Err(e),
+            };
 
             match result {
                 Ok(rows_affected) => results.push(succeeded(rows_affected)),
@@ -80,16 +79,14 @@ impl WriteServiceImpl {
     /// is one result per statement; on failure a single failed result, because
     /// nothing was applied and no statement has an outcome of its own.
     async fn apply_atomically(&self, req: &ExecuteWriteRequest) -> Vec<WriteResult> {
-        let statements: Vec<QueuedStatement> = req
-            .statements
-            .iter()
-            .map(|stmt| QueuedStatement {
-                sql: stmt.sql.clone(),
-                params: duckdb_params(stmt),
-            })
-            .collect();
+        // A statement that cannot even be decoded aborts the batch before the writer
+        // thread sees any of it, which is the same outcome as one failing inside it.
+        let outcome = match req.statements.iter().map(queued).collect() {
+            Ok(statements) => self.write_queue.execute_atomic_batch(statements).await,
+            Err(e) => Err(e),
+        };
 
-        match self.write_queue.execute_atomic_batch(statements).await {
+        match outcome {
             Ok(rows_affected) => rows_affected.into_iter().map(succeeded).collect(),
             Err(e) => {
                 tracing::warn!(
@@ -101,6 +98,18 @@ impl WriteServiceImpl {
                 vec![failed(&e)]
             }
         }
+    }
+}
+
+/// What the writer thread is asked to apply for one statement of a request: its SQL
+/// and parameters, or the rows of a bulk insert.
+fn queued(stmt: &WriteStatement) -> Result<QueuedStatement, CoreError> {
+    match &stmt.bulk_rows {
+        Some(bulk) => BulkInsert::decode(bulk).map(QueuedStatement::Bulk),
+        None => Ok(QueuedStatement::Sql {
+            sql: stmt.sql.clone(),
+            params: duckdb_params(stmt),
+        }),
     }
 }
 
@@ -227,6 +236,7 @@ mod tests {
             shard_id: "orders_shard0".to_string(),
             operation: WriteOperation::Insert.into(),
             params: vec![],
+            bulk_rows: None,
         }
     }
 
@@ -238,6 +248,7 @@ mod tests {
             shard_id: "orders_shard0".to_string(),
             operation: WriteOperation::Insert.into(),
             params: vec![],
+            bulk_rows: None,
         };
         let response = service
             .execute_write(make_request("w-1", vec![stmt]))
@@ -258,12 +269,14 @@ mod tests {
                 shard_id: "orders_shard0".to_string(),
                 operation: WriteOperation::Insert.into(),
                 params: vec![],
+                bulk_rows: None,
             },
             WriteStatement {
                 sql: "INSERT INTO orders_shard0 VALUES (2, 20.0), (3, 30.0)".to_string(),
                 shard_id: "orders_shard0".to_string(),
                 operation: WriteOperation::Insert.into(),
                 params: vec![],
+                bulk_rows: None,
             },
         ];
         let response = service
@@ -286,6 +299,7 @@ mod tests {
             shard_id: "nonexistent_table".to_string(),
             operation: WriteOperation::Insert.into(),
             params: vec![],
+            bulk_rows: None,
         };
         let response = service
             .execute_write(make_request("w-3", vec![stmt]))
@@ -305,6 +319,7 @@ mod tests {
             shard_id: "orders_shard0".to_string(),
             operation: WriteOperation::Insert.into(),
             params: vec![],
+            bulk_rows: None,
         };
         let response1 = service
             .execute_write(make_request("w-dup", vec![stmt.clone()]))
@@ -327,6 +342,7 @@ mod tests {
             shard_id: "orders_shard0".to_string(),
             operation: WriteOperation::Insert.into(),
             params: vec![],
+            bulk_rows: None,
         };
         service
             .execute_write(make_request("", vec![stmt]))
@@ -337,6 +353,7 @@ mod tests {
             shard_id: "orders_shard0".to_string(),
             operation: WriteOperation::Insert.into(),
             params: vec![],
+            bulk_rows: None,
         };
         let response = service
             .execute_write(make_request("", vec![stmt2]))
@@ -354,6 +371,7 @@ mod tests {
             shard_id: "orders_shard0".to_string(),
             operation: WriteOperation::Insert.into(),
             params: vec![],
+            bulk_rows: None,
         };
         service
             .execute_write(make_request("w-evict-1", vec![stmt.clone()]))
@@ -364,6 +382,7 @@ mod tests {
             shard_id: "orders_shard0".to_string(),
             operation: WriteOperation::Insert.into(),
             params: vec![],
+            bulk_rows: None,
         };
         service
             .execute_write(make_request("w-evict-2", vec![stmt2]))
@@ -374,6 +393,7 @@ mod tests {
             shard_id: "orders_shard0".to_string(),
             operation: WriteOperation::Insert.into(),
             params: vec![],
+            bulk_rows: None,
         };
         service
             .execute_write(make_request("w-evict-3", vec![stmt3]))
@@ -384,6 +404,7 @@ mod tests {
             shard_id: "orders_shard0".to_string(),
             operation: WriteOperation::Insert.into(),
             params: vec![],
+            bulk_rows: None,
         };
         let response = service
             .execute_write(make_request("w-evict-1", vec![stmt_retry]))
@@ -401,6 +422,7 @@ mod tests {
             shard_id: "nonexistent_table".to_string(),
             operation: WriteOperation::Insert.into(),
             params: vec![],
+            bulk_rows: None,
         };
         let response = service
             .execute_write(make_request("w-err-detail", vec![stmt]))
@@ -501,5 +523,125 @@ mod tests {
             .unwrap();
         assert!(response.into_inner().results[0].success);
         assert_eq!(row_count(&reader), 1);
+    }
+
+    // --- Bulk rows ---
+
+    /// A statement carrying `ids` and `amounts` as bulk rows rather than SQL text.
+    fn bulk_insert(ids: &[i64], amounts: &[&str]) -> WriteStatement {
+        use std::sync::Arc;
+
+        use arrow::array::{ArrayRef, Int64Array, StringArray};
+
+        WriteStatement {
+            sql: String::new(),
+            shard_id: "orders_shard0".to_string(),
+            operation: WriteOperation::Insert.into(),
+            params: vec![],
+            bulk_rows: Some(crate::write_queue::test_support::bulk_rows(
+                "orders_shard0",
+                &[
+                    ("id", Arc::new(Int64Array::from(ids.to_vec())) as ArrayRef),
+                    (
+                        "amount",
+                        Arc::new(StringArray::from(amounts.to_vec())) as ArrayRef,
+                    ),
+                ],
+            )),
+        }
+    }
+
+    #[tokio::test]
+    async fn bulk_rows_are_inserted_and_counted() {
+        let (service, reader) = setup_service_with_reader();
+        let response = service
+            .execute_write(make_request(
+                "w-bulk",
+                vec![bulk_insert(&[1, 2, 3], &["1.5", "2.5", "3.5"])],
+            ))
+            .await
+            .unwrap();
+        let results = response.into_inner().results;
+        assert!(results[0].success, "got: {results:?}");
+        assert_eq!(results[0].rows_affected, 3);
+        assert_eq!(row_count(&reader), 3);
+    }
+
+    // A transaction's buffered writes reach the node as one atomic batch, and a bulk
+    // insert among them is part of the same all-or-nothing.
+    #[tokio::test]
+    async fn bulk_rows_join_an_atomic_batch() {
+        let (service, reader) = setup_service_with_reader();
+        let response = service
+            .execute_write(make_atomic_request(
+                "w-bulk-atomic",
+                vec![
+                    insert("INSERT INTO orders_shard0 VALUES (1, 10.0)"),
+                    bulk_insert(&[2, 3], &["20", "30"]),
+                ],
+            ))
+            .await
+            .unwrap();
+        let results = response.into_inner().results;
+        assert_eq!(
+            results.iter().map(|r| r.rows_affected).collect::<Vec<_>>(),
+            [1, 2]
+        );
+        assert_eq!(row_count(&reader), 3);
+
+        let response = service
+            .execute_write(make_atomic_request(
+                "w-bulk-atomic-fail",
+                vec![
+                    bulk_insert(&[4], &["40"]),
+                    insert("INSERT INTO nonexistent_table VALUES (5)"),
+                ],
+            ))
+            .await
+            .unwrap();
+        assert!(!response.into_inner().results[0].success);
+        assert_eq!(
+            row_count(&reader),
+            3,
+            "the bulk rows must roll back with the batch"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unreadable_bulk_payload_fails_as_its_own_result() {
+        let (service, reader) = setup_service_with_reader();
+        let mut garbled = bulk_insert(&[1], &["1"]);
+        if let Some(bulk) = garbled.bulk_rows.as_mut() {
+            bulk.arrow_ipc = b"not arrow".to_vec().into();
+        }
+        let response = service
+            .execute_write(make_request("w-bulk-garbled", vec![garbled]))
+            .await
+            .unwrap();
+        let results = response.into_inner().results;
+        assert!(!results[0].success);
+        assert_eq!(
+            results[0].error.as_ref().unwrap().code,
+            VdbErrorCode::EngineError as i32
+        );
+        assert_eq!(row_count(&reader), 0);
+    }
+
+    // A retried bulk insert is the same write: replaying its id must not store its
+    // rows twice.
+    #[tokio::test]
+    async fn a_replayed_bulk_write_id_is_not_reapplied() {
+        let (service, reader) = setup_service_with_reader();
+        for _ in 0..2 {
+            let response = service
+                .execute_write(make_request(
+                    "w-bulk-dup",
+                    vec![bulk_insert(&[1, 2], &["1", "2"])],
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.into_inner().results[0].rows_affected, 2);
+        }
+        assert_eq!(row_count(&reader), 2);
     }
 }

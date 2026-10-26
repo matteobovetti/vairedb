@@ -1503,6 +1503,7 @@ async fn send_ddl_to_node(
                 shard_id: shard_id.to_string(),
                 operation: WriteOperation::Unspecified.into(),
                 params: vec![],
+                bulk_rows: None,
             })
             .collect(),
         atomic: sql.len() > 1,

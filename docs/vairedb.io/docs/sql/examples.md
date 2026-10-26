@@ -167,7 +167,8 @@ DROP TABLE users;
 - `COPY … TO` ran its source on that same read path, so the file gathered every
   shard's rows; `COPY … FROM` decoded the file into batches and re-entered the
   write path above, so each row was hashed and replicated exactly as a
-  hand-written `INSERT` is.
+  hand-written `INSERT` is — each shard receiving its rows as one columnar batch
+  rather than as `INSERT` text.
 
 Follow these flows in detail in
 [Query Processing](../concepts/query-processing.md).

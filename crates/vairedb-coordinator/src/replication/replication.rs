@@ -11,7 +11,7 @@ use std::time::Duration;
 use tokio::sync::Mutex;
 
 use vairedb_common::proto::vairedb::v1::{
-    ExecuteWriteRequest, VdbErrorCode, WriteOperation, WriteParam, WriteStatement,
+    BulkRows, ExecuteWriteRequest, VdbErrorCode, WriteOperation, WriteParam, WriteStatement,
     write_service_client::WriteServiceClient,
 };
 
@@ -53,6 +53,10 @@ pub struct BatchStatement {
     pub params: Vec<WriteParam>,
     /// Physical shard table the statement targets, e.g. `orders_shard0`.
     pub shard_id: String,
+    /// Rows of a bulk insert, carried as data instead of `sql` — which is then
+    /// empty. Its payload is a shared buffer, so every node and every retry is
+    /// sent the same bytes rather than a copy of them.
+    pub bulk: Option<BulkRows>,
 }
 
 /// Everything a node must be told to apply a write, and the only thing a resend
@@ -121,14 +125,27 @@ impl ReplicationManager {
         write_id: &str,
         quorum_size: usize,
     ) -> Result<u64> {
-        let statements = vec![BatchStatement {
+        let statement = BatchStatement {
             sql: sql.to_string(),
             params: params.to_vec(),
             shard_id: crate::util::shard_table_name(&shard.table_name, shard.hash_bucket),
-        }];
+            bulk: None,
+        };
+        self.execute_statement_with_quorum(shard, statement, write_id, quorum_size)
+            .await
+    }
 
+    /// [`execute_write_with_quorum`](Self::execute_write_with_quorum) for a statement
+    /// already planned whole — the form a bulk insert has, since it is not SQL text.
+    pub async fn execute_statement_with_quorum(
+        &self,
+        shard: &ShardMeta,
+        statement: BatchStatement,
+        write_id: &str,
+        quorum_size: usize,
+    ) -> Result<u64> {
         let rows = self
-            .fan_out(shard, statements, write_id, quorum_size, false)
+            .fan_out(shard, vec![statement], write_id, quorum_size, false)
             .await?;
 
         Ok(rows.first().copied().unwrap_or(0))
@@ -381,6 +398,7 @@ fn write_request(batch: &WriteBatch) -> tonic::Request<ExecuteWriteRequest> {
                 shard_id: stmt.shard_id.clone(),
                 operation: WriteOperation::Insert.into(),
                 params: stmt.params.clone(),
+                bulk_rows: stmt.bulk.clone(),
             })
             .collect(),
         atomic: batch.atomic,

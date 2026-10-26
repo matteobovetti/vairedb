@@ -43,6 +43,8 @@ Write operations (INSERT/UPDATE/DELETE) are handled by the coordinator's dedicat
 
 This is a **synchronous quorum write with asynchronous tail replication**: the write path blocks until a majority confirms, but lagging nodes are not on the critical path. The coordinator retries the same shard-local SQL statement against lagging nodes in the background until they acknowledge. If a node remains unreachable beyond the heartbeat timeout, it is marked as dead and stops receiving retries (see [Failure Detection](cluster-coordination.md#failure-detection)).
 
+**Bulk rows.** Rows the coordinator already holds as data — a `COPY ... FROM` import — skip the SQL text in steps 2–3: each shard is sent its rows as one columnar batch, and the core node inserts them with the meaning of the equivalent `INSERT ... VALUES` (the same casts to the declared column types, defaults and constraints, all of a batch or none of it). Every row is routed to the shard that `INSERT` would have chosen, and quorum, tail replication and idempotent replay are unchanged. A table with pseudonymized columns, and a batch whose shard key the INSERT path would refuse, keep the SQL form.
+
 A different replication factor can be set per table at creation time, otherwise the cluster-wide default applies.
 
 **Read path**

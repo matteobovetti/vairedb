@@ -2,13 +2,15 @@ use duckdb::Connection;
 use duckdb::types::Value;
 use tokio::sync::{mpsc, oneshot};
 
+use super::bulk_insert::BulkInsert;
 use crate::error::CoreError;
 
-/// One statement destined for the writer thread: the SQL and its bind
-/// parameters.
-pub(crate) struct QueuedStatement {
-    pub sql: String,
-    pub params: Vec<Value>,
+/// One statement destined for the writer thread.
+pub(crate) enum QueuedStatement {
+    /// SQL text and its bind parameters.
+    Sql { sql: String, params: Vec<Value> },
+    /// Rows to insert, carried as data rather than spelled out as SQL.
+    Bulk(BulkInsert),
 }
 
 /// A unit of work for the writer thread, carrying the channel that delivers the
@@ -16,8 +18,7 @@ pub(crate) struct QueuedStatement {
 enum WriteQueueEntry {
     /// A single statement, applied on its own.
     Single {
-        sql: String,
-        params: Vec<Value>,
+        statement: QueuedStatement,
         response_tx: oneshot::Sender<Result<u64, CoreError>>,
     },
     /// Several statements applied inside one DuckDB transaction: either all of
@@ -66,11 +67,10 @@ impl WriteQueue {
         while let Some(entry) = rx.blocking_recv() {
             match entry {
                 WriteQueueEntry::Single {
-                    sql,
-                    params,
+                    statement,
                     response_tx,
                 } => {
-                    let _ = response_tx.send(Self::execute_one(&conn, &sql, &params));
+                    let _ = response_tx.send(Self::execute_single(&conn, &statement));
                 }
                 WriteQueueEntry::Atomic {
                     statements,
@@ -82,8 +82,30 @@ impl WriteQueue {
         }
     }
 
-    /// Execute one statement, binding `params` when there are any.
-    fn execute_one(conn: &Connection, sql: &str, params: &[Value]) -> Result<u64, CoreError> {
+    /// Execute a statement that was submitted on its own.
+    ///
+    /// A bulk insert is a transaction even alone: it stages its rows before moving
+    /// them into the shard table, and a failure has to take the staging with it.
+    fn execute_single(conn: &Connection, statement: &QueuedStatement) -> Result<u64, CoreError> {
+        match statement {
+            QueuedStatement::Sql { sql, params } => Self::execute_sql(conn, sql, params),
+            QueuedStatement::Bulk(_) => {
+                let rows = Self::execute_atomically(conn, std::slice::from_ref(statement))?;
+                Ok(rows.first().copied().unwrap_or(0))
+            }
+        }
+    }
+
+    /// Execute one statement inside whatever transaction is open.
+    fn execute_one(conn: &Connection, statement: &QueuedStatement) -> Result<u64, CoreError> {
+        match statement {
+            QueuedStatement::Sql { sql, params } => Self::execute_sql(conn, sql, params),
+            QueuedStatement::Bulk(bulk) => bulk.execute(conn),
+        }
+    }
+
+    /// Execute SQL text, binding `params` when there are any.
+    fn execute_sql(conn: &Connection, sql: &str, params: &[Value]) -> Result<u64, CoreError> {
         if params.is_empty() {
             conn.execute(sql, [])
         } else {
@@ -109,7 +131,7 @@ impl WriteQueue {
 
         let mut rows_affected = Vec::with_capacity(statements.len());
         for stmt in statements {
-            match Self::execute_one(conn, &stmt.sql, &stmt.params) {
+            match Self::execute_one(conn, stmt) {
                 Ok(rows) => rows_affected.push(rows),
                 Err(e) => {
                     // Report the statement error, not the rollback's: a failing
@@ -134,21 +156,16 @@ impl WriteQueue {
 }
 
 impl WriteQueueHandle {
-    /// Submit `sql` with bound `params` to the writer thread and await the
-    /// number of rows affected.
+    /// Submit one statement to the writer thread and await the number of rows it
+    /// affected.
     ///
     /// Returns [`CoreError::WriteQueue`] if the queue is closed or the writer
     /// drops the response, or the classified DuckDB error on execution failure.
-    pub(crate) async fn execute_with_params(
-        &self,
-        sql: String,
-        params: Vec<Value>,
-    ) -> Result<u64, CoreError> {
+    pub(crate) async fn execute(&self, statement: QueuedStatement) -> Result<u64, CoreError> {
         let (response_tx, response_rx) = oneshot::channel();
 
         let entry = WriteQueueEntry::Single {
-            sql,
-            params,
+            statement,
             response_tx,
         };
 
@@ -199,6 +216,17 @@ impl WriteQueueHandle {
 mod tests {
     use super::*;
 
+    impl WriteQueueHandle {
+        /// SQL text and its parameters — the statement nearly every test here submits.
+        async fn execute_with_params(
+            &self,
+            sql: String,
+            params: Vec<Value>,
+        ) -> Result<u64, CoreError> {
+            self.execute(QueuedStatement::Sql { sql, params }).await
+        }
+    }
+
     #[tokio::test]
     async fn execute_on_closed_channel_returns_write_queue_error() {
         let (tx, rx) = mpsc::channel::<WriteQueueEntry>(1);
@@ -244,7 +272,7 @@ mod tests {
 
         let handle = WriteQueueHandle { tx };
         let result = handle
-            .execute_atomic_batch(vec![QueuedStatement {
+            .execute_atomic_batch(vec![QueuedStatement::Sql {
                 sql: "SELECT 1".to_string(),
                 params: Vec::new(),
             }])
@@ -492,15 +520,15 @@ mod tests {
         let (handle, reader) = setup_write_queue_with_reader();
         let rows = handle
             .execute_atomic_batch(vec![
-                QueuedStatement {
+                QueuedStatement::Sql {
                     sql: "INSERT INTO wq_test VALUES (1, 'a')".to_string(),
                     params: Vec::new(),
                 },
-                QueuedStatement {
+                QueuedStatement::Sql {
                     sql: "INSERT INTO wq_test VALUES ($1, $2), (3, 'c')".to_string(),
                     params: vec![Value::Int(2), Value::Text("b".to_string())],
                 },
-                QueuedStatement {
+                QueuedStatement::Sql {
                     sql: "UPDATE wq_test SET val = 'z' WHERE id > 1".to_string(),
                     params: Vec::new(),
                 },
@@ -517,11 +545,11 @@ mod tests {
         let (handle, reader) = setup_write_queue_with_reader();
         let result = handle
             .execute_atomic_batch(vec![
-                QueuedStatement {
+                QueuedStatement::Sql {
                     sql: "INSERT INTO wq_test VALUES (1, 'a')".to_string(),
                     params: Vec::new(),
                 },
-                QueuedStatement {
+                QueuedStatement::Sql {
                     sql: "INSERT INTO nonexistent VALUES (2)".to_string(),
                     params: Vec::new(),
                 },
@@ -537,7 +565,7 @@ mod tests {
     async fn queue_still_serves_writes_after_a_rolled_back_batch() {
         let (handle, reader) = setup_write_queue_with_reader();
         let _ = handle
-            .execute_atomic_batch(vec![QueuedStatement {
+            .execute_atomic_batch(vec![QueuedStatement::Sql {
                 sql: "INSERT INTO nonexistent VALUES (1)".to_string(),
                 params: Vec::new(),
             }])

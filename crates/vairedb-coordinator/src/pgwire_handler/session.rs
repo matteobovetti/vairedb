@@ -292,6 +292,7 @@ mod tests {
                 sql: sql.to_string(),
                 params: Vec::new(),
                 shard_id: crate::util::shard_table_name(table, bucket),
+                bulk: None,
             },
             shard: shard_meta(table, bucket, primary, replicas),
             quorum_size: 1,

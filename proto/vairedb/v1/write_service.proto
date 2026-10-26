@@ -45,7 +45,8 @@ message ExecuteWriteRequest {
 
 message WriteStatement {
   // Shard-local SQL statement (e.g. "INSERT INTO orders_shard0 VALUES (...)").
-  // May contain positional placeholders ($1..$N) bound from `params`.
+  // May contain positional placeholders ($1..$N) bound from `params`. Empty when
+  // `bulk_rows` carries the write instead.
   string sql = 1;
 
   // Target shard identifier (e.g. "orders_shard0").
@@ -58,6 +59,34 @@ message WriteStatement {
   // statement. When present, the core node binds them as prepared-statement
   // parameters rather than substituting them into the SQL text.
   repeated WriteParam params = 4;
+
+  // Rows to insert, carried as data rather than spelled into `sql`. When set,
+  // `sql` and `params` are empty.
+  BulkRows bulk_rows = 5;
+}
+
+// An INSERT of rows the coordinator has already routed to this shard.
+//
+// It means exactly what `INSERT INTO <table> (<columns>) VALUES ...` with the
+// same values would: each value is cast to its column's declared type by the
+// node's engine, a column not listed takes its default, the table's constraints
+// apply, and the statement reports the rows it inserted. All of its rows take
+// effect or none does.
+//
+// What it saves is the SQL text. A bulk load spelled as literals is rendered,
+// shipped and re-parsed value by value, and that — not the storage engine — is
+// what bounds how fast it goes.
+message BulkRows {
+  // Physical shard-local table, e.g. "orders_shard0".
+  string table = 1;
+
+  // Target columns, one per field of the stream, in field order.
+  repeated string columns = 2;
+
+  // The rows, as one Arrow IPC stream. A field is Boolean, a signed or unsigned
+  // integer, or UTF-8 text: any other value travels as the text its SQL literal
+  // would carry, so the node casts it exactly as it would cast that literal.
+  bytes arrow_ipc = 3;
 }
 
 // A single typed bind parameter. Exactly one variant is set; an unset oneof

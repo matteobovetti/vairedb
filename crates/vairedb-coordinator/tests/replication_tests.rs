@@ -269,6 +269,7 @@ fn statement(sql: &str, shard_id: &str) -> BatchStatement {
         sql: sql.to_string(),
         params: vec![],
         shard_id: shard_id.to_string(),
+        bulk: None,
     }
 }
 

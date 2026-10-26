@@ -9,7 +9,9 @@
 //!   and emits the collected batches in the format the statement asked for.
 //! * `COPY <table> FROM '<file>' | STDIN` decodes the file into record batches and
 //!   hands them to the INSERT lane, so every row is routed by its shard key, split
-//!   per shard, and counted exactly like a client `INSERT ... VALUES` would be.
+//!   per shard, and counted exactly like a client `INSERT ... VALUES` would be — and
+//!   shipped as data rather than as that INSERT's text wherever that stores the same
+//!   rows (see [`crate::pgwire_handler::bulk_insert`]).
 //!
 //! The two CSV `FROM` forms differ only in who supplies the bytes: both feed one
 //! [`crate::pgwire_handler::copy_stream::CopySink`], which is what makes a file
@@ -50,6 +52,7 @@ use tokio::io::AsyncReadExt;
 use vairedb_common::proto::vairedb::v1::VdbErrorCode;
 
 use crate::catalog::MetadataCatalog;
+use crate::pgwire_handler::bulk_insert::RowTarget;
 use crate::pgwire_handler::column_labels;
 use crate::pgwire_handler::copy_parquet;
 use crate::pgwire_handler::copy_stream::CopySink;
@@ -345,13 +348,13 @@ impl VaireDbQueryHandler {
 
         readable_file(path)?;
         let mut file = copy_parquet::ParquetFile::open(path).await?;
-        let template = copy_parquet::insert_template(table, columns, file.fields(), &table_meta)?;
+        let target = copy_parquet::row_target(table, columns, file.fields(), &table_meta)?;
 
         // Counted outside the loop so a failure part-way can say how much of the
         // file is already stored — there is no cross-shard rollback to undo it with.
         let mut rows = 0u64;
         match self
-            .import_parquet_batches(&mut file, &template, table, session, &mut rows)
+            .import_parquet_batches(&mut file, &target, session, &mut rows)
             .await
         {
             Ok(()) => Ok(rows),
@@ -364,15 +367,13 @@ impl VaireDbQueryHandler {
     async fn import_parquet_batches(
         &self,
         file: &mut copy_parquet::ParquetFile,
-        template: &Statement,
-        table: &str,
+        target: &RowTarget,
         session: &SessionState,
         rows: &mut u64,
     ) -> PgWireResult<()> {
         while let Some(batch) = file.next_batch().await? {
-            let statements = copy_parquet::insert_statements(template, &batch)?;
             *rows += self
-                .write_row_statements(&statements, &[], session, table, "COPY")
+                .write_row_batch(target, &batch, session, "COPY")
                 .await?;
         }
         Ok(())

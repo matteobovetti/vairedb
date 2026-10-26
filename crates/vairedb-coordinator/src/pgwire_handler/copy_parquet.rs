@@ -46,12 +46,11 @@ use pgwire::error::{PgWireError, PgWireResult};
 use vairedb_common::proto::vairedb::v1::VdbErrorCode;
 
 use crate::catalog::TableMeta;
+use crate::pgwire_handler::bulk_insert::RowTarget;
 use crate::pgwire_handler::copy::{
     ROWS_PER_BATCH, file_error, target_columns, validate_target_columns,
 };
 use crate::pgwire_handler::error_enrichment::make_vdb_error;
-use crate::sqlparser::ast::Statement;
-use crate::write_sql_cl;
 
 /// A Parquet file on the coordinator's disk, open and handed over a batch at a
 /// time.
@@ -134,48 +133,30 @@ fn open_blocking(path: &str) -> PgWireResult<(Vec<String>, ParquetRecordBatchRea
     Ok((fields, reader))
 }
 
-/// The `INSERT` template a Parquet import writes its rows through.
+/// Where a Parquet import writes its rows: the table, and the columns the file's
+/// fields land on.
 ///
 /// A Parquet file always names its columns, so the mapping is by name exactly as a
 /// CSV file's `HEADER` makes it: [`target_columns`] is asked for the header rule.
 /// The statement's own column list still wins, and is still matched positionally
-/// against the file's fields.
+/// against the file's fields. The batches keep the file's column order, which is the
+/// target's order too, so the positional match the INSERT lane makes is the mapping
+/// the statement asked for.
 ///
 /// Everything decidable before a row is read is decided here — the columns exist
 /// on the table and they carry the shard key — so a client hears about a file it
 /// cannot import before anything is written.
-pub(super) fn insert_template(
+pub(super) fn row_target(
     table: &str,
     stated: &[String],
     file_fields: &[String],
     meta: &TableMeta,
-) -> PgWireResult<Statement> {
+) -> PgWireResult<RowTarget> {
     let table_columns: Vec<String> = meta.columns.iter().map(|c| c.name.clone()).collect();
     // `true`: the file names its columns, which is what a CSV header does.
     let target = target_columns(stated, file_fields, &table_columns, true)?;
     validate_target_columns(table, &target, &table_columns, &meta.shard_key)?;
-
-    let refs: Vec<&str> = target.iter().map(String::as_str).collect();
-    write_sql_cl::insert_template(table, &refs)
-        .map_err(|msg| make_vdb_error(VdbErrorCode::SqlSyntaxError, msg))
-}
-
-/// The `INSERT ... VALUES` statements one batch of the file becomes, chunked the
-/// way a client's own multi-row `INSERT` is.
-///
-/// The batch's columns are in file order, which [`insert_template`] already mapped
-/// onto the target columns in the same order, so the positional match the INSERT
-/// lane makes is the mapping the statement asked for.
-pub(super) fn insert_statements(
-    template: &Statement,
-    batch: &RecordBatch,
-) -> PgWireResult<Vec<Statement>> {
-    write_sql_cl::insert_statements_from_batches(
-        template,
-        std::slice::from_ref(batch),
-        write_sql_cl::ROWS_PER_STATEMENT,
-    )
-    .map_err(|msg| make_vdb_error(VdbErrorCode::FeatureNotSupported, msg))
+    RowTarget::new(table, target)
 }
 
 /// Write collected batches to `path` as Parquet, truncating whatever was there —
@@ -307,11 +288,12 @@ mod tests {
             .to_string()
     }
 
-    /// Every statement a file's batches turn into, as SQL.
+    /// Every statement a file's batches turn into on the literal lane, as SQL — which
+    /// is also the definition of what the bulk lane stores for them.
     async fn imported(path: &str, stated: &[&str], table: &[&str]) -> PgWireResult<Vec<String>> {
         let mut file = ParquetFile::open(path).await?;
         let stated: Vec<String> = stated.iter().map(|s| (*s).to_string()).collect();
-        let template = insert_template(
+        let target = row_target(
             "orders",
             &stated,
             file.fields(),
@@ -321,9 +303,10 @@ mod tests {
         let mut sql = Vec::new();
         while let Some(batch) = file.next_batch().await? {
             sql.extend(
-                insert_statements(&template, &batch)?
+                target
+                    .literal_statements(&batch)?
                     .iter()
-                    .map(write_sql_cl::statement_to_sql),
+                    .map(crate::write_sql_cl::statement_to_sql),
             );
         }
         Ok(sql)

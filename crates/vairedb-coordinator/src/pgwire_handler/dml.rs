@@ -368,6 +368,25 @@ impl VaireDbQueryHandler {
             .map(|chunk| self.plan_dml(chunk, &QueryType::Insert, params))
             .collect::<PgWireResult<Vec<DmlPlan>>>()?;
 
+        self.ship_row_plans(plans, session, table_name, command)
+            .await
+    }
+
+    /// Ship the plans a set of materialized rows was planned into, in order,
+    /// returning the number of rows written — or buffer them, inside a transaction
+    /// block.
+    ///
+    /// The second half of [`write_row_statements`](Self::write_row_statements), shared
+    /// with the bulk lane (see [`crate::pgwire_handler::bulk_insert`]): however the rows
+    /// were planned, they are buffered, counted and reported as partially applied the
+    /// same way. Every plan must carry its exact row count.
+    pub(super) async fn ship_row_plans(
+        &self,
+        plans: Vec<DmlPlan>,
+        session: &SessionState,
+        table_name: &str,
+        command: &str,
+    ) -> PgWireResult<u64> {
         let mut txn = session.transaction().await;
         if txn.is_open() {
             let mut rows = 0u64;
@@ -521,10 +540,9 @@ impl VaireDbQueryHandler {
             let shard_write_id = format!("{}-{}", write_id, idx);
             total_rows += self
                 .replication_manager
-                .execute_write_with_quorum(
+                .execute_statement_with_quorum(
                     &write.shard,
-                    &write.statement.sql,
-                    &write.statement.params,
+                    write.statement.clone(),
                     &shard_write_id,
                     write.quorum_size,
                 )
@@ -672,6 +690,7 @@ impl VaireDbQueryHandler {
                 sql: shard_sql,
                 params: shard_params,
                 shard_id: crate::util::shard_table_name(&shard.table_name, shard.hash_bucket),
+                bulk: None,
             },
             shard: shard.clone(),
             quorum_size,

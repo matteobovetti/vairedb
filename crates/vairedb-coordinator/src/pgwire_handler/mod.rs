@@ -18,6 +18,7 @@ pub mod parser;
 pub mod query_router;
 
 mod anonymized_reads;
+mod bulk_insert;
 mod catalog_routing;
 mod column_labels;
 mod compat_rewrite;

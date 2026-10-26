@@ -7,9 +7,10 @@
 //! INSERT lane a batch at a time. Nothing here needs the whole input: a bulk load
 //! is as large as the client's data, so buffering it would defeat the point.
 //!
-//! The rows are decoded as **text** and re-emitted as string literals, letting the
-//! shard's engine apply each column's declared type exactly as it does for an
-//! `INSERT ... VALUES ('...')`. That is deliberate. Typing them here would mean
+//! The rows are decoded as **text** and written as strings — string literals on the
+//! INSERT lane's literal path, the same strings as data on its bulk path (see
+//! [`super::bulk_insert`]) — letting the shard's engine apply each column's declared
+//! type exactly as it does for an `INSERT ... VALUES ('...')`. That is deliberate. Typing them here would mean
 //! either inferring types from the data — where the type a column gets depends on
 //! which rows happened to land in the same batch, so the same file could import
 //! differently — or reading the catalog's declared types, which would refuse
@@ -32,6 +33,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use datafusion::arrow::array::RecordBatch;
 use datafusion::arrow::csv::reader::{Decoder, ReaderBuilder};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::arrow::error::ArrowError;
@@ -46,6 +48,7 @@ use pgwire::messages::copy::{CopyData, CopyDone, CopyFail};
 use vairedb_common::proto::vairedb::v1::VdbErrorCode;
 
 use crate::catalog::TableMeta;
+use crate::pgwire_handler::bulk_insert::RowTarget;
 use crate::pgwire_handler::copy::{
     CsvDialect, ROWS_PER_BATCH, copy_tag, partial_copy_error, target_columns,
     validate_target_columns,
@@ -53,8 +56,6 @@ use crate::pgwire_handler::copy::{
 use crate::pgwire_handler::error_enrichment::make_vdb_error;
 use crate::pgwire_handler::handler::VaireDbQueryHandler;
 use crate::pgwire_handler::session::SessionState;
-use crate::sqlparser::ast::Statement;
-use crate::write_sql_cl;
 
 /// How much of the input may go by without completing a first record.
 ///
@@ -64,18 +65,18 @@ use crate::write_sql_cl;
 /// dies, rather than hearing that its data is malformed.
 const MAX_FIRST_RECORD_BYTES: usize = 1024 * 1024;
 
-/// CSV bytes in, INSERT statements out — the whole decoding half of a `COPY ...
-/// FROM`, with no idea where the bytes came from or where the rows are going.
+/// CSV bytes in, batches of rows out — the whole decoding half of a `COPY ... FROM`,
+/// with no idea where the bytes came from or where the rows are going.
 ///
 /// Kept free of the write path on purpose. Everything that can go wrong with a
 /// bulk load's *data* — a chunk that ends mid-row, a header split across two
 /// messages, a final record with no newline — is decided here, so it can be tested
 /// as a function of the bytes rather than against a cluster.
 ///
-/// Bytes are handed over with [`CsvRows::accept`] and statements taken with
-/// [`CsvRows::next_statements`] until it yields `None`. That is what bounds memory:
-/// the caller writes each batch before asking for the next, so a client sending one
-/// enormous message does not turn into an enormous pile of statements.
+/// Bytes are handed over with [`CsvRows::accept`] and batches taken with
+/// [`CsvRows::next_batch`] until it yields `None`. That is what bounds memory: the
+/// caller writes each batch before asking for the next, so a client sending one
+/// enormous message does not turn into an enormous pile of rows.
 struct CsvRows {
     table: String,
     dialect: CsvDialect,
@@ -103,9 +104,8 @@ struct CsvRows {
 
 /// The decoding state a settled column list makes possible.
 struct Body {
-    /// `INSERT INTO <table> (<columns>) VALUES ...`, with the rows filled in per
-    /// batch — the same template a client `INSERT` is chunked against.
-    template: Statement,
+    /// The table and the columns the decoded fields land on, in order.
+    target: RowTarget,
     decoder: Decoder,
 }
 
@@ -177,12 +177,12 @@ impl CsvRows {
         self.ended = true;
     }
 
-    /// The statements for the next batch of rows, or `None` when the bytes accepted
-    /// so far do not complete one.
+    /// The next batch of rows, or `None` when the bytes accepted so far do not
+    /// complete one.
     ///
     /// Call it until it answers `None`: a single `accept` can complete several
     /// batches, and after [`CsvRows::end`] the last partial batch is one too.
-    fn next_statements(&mut self) -> PgWireResult<Option<Vec<Statement>>> {
+    fn next_batch(&mut self) -> PgWireResult<Option<RecordBatch>> {
         if self.body.is_none() {
             // The first record is the only one buffered whole, because it is what
             // decides the column list.
@@ -230,7 +230,6 @@ impl CsvRows {
         } else {
             None
         };
-        let template = body.template.clone();
         self.input = input;
 
         let Some(batch) = batch.filter(|b| b.num_rows() > 0) else {
@@ -241,14 +240,16 @@ impl CsvRows {
             }
             return Ok(None);
         };
+        Ok(Some(batch))
+    }
 
-        write_sql_cl::insert_statements_from_batches(
-            &template,
-            &[batch],
-            write_sql_cl::ROWS_PER_STATEMENT,
-        )
-        .map(Some)
-        .map_err(|msg| make_vdb_error(VdbErrorCode::FeatureNotSupported, msg))
+    /// Where the rows go — known once the first record has settled the column list,
+    /// which is before any batch exists.
+    fn target(&self) -> PgWireResult<&RowTarget> {
+        self.body
+            .as_ref()
+            .map(|body| &body.target)
+            .ok_or_else(|| internal("COPY decoded rows before its columns were settled"))
     }
 
     /// Decide the column list from the first record and build the decoder for the
@@ -258,26 +259,23 @@ impl CsvRows {
     /// the first record *is* data, so it goes back to the decoder untouched and only
     /// its field count was used.
     fn settle(&mut self, fields: &[String], consumed: usize) -> PgWireResult<()> {
-        let target = target_columns(
+        let columns = target_columns(
             &self.stated,
             fields,
             &self.table_columns,
             self.dialect.header,
         )?;
-        validate_target_columns(&self.table, &target, &self.table_columns, &self.shard_key)?;
-
-        let refs: Vec<&str> = target.iter().map(String::as_str).collect();
-        let template = write_sql_cl::insert_template(&self.table, &refs)
-            .map_err(|msg| make_vdb_error(VdbErrorCode::SqlSyntaxError, msg))?;
+        validate_target_columns(&self.table, &columns, &self.table_columns, &self.shard_key)?;
 
         // Every field as text: see the module doc for why the catalog's declared
         // types are deliberately not used here.
         let schema = Arc::new(Schema::new(
-            target
+            columns
                 .iter()
                 .map(|c| Field::new(c, DataType::Utf8, true))
                 .collect::<Vec<_>>(),
         ));
+        let target = RowTarget::new(&self.table, columns)?;
         // `with_header(false)`: a header was already taken off above, and the decoder
         // must not mistake the first data row for one.
         let decoder = ReaderBuilder::new(schema)
@@ -293,7 +291,7 @@ impl CsvRows {
             std::mem::take(&mut self.head)
         };
         self.head = Vec::new();
-        self.body = Some(Body { template, decoder });
+        self.body = Some(Body { target, decoder });
         Ok(())
     }
 }
@@ -370,9 +368,10 @@ impl CopySink {
         handler: &VaireDbQueryHandler,
         session: &SessionState,
     ) -> PgWireResult<()> {
-        while let Some(statements) = self.csv.next_statements()? {
+        while let Some(batch) = self.csv.next_batch()? {
+            let target = self.csv.target()?;
             self.rows += handler
-                .write_row_statements(&statements, &[], session, self.csv.table(), "COPY")
+                .write_row_batch(target, &batch, session, "COPY")
                 .await?;
         }
         Ok(())
@@ -584,6 +583,7 @@ impl CopyHandler for VaireDbQueryHandler {
 mod tests {
     use super::*;
     use crate::catalog::catalog_test_helper::table_meta;
+    use crate::write_sql_cl;
 
     fn csv(header: bool) -> CsvDialect {
         CsvDialect {
@@ -698,8 +698,9 @@ mod tests {
 
     // --- Bytes in, INSERT statements out ---
 
-    /// The SQL a sequence of client messages turns into. `chunks` are handed over
-    /// exactly as given, so where one ends is the boundary under test.
+    /// The SQL a sequence of client messages turns into on the literal lane — which
+    /// is also the definition of what the bulk lane stores for them. `chunks` are
+    /// handed over exactly as given, so where one ends is the boundary under test.
     fn imported(
         dialect: &CsvDialect,
         stated: &[&str],
@@ -716,15 +717,20 @@ mod tests {
         let mut sql = Vec::new();
         for chunk in chunks {
             rows.accept(chunk);
-            while let Some(statements) = rows.next_statements()? {
-                sql.extend(statements.iter().map(write_sql_cl::statement_to_sql));
-            }
+            drain(&mut rows, &mut sql)?;
         }
         rows.end();
-        while let Some(statements) = rows.next_statements()? {
+        drain(&mut rows, &mut sql)?;
+        Ok(sql)
+    }
+
+    /// Take every batch `rows` has ready, as literal SQL.
+    fn drain(rows: &mut CsvRows, sql: &mut Vec<String>) -> PgWireResult<()> {
+        while let Some(batch) = rows.next_batch()? {
+            let statements = rows.target()?.literal_statements(&batch)?;
             sql.extend(statements.iter().map(write_sql_cl::statement_to_sql));
         }
-        Ok(sql)
+        Ok(())
     }
 
     fn one_statement(

@@ -9,6 +9,8 @@
 //!   shard by shard.
 //! - `rows` — re-emit materialized result rows as a literal `INSERT ... VALUES`,
 //!   so a write whose rows come from a query can be routed like any other.
+//! - `bulk_rows` — the same rows as bulk-insert payloads instead of SQL text, routed
+//!   and valued exactly as their literals would be.
 //!
 //! The shard-local relation rewrite, the SQL render, and the small AST reads several
 //! submodules share live here as the primitives they build on.
@@ -17,6 +19,7 @@
 //! [`crate::pgwire_handler::parser::parse_sql`], which serves both paths and so lives at
 //! the protocol layer alongside the read-path rewrites.
 
+mod bulk_rows;
 mod duckdb_compat;
 mod merge;
 mod routing_value;
@@ -24,6 +27,7 @@ mod rows;
 mod shard_routing;
 mod statement;
 
+pub use bulk_rows::{BulkPayload, bulk_payloads, bulk_routing_values, bulk_wire_rows};
 pub use duckdb_compat::{reject_duckdb_divergent, transform_to_duckdb};
 pub use merge::{
     MergeShape, MergeSource, ensure_merge_relation_aliases, materialize_merge_insert_columns,

@@ -885,6 +885,193 @@ async fn test_an_empty_streaming_import_writes_nothing() {
     drop_table(&client, &tbl).await;
 }
 
+/// Delete every row of `tbl` by its own key, one statement each, asserting each
+/// statement found its row.
+///
+/// The read path scans every shard, so it would find a row stored on the wrong shard
+/// just as well. A `DELETE ... WHERE id = x` is routed to the one shard `x` hashes to,
+/// so it finds the row only where an INSERT of it would have put it.
+async fn delete_each_by_key(client: &Client, tbl: &str, ids: impl IntoIterator<Item = i64>) {
+    for id in ids {
+        assert_eq!(
+            execute(client, &format!("DELETE FROM {tbl} WHERE id = {id}"))
+                .await
+                .unwrap(),
+            1,
+            "row {id} must be stored on the shard its key routes to"
+        );
+    }
+}
+
+// A Parquet import ships its rows to the shards as data rather than as INSERT text,
+// and has to be indistinguishable from the INSERT it stands in for: the same values
+// — across the types whose casts are easiest to get subtly wrong — on the same shards.
+#[tokio::test]
+async fn test_a_parquet_import_stores_each_row_where_and_as_an_insert_would() {
+    let client = ready_client().await;
+    let columns = "(id BIGINT NOT NULL, d DOUBLE PRECISION, n NUMERIC(10, 2), ts TIMESTAMP, \
+                   tz TIMESTAMPTZ, dt DATE, b BOOLEAN, s VARCHAR)";
+    let src = create_table(
+        &client,
+        "un_copybulk_src",
+        &format!("{columns} {CREATE_OPTS}"),
+    )
+    .await;
+
+    let rows: Vec<String> = (0..240_i64)
+        .map(|id| {
+            if id % 7 == 0 {
+                return format!("({id}, NULL, NULL, NULL, NULL, NULL, NULL, NULL)");
+            }
+            let day = id % 28 + 1;
+            let minute = id % 60;
+            format!(
+                "({id}, {d}, {whole}.{cents:02}, '2019-01-{day:02} 08:{minute:02}:00.123456', \
+                 '2019-01-{day:02} 08:{minute:02}:00+01', '2024-02-{day:02}', {b}, 'it''s row {id}')",
+                d = id as f64 / 3.0,
+                whole = id - 120,
+                cents = id % 100,
+                b = id % 2 == 0,
+            )
+        })
+        .collect();
+    execute(
+        &client,
+        &format!("INSERT INTO {src} VALUES {}", rows.join(", ")),
+    )
+    .await
+    .unwrap();
+
+    let path = format!("/tmp/{src}.parquet");
+    execute(&client, &format!("COPY {src} TO '{path}' (FORMAT PARQUET)"))
+        .await
+        .unwrap();
+    let dst = create_table(
+        &client,
+        "un_copybulk_dst",
+        &format!("{columns} {CREATE_OPTS}"),
+    )
+    .await;
+    assert_eq!(
+        execute(
+            &client,
+            &format!("COPY {dst} FROM '{path}' (FORMAT PARQUET)")
+        )
+        .await
+        .unwrap(),
+        240,
+        "COPY must report every row it wrote"
+    );
+
+    let all = |tbl: &str| format!("SELECT id, d, n, ts, tz, dt, b, s FROM {tbl} ORDER BY id");
+    assert_eq!(
+        simple_query_rows(&client, &all(&dst)).await.unwrap(),
+        simple_query_rows(&client, &all(&src)).await.unwrap(),
+        "an imported row must hold exactly the values its INSERT stored"
+    );
+
+    delete_each_by_key(&client, &dst, 0..240).await;
+    assert_eq!(row_count(&client, &dst).await, 0);
+
+    drop_table(&client, &src).await;
+    drop_table(&client, &dst).await;
+}
+
+// A load larger than one of the coordinator's batches is shipped a batch at a time;
+// every row of every batch has to arrive once, on its own shard.
+#[tokio::test]
+async fn test_a_streaming_import_larger_than_one_batch_lands_every_row() {
+    use futures::SinkExt;
+
+    let client = ready_client().await;
+    let tbl = create_table(
+        &client,
+        "un_copybig",
+        &format!("(id INTEGER NOT NULL, v VARCHAR) {CREATE_OPTS}"),
+    )
+    .await;
+
+    // More than two 10,000-row batches, so a batch boundary falls mid-load twice.
+    let total: i64 = 25_000;
+    let mut csv = String::from("id,v\n");
+    for id in 0..total {
+        csv.push_str(&format!("{id},\"v,{id}\"\n"));
+    }
+    let sink = client
+        .copy_in(&format!("COPY {tbl} FROM STDIN (FORMAT CSV, HEADER)"))
+        .await
+        .unwrap();
+    let mut sink = Box::pin(sink);
+    for piece in csv.as_bytes().chunks(64 * 1024) {
+        sink.send(bytes::Bytes::copy_from_slice(piece))
+            .await
+            .unwrap();
+    }
+    assert_eq!(sink.as_mut().finish().await.unwrap(), total as u64);
+
+    let rows = simple_query_rows(
+        &client,
+        &format!("SELECT count(*), count(DISTINCT id), sum(id), min(v), max(v) FROM {tbl}"),
+    )
+    .await
+    .unwrap();
+    assert_eq!(rows[0][0].as_deref(), Some("25000"), "every row once");
+    assert_eq!(rows[0][1].as_deref(), Some("25000"), "no row twice");
+    assert_eq!(
+        rows[0][2].as_deref(),
+        Some(&*(total * (total - 1) / 2).to_string())
+    );
+    assert_eq!(rows[0][3].as_deref(), Some("v,0"));
+    assert_eq!(rows[0][4].as_deref(), Some("v,9999"));
+
+    // A sample from every batch, each found where its key routes.
+    let sample: Vec<i64> = (0..total).step_by(499).collect();
+    delete_each_by_key(&client, &tbl, sample.iter().copied()).await;
+    assert_eq!(row_count(&client, &tbl).await, total - sample.len() as i64);
+
+    drop_table(&client, &tbl).await;
+}
+
+// Inside a transaction block an import is buffered like any INSERT and applied at
+// COMMIT — or not at all, at ROLLBACK. One shard, so the block commits atomically
+// without cross-shard transactions being allowed.
+#[tokio::test]
+async fn test_a_copy_inside_a_transaction_block_applies_at_commit() {
+    let client = ready_client().await;
+    let src = unique_table_name("un_copytxn_src");
+    let ids = setup_rows(&client, &src).await;
+    let path = format!("/tmp/{src}.parquet");
+    execute(&client, &format!("COPY {src} TO '{path}' (FORMAT PARQUET)"))
+        .await
+        .unwrap();
+
+    let dst = create_table(
+        &client,
+        "un_copytxn_dst",
+        "(id INTEGER NOT NULL, v VARCHAR) WITH (shards = 1, replication_factor = 3, shard_by = 'id')",
+    )
+    .await;
+    let copy = format!("COPY {dst} FROM '{path}' (FORMAT PARQUET)");
+
+    client.batch_execute("BEGIN").await.unwrap();
+    assert_eq!(execute(&client, &copy).await.unwrap(), ids.len() as u64);
+    client.batch_execute("ROLLBACK").await.unwrap();
+    assert_eq!(
+        row_count(&client, &dst).await,
+        0,
+        "a rolled-back import writes nothing"
+    );
+
+    client.batch_execute("BEGIN").await.unwrap();
+    assert_eq!(execute(&client, &copy).await.unwrap(), ids.len() as u64);
+    client.batch_execute("COMMIT").await.unwrap();
+    assert_eq!(row_count(&client, &dst).await, ids.len() as i64);
+    delete_each_by_key(&client, &dst, ids).await;
+
+    drop_table(&client, &src).await;
+    drop_table(&client, &dst).await;
+}
+
 // ============================================================================
 // 3. Views — rows 20 (CREATE VIEW), 8 (ALTER VIEW) and 7 (DROP VIEW)
 // ============================================================================

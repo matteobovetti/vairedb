@@ -17,7 +17,7 @@ All coordinator-to-core-node communication uses gRPC:
 |---------|----------------|------------------|---------|
 | **Ballista scheduler** | Coordinator | _(Apache Ballista)_ | Executor registration and task scheduling for distributed SELECT queries. |
 | **Arrow Flight** | Core nodes | _(Apache Arrow Flight spec)_ | Columnar data exchange between executors (and back to the coordinator) during distributed SELECT queries. |
-| **WriteService** | Core nodes | [`write_service.proto`](../../proto/vairedb/v1/write_service.proto) | Coordinator sends shard-local DML statements (INSERT/UPDATE/DELETE) to core nodes for execution and replication. |
+| **WriteService** | Core nodes | [`write_service.proto`](../../proto/vairedb/v1/write_service.proto) | Coordinator sends shard-local DML statements (INSERT/UPDATE/DELETE) to core nodes for execution and replication — as SQL text, or for a bulk import as columnar batches of rows to insert. |
 | **NodeService** | Coordinator | [`node_service.proto`](../../proto/vairedb/v1/node_service.proto) | Core node registration, heartbeats, and failure reporting. |
 
 ## Wire Format
