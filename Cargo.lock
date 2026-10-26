@@ -5529,7 +5529,7 @@ dependencies = [
 
 [[package]]
 name = "vairedb-common"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "arrow",
  "chrono",
@@ -5548,7 +5548,7 @@ dependencies = [
 
 [[package]]
 name = "vairedb-coordinator"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "arrow",
  "arrow-pg",
@@ -5585,7 +5585,7 @@ dependencies = [
 
 [[package]]
 name = "vairedb-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "arrow",
  "arrow-flight",
