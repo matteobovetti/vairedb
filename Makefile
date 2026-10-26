@@ -4,7 +4,7 @@
        build-core check-core test-core \
        coverage \
        docker-base docker-coordinator docker-core docker \
-       e2e e2e-up e2e-test e2e-down
+       e2e e2e-test vdb-cluster-up vdb-cluster-down
 
 # Build all crates (debug)
 build:
@@ -106,23 +106,26 @@ docker: docker-coordinator docker-core
 
 # End-to-end tests (Docker Compose cluster + Rust test runner)
 E2E_DIR := tests/e2e
-E2E_COMPOSE := docker compose -f $(E2E_DIR)/docker-compose.yml -p vairedb-e2e
+VAIREDB_CLUSTER_COMPOSE := docker compose -f $(E2E_DIR)/docker-compose.yml -p vairedb-cluster
 
 e2e: docker
-	$(E2E_COMPOSE) up -d --wait
+	$(VAIREDB_CLUSTER_COMPOSE) up -d --wait
 	cd $(E2E_DIR) && cargo test -- --test-threads=1; \
 	  status=$$?; \
-	  cd ../.. &&  $(MAKE) e2e-down; \
+	  cd ../.. &&  $(MAKE) vdb-cluster-down; \
 	  exit $$status
-
-e2e-up: docker
-	$(E2E_COMPOSE) up -d --wait
 
 e2e-test:
 	cd $(E2E_DIR) && cargo test -- --test-threads=1
 
-e2e-down:
-	$(E2E_COMPOSE) down -v --remove-orphans
+
+# Docker compose cluster up and down
+
+vdb-cluster-up: docker
+	$(VAIREDB_CLUSTER_COMPOSE) up -d --wait
+
+vdb-cluster-down:
+	$(VAIREDB_CLUSTER_COMPOSE) down -v --remove-orphans
 
 # Remove build artifacts
 clean:

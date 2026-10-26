@@ -31,7 +31,6 @@ data/
 
 # Claude
 .claude
-CLAUDE.md
 
 # MkDocs
 docs/vairedb.io/site/

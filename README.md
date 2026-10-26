@@ -182,12 +182,12 @@ psql -h localhost -p 5432
 
 Start a small VaireDB cluster (1 coordinator + 5 core node):
 ```bash
-make e2e-up
+make vdb-cluster-up
 ```
 
 Stop the small VaireDB cluster:
 ```bash
-make e2e-down
+make vdb-cluster-down
 ```
 
 ### Configuration
