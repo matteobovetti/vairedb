@@ -286,6 +286,11 @@ pub const SQLSTATE_UNDEFINED_FUNCTION: &str = "42883";
 /// a client would paste back into SQL as a real, differently-named column.
 pub const SQLSTATE_NULL_VALUE_NOT_ALLOWED: &str = "22004";
 
+/// `InternalError` — the server broke, not the statement. Never a contract a test should
+/// want: it is pinned only by a gap's passing half, to record that a valid statement lands
+/// here today, so that the day it stops landing here is a visible change.
+pub const SQLSTATE_INTERNAL_ERROR: &str = "XX000";
+
 /// Assert `sql` fails with exactly `sqlstate`, and return the error. Stronger than
 /// [`assert_rejected`]: use it where the SQLSTATE is the contract, so a client can
 /// tell a missing schema from a missing table without reading the message.

@@ -1057,6 +1057,113 @@ async fn test_lateral_join() {
     drop_table(&client, &r).await;
 }
 
+/// The three `LATERAL` shapes that keep their reference to the left row: a top-1 correlated
+/// by equality, a nearest-match correlated by inequality, and a `VALUES` list built from the
+/// left row's columns. The first projects `(l.id, w)`, the second `(l.id, r.id)`, the third the
+/// unpivoted value alone.
+fn lateral_shapes_that_keep_an_outer_reference(l: &str, r: &str) -> [String; 3] {
+    [
+        format!(
+            "SELECT l.id, t.w FROM {l} l CROSS JOIN LATERAL \
+             (SELECT r.w FROM {r} r WHERE r.id = l.id ORDER BY r.w LIMIT 1) t ORDER BY l.id"
+        ),
+        format!(
+            "SELECT l.id, t.id FROM {l} l CROSS JOIN LATERAL \
+             (SELECT r.id FROM {r} r WHERE r.k >= l.k ORDER BY r.k, r.id LIMIT 1) t ORDER BY l.id"
+        ),
+        format!(
+            "SELECT v.val FROM {l} l CROSS JOIN LATERAL \
+             (VALUES ('id', l.id), ('k', l.k)) AS v(name, val) ORDER BY l.id, v.name"
+        ),
+    ]
+}
+
+// REFUSAL, DISTRIBUTED — finding F7 of `docs/tests/bts-flights-weather-analytical-queries.md`
+// (blocks P14 and P15). A `LATERAL` subquery that only filters or aggregates by the left row is
+// decorrelated into a join and answers (above). One that *keeps* the reference — a top-N with
+// `ORDER BY … LIMIT`, or a `VALUES` list built from the left row, the unpivot spelling
+// gap-analysis § 3.2 recommends in place of `UNPIVOT` — reaches Ballista's plan serializer with
+// the outer reference still in it, and fails there. The failure arrives as `42601`, a syntax
+// error, for a statement PostgreSQL parses and answers: loud, but in the wrong class.
+#[tokio::test]
+async fn test_a_lateral_subquery_that_keeps_its_outer_reference_fails_to_serialize() {
+    let client = ready_client().await;
+    let (l, r) = setup_pair(&client, "jg_lateral_outer").await;
+
+    for sql in lateral_shapes_that_keep_an_outer_reference(&l, &r) {
+        let err = assert_sqlstate(&client, &sql, SQLSTATE_SYNTAX_ERROR).await;
+        assert!(
+            err.message().contains("outer_ref"),
+            "the serializer names the outer reference it cannot encode: {}",
+            err.message()
+        );
+    }
+
+    // OVER-REACH. A `LATERAL` that only filters by the left row is decorrelated and answers ...
+    assert_eq!(
+        pairs(
+            &client,
+            &format!(
+                "SELECT l.id, t.w FROM {l} l CROSS JOIN LATERAL \
+                 (SELECT r.w FROM {r} r WHERE r.id = l.id) t ORDER BY l.id"
+            )
+        )
+        .await,
+        vec![
+            ("2".to_string(), "x".to_string()),
+            ("3".to_string(), "y".to_string()),
+        ]
+    );
+    // ... and the unpivot written as `UNION ALL` answers what the `VALUES` list asked for.
+    assert_eq!(
+        column(
+            &client,
+            &format!(
+                "SELECT val FROM (SELECT id, 'id' AS name, id AS val FROM {l} \
+                 UNION ALL SELECT id, 'k', k FROM {l}) u ORDER BY id, name"
+            )
+        )
+        .await,
+        vec!["1", "10", "2", "20", "3", "30", "4", "NULL"]
+    );
+
+    drop_table(&client, &l).await;
+    drop_table(&client, &r).await;
+}
+
+#[tokio::test]
+#[ignore = "gap (F7, analytical suite): a LATERAL subquery that keeps its outer reference must answer"]
+async fn test_a_lateral_subquery_that_keeps_its_outer_reference_answers() {
+    let client = ready_client().await;
+    let (l, r) = setup_pair(&client, "jg_lateral_outer_gap").await;
+
+    let [top_one, nearest, unpivot] = lateral_shapes_that_keep_an_outer_reference(&l, &r);
+    // Rows 1 and 4 have no `r` row with their id, so the CROSS JOIN drops them.
+    assert_eq!(
+        pairs(&client, &top_one).await,
+        vec![
+            ("2".to_string(), "x".to_string()),
+            ("3".to_string(), "y".to_string()),
+        ]
+    );
+    // The smallest `r.k` at or above each `l.k`; row 4's NULL key matches nothing.
+    assert_eq!(
+        pairs(&client, &nearest).await,
+        vec![
+            ("1".to_string(), "2".to_string()),
+            ("2".to_string(), "2".to_string()),
+            ("3".to_string(), "5".to_string()),
+        ]
+    );
+    assert_eq!(
+        column(&client, &unpivot).await,
+        vec!["1", "10", "2", "20", "3", "30", "4", "NULL"]
+    );
+
+    drop_table(&client, &l).await;
+    drop_table(&client, &r).await;
+}
+
 // ============================================================================
 // 5. Semi and anti joins
 // ============================================================================

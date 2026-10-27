@@ -5583,3 +5583,836 @@ async fn test_the_datetime_family_answers_over_the_cluster() {
 
     drop_table(&client, &tbl).await;
 }
+
+// ============================================================================
+// 21. Rows found by the analytical suite over the BTS flights slice
+// ============================================================================
+//
+// `docs/tests/bts-flights-weather-analytical-queries.md` runs analytical queries over a real
+// 1M-row slice on VaireDB and on DuckDB, and checks every one against PostgreSQL 16's parser.
+// Each block it records as failing is pinned here on six rows, so the shape stays guarded
+// without the dataset; the comment above each test names the document's blocks and finding.
+//
+// Every row is the pair the e2e convention asks for: a passing test pinning today's behaviour,
+// with the neighbouring forms that must keep answering, and an `#[ignore = "gap: …"]` test
+// asserting PostgreSQL's answer, measured on PostgreSQL 16.15 over these same rows. F1 and F2
+// are wrong answers that raise nothing — the class gap-analysis § 2.7 exists for — so their
+// passing halves pin a wrong value on purpose: the day it changes, the pin fails, and the gap
+// half is the one to un-ignore.
+//
+//     cd tests/e2e && cargo test --test sql_expression_gaps -- --ignored --test-threads=1
+
+/// Two carriers over three months, sized so that each month's ranking flips: A ranks second,
+/// first, second and B the reverse. Every month-over-month rank change is therefore `-1` or
+/// `+1`, one of each per carrier, and the `-1` is the half F1 loses.
+async fn setup_monthly_rank_table(client: &Client, prefix: &str) -> String {
+    let tbl = create_table(
+        client,
+        prefix,
+        &format!(
+            "(id INTEGER NOT NULL, carrier VARCHAR NOT NULL, month INTEGER NOT NULL, \
+             flights INTEGER NOT NULL) {CREATE_OPTS}"
+        ),
+    )
+    .await;
+    execute(
+        client,
+        &format!(
+            "INSERT INTO {tbl} (id, carrier, month, flights) VALUES \
+             (1, 'A', 1, 10), (2, 'B', 1, 20), (3, 'A', 2, 30), (4, 'B', 2, 5), \
+             (5, 'A', 3, 7), (6, 'B', 3, 8)"
+        ),
+    )
+    .await
+    .unwrap();
+    tbl
+}
+
+/// Every row of `sql` as the server rendered it, NULL spelled `NULL` so that a missing
+/// predecessor reads differently from a present one.
+async fn rendered_rows(client: &Client, sql: &str) -> Vec<Vec<String>> {
+    simple_query_rows(client, sql)
+        .await
+        .unwrap_or_else(|e| panic!("`{sql}` should be answerable: {e}"))
+        .into_iter()
+        .map(|row| {
+            row.into_iter()
+                .map(|value| value.unwrap_or_else(|| "NULL".to_string()))
+                .collect()
+        })
+        .collect()
+}
+
+/// The expected side of a [`rendered_rows`] comparison, written as a table.
+fn rows_of(rows: &[&[&str]]) -> Vec<Vec<String>> {
+    rows.iter()
+        .map(|row| row.iter().map(|value| value.to_string()).collect())
+        .collect()
+}
+
+/// F1, projected: two ranking values over opposite orders, subtracted. PostgreSQL answers
+/// -5, -3, -1, 1, 3, 5.
+fn ranking_difference_sql(tbl: &str) -> String {
+    format!(
+        "SELECT id, row_number() OVER (ORDER BY id) - row_number() OVER (ORDER BY id DESC) \
+         FROM {tbl} ORDER BY id"
+    )
+}
+
+/// F1, compared: the same difference, only tested for its sign. PostgreSQL counts 3.
+fn negative_ranking_differences_sql(tbl: &str) -> String {
+    format!(
+        "SELECT count(*) FROM (SELECT row_number() OVER (ORDER BY id) AS up, \
+         row_number() OVER (ORDER BY id DESC) AS down FROM {tbl}) s WHERE up - down < 0"
+    )
+}
+
+/// Q24's shape: each month's rank, and its change against the carrier's previous month.
+fn rank_change_sql(tbl: &str) -> String {
+    format!(
+        "WITH r AS (SELECT carrier, month, \
+         rank() OVER (PARTITION BY month ORDER BY flights DESC) AS rnk FROM {tbl}) \
+         SELECT carrier, month, rnk - lag(rnk) OVER (PARTITION BY carrier ORDER BY month) \
+         FROM r ORDER BY carrier, month"
+    )
+}
+
+/// Q25's shape: the same change, only counted by its direction.
+fn rank_moves_sql(tbl: &str) -> String {
+    format!(
+        "WITH r AS (SELECT carrier, month, \
+         rank() OVER (PARTITION BY month ORDER BY flights DESC) AS rnk FROM {tbl}), \
+         c AS (SELECT carrier, \
+         rnk - lag(rnk) OVER (PARTITION BY carrier ORDER BY month) AS rank_change FROM r) \
+         SELECT carrier, count(*) FILTER (WHERE rank_change < 0), \
+         count(*) FILTER (WHERE rank_change > 0) FROM c GROUP BY carrier ORDER BY carrier"
+    )
+}
+
+// F1, ⛔ — blocks Q24, Q25, P07 and P08. `row_number`, `rank` and `dense_rank` are evaluated as
+// unsigned 64-bit integers and only become the `bigint` they are described as on the way out
+// (section 6), so the difference of two of them is computed unsigned and `-1` wraps to
+// `18446744073709551615`. Projected, the wrapped value cannot be sent and the statement fails
+// `22003`. Compared or aggregated first, it never reaches the wire, and the answer is wrong with
+// no error at all: every move up a ranking is counted as a move down.
+#[tokio::test]
+async fn test_a_negative_ranking_difference_wraps_instead_of_going_negative() {
+    let client = ready_client().await;
+    let tbl = setup_window_table(&client, "expr_rank_wrap").await;
+    let monthly = setup_monthly_rank_table(&client, "expr_rank_wrap_m").await;
+
+    // Loud: the wrapped value reaches the wire. The first row's -5 is 2^64 - 5.
+    let err = assert_sqlstate(
+        &client,
+        &ranking_difference_sql(&tbl),
+        SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+    )
+    .await;
+    assert!(
+        err.message().contains("18446744073709551611"),
+        "the refusal carries the wrapped -5: {}",
+        err.message()
+    );
+    assert_sqlstate(
+        &client,
+        &rank_change_sql(&monthly),
+        SQLSTATE_NUMERIC_VALUE_OUT_OF_RANGE,
+    )
+    .await;
+
+    // Silent: compared before it is sent, so nothing fails. PostgreSQL counts 3 negatives, and
+    // one move up and one move down per carrier.
+    assert_eq!(
+        scalar(&client, &negative_ranking_differences_sql(&tbl)).await,
+        "0"
+    );
+    assert_eq!(
+        rendered_rows(&client, &rank_moves_sql(&monthly)).await,
+        rows_of(&[&["A", "0", "2"], &["B", "0", "2"]])
+    );
+
+    // OVER-REACH. What stays signed: a ranking value against a literal, because the literal
+    // makes the arithmetic signed ...
+    assert_eq!(
+        rendered_column(
+            &client,
+            &format!("SELECT row_number() OVER (ORDER BY id) - 4 FROM {tbl} ORDER BY id")
+        )
+        .await,
+        vec!["-3", "-2", "-1", "0", "1", "2"]
+    );
+    // ... a difference that cannot go negative — the gaps-and-islands id, the overall number
+    // minus the per-state one, which is why Q22 of the analytical suite is right ...
+    assert_eq!(
+        rendered_column(
+            &client,
+            &format!(
+                "SELECT row_number() OVER (ORDER BY id) \
+                 - row_number() OVER (PARTITION BY n IS NULL ORDER BY id) \
+                 FROM {tbl} ORDER BY id"
+            )
+        )
+        .await,
+        vec!["0", "1", "1", "1", "1", "4"]
+    );
+    // ... and the workaround the suite names (P08): a cast to bigint before subtracting.
+    assert_eq!(
+        scalar(
+            &client,
+            &format!(
+                "SELECT count(*) FROM (SELECT CAST(row_number() OVER (ORDER BY id) AS bigint) \
+                 AS up, CAST(row_number() OVER (ORDER BY id DESC) AS bigint) AS down \
+                 FROM {tbl}) s WHERE up - down < 0"
+            )
+        )
+        .await,
+        "3"
+    );
+
+    drop_table(&client, &tbl).await;
+    drop_table(&client, &monthly).await;
+}
+
+#[tokio::test]
+#[ignore = "gap (F1, analytical suite): the difference of two ranking values must be a signed bigint, as in PostgreSQL"]
+async fn test_a_difference_of_two_ranking_values_is_signed() {
+    let client = ready_client().await;
+    let tbl = setup_window_table(&client, "expr_rank_signed").await;
+    let monthly = setup_monthly_rank_table(&client, "expr_rank_signed_m").await;
+
+    assert_eq!(
+        rendered_rows(&client, &ranking_difference_sql(&tbl)).await,
+        rows_of(&[
+            &["1", "-5"],
+            &["2", "-3"],
+            &["3", "-1"],
+            &["4", "1"],
+            &["5", "3"],
+            &["6", "5"],
+        ])
+    );
+    assert_eq!(
+        scalar(&client, &negative_ranking_differences_sql(&tbl)).await,
+        "3"
+    );
+    assert_eq!(
+        rendered_rows(&client, &rank_change_sql(&monthly)).await,
+        rows_of(&[
+            &["A", "1", "NULL"],
+            &["A", "2", "-1"],
+            &["A", "3", "1"],
+            &["B", "1", "NULL"],
+            &["B", "2", "1"],
+            &["B", "3", "-1"],
+        ])
+    );
+    assert_eq!(
+        rendered_rows(&client, &rank_moves_sql(&monthly)).await,
+        rows_of(&[&["A", "1", "1"], &["B", "1", "1"]])
+    );
+
+    drop_table(&client, &tbl).await;
+    drop_table(&client, &monthly).await;
+}
+
+/// F2's shape, P09 in the analytical suite: an inner window numbers the rows from the end
+/// (`ORDER BY id DESC`), and the outer windows ask for each row's neighbours in the opposite
+/// order. `from_end` is projected on purpose — an inner window nothing reads is pruned before
+/// planning, and the defect goes with it.
+fn neighbours_over_reversed_input_sql(tbl: &str) -> String {
+    format!(
+        "WITH r AS (SELECT id, row_number() OVER (ORDER BY id DESC) AS from_end FROM {tbl}) \
+         SELECT id, from_end, lag(id) OVER (ORDER BY id), lead(id) OVER (ORDER BY id) \
+         FROM r ORDER BY id"
+    )
+}
+
+/// The same, partitioned, as Q26 writes it: per carrier, the previous month's flights.
+fn previous_month_over_reversed_input_sql(tbl: &str) -> String {
+    format!(
+        "WITH r AS (SELECT carrier, month, flights, \
+         row_number() OVER (PARTITION BY carrier ORDER BY month DESC) AS from_end FROM {tbl}) \
+         SELECT carrier, month, from_end, \
+         lag(flights) OVER (PARTITION BY carrier ORDER BY month) FROM r ORDER BY carrier, month"
+    )
+}
+
+/// And aggregated, which is what Q26 returns: the change against the previous month, summed
+/// by how far from the last month it is.
+fn change_by_distance_from_end_sql(tbl: &str) -> String {
+    format!(
+        "WITH r AS (SELECT carrier, month, flights, \
+         row_number() OVER (PARTITION BY carrier ORDER BY month DESC) AS from_end FROM {tbl}), \
+         d AS (SELECT from_end, \
+         flights - lag(flights) OVER (PARTITION BY carrier ORDER BY month) AS change FROM r) \
+         SELECT from_end, count(change), sum(change) FROM d GROUP BY from_end ORDER BY from_end"
+    )
+}
+
+// F2, ⛔ — blocks Q26 and P09. A window whose ORDER BY is the exact reverse of an inner window's
+// runs over its input in the inner window's order, without the sort it needs: `lag` reads the
+// following row and `lead` the preceding one. Nothing is raised, and the aggregated form is a
+// plausible table — every bucket shifted by one, the sign of every change flipped. Deterministic
+// on these rows, so the wrong values are pinned exactly.
+#[tokio::test]
+async fn test_a_window_over_the_reverse_of_an_inner_windows_order_skips_its_sort() {
+    let client = ready_client().await;
+    let tbl = setup_window_table(&client, "expr_wdw_rev").await;
+    let monthly = setup_monthly_rank_table(&client, "expr_wdw_rev_m").await;
+
+    // PostgreSQL: lag is NULL, 1, 2, 3, 4, 5 and lead 2, 3, 4, 5, 6, NULL — the two are swapped.
+    assert_eq!(
+        rendered_rows(&client, &neighbours_over_reversed_input_sql(&tbl)).await,
+        rows_of(&[
+            &["1", "6", "2", "NULL"],
+            &["2", "5", "3", "1"],
+            &["3", "4", "4", "2"],
+            &["4", "3", "5", "3"],
+            &["5", "2", "6", "4"],
+            &["6", "1", "NULL", "5"],
+        ])
+    );
+    // PostgreSQL: NULL, 10, 30 for A and NULL, 20, 5 for B.
+    assert_eq!(
+        rendered_rows(&client, &previous_month_over_reversed_input_sql(&monthly)).await,
+        rows_of(&[
+            &["A", "1", "3", "30"],
+            &["A", "2", "2", "7"],
+            &["A", "3", "1", "NULL"],
+            &["B", "1", "3", "5"],
+            &["B", "2", "2", "8"],
+            &["B", "3", "1", "NULL"],
+        ])
+    );
+    // PostgreSQL: (1, 2, -20), (2, 2, 5), (3, 0, NULL).
+    assert_eq!(
+        rendered_rows(&client, &change_by_distance_from_end_sql(&monthly)).await,
+        rows_of(&[&["1", "0", "NULL"], &["2", "2", "20"], &["3", "2", "-5"]])
+    );
+
+    // OVER-REACH. The neighbours that answer: an inner window in the *same* direction, one on an
+    // unrelated key, and the inner window left unread, which the planner prunes.
+    let in_order = rows_of(&[
+        &["1", "NULL"],
+        &["2", "1"],
+        &["3", "2"],
+        &["4", "3"],
+        &["5", "4"],
+        &["6", "5"],
+    ]);
+    for sql in [
+        format!(
+            "WITH r AS (SELECT id, row_number() OVER (ORDER BY id) AS k FROM {tbl}) \
+             SELECT id, lag(id) OVER (ORDER BY id) FROM r WHERE k > 0 ORDER BY id"
+        ),
+        format!(
+            "WITH r AS (SELECT id, row_number() OVER (ORDER BY g DESC, id) AS k FROM {tbl}) \
+             SELECT id, lag(id) OVER (ORDER BY id) FROM r WHERE k > 0 ORDER BY id"
+        ),
+        format!(
+            "WITH r AS (SELECT id, row_number() OVER (ORDER BY id DESC) AS from_end FROM {tbl}) \
+             SELECT id, lag(id) OVER (ORDER BY id) FROM r ORDER BY id"
+        ),
+    ] {
+        assert_eq!(rendered_rows(&client, &sql).await, in_order, "`{sql}`");
+    }
+
+    drop_table(&client, &tbl).await;
+    drop_table(&client, &monthly).await;
+}
+
+#[tokio::test]
+#[ignore = "gap (F2, analytical suite): a window must sort its input even when an inner window sorted it the other way"]
+async fn test_a_window_over_the_reverse_of_an_inner_windows_order_is_sorted() {
+    let client = ready_client().await;
+    let tbl = setup_window_table(&client, "expr_wdw_rev_gap").await;
+    let monthly = setup_monthly_rank_table(&client, "expr_wdw_rev_gap_m").await;
+
+    assert_eq!(
+        rendered_rows(&client, &neighbours_over_reversed_input_sql(&tbl)).await,
+        rows_of(&[
+            &["1", "6", "NULL", "2"],
+            &["2", "5", "1", "3"],
+            &["3", "4", "2", "4"],
+            &["4", "3", "3", "5"],
+            &["5", "2", "4", "6"],
+            &["6", "1", "5", "NULL"],
+        ])
+    );
+    assert_eq!(
+        rendered_rows(&client, &previous_month_over_reversed_input_sql(&monthly)).await,
+        rows_of(&[
+            &["A", "1", "3", "NULL"],
+            &["A", "2", "2", "10"],
+            &["A", "3", "1", "30"],
+            &["B", "1", "3", "NULL"],
+            &["B", "2", "2", "20"],
+            &["B", "3", "1", "5"],
+        ])
+    );
+    assert_eq!(
+        rendered_rows(&client, &change_by_distance_from_end_sql(&monthly)).await,
+        rows_of(&[&["1", "2", "-20"], &["2", "2", "5"], &["3", "0", "NULL"]])
+    );
+
+    drop_table(&client, &tbl).await;
+    drop_table(&client, &monthly).await;
+}
+
+/// F3: what `pg_typeof` says the ranking functions are, in PostgreSQL's spelling.
+fn ranking_typeof_sql(tbl: &str) -> String {
+    format!(
+        "SELECT pg_typeof(row_number() OVER (ORDER BY id))::text, \
+         pg_typeof(rank() OVER (ORDER BY id))::text, \
+         pg_typeof(dense_rank() OVER (ORDER BY id))::text, \
+         pg_typeof(ntile(2) OVER (ORDER BY id))::text FROM {tbl} LIMIT 1"
+    )
+}
+
+// F3, 🟡 — block P10. Section 6 makes Describe and Execute agree that a ranking column is `bigint`,
+// but `pg_typeof` is answered from the type the window is *evaluated* in, which is F1's unsigned
+// integer, and that has no PostgreSQL name narrower than `numeric`. So the same column is
+// `bigint` on the wire and `numeric` to the SQL that asks. `ntile`, narrowed to `integer`
+// separately, already agrees.
+#[tokio::test]
+async fn test_pg_typeof_reports_a_ranking_function_as_numeric() {
+    let client = ready_client().await;
+    let tbl = setup_window_table(&client, "expr_rank_typeof").await;
+
+    assert_eq!(
+        rendered_rows(&client, &ranking_typeof_sql(&tbl)).await,
+        rows_of(&[&["numeric", "numeric", "numeric", "integer"]])
+    );
+    // The wire type of the same columns, which is already PostgreSQL's.
+    assert_eq!(
+        describe_result_types(
+            &client,
+            &format!(
+                "SELECT row_number() OVER (ORDER BY id), rank() OVER (ORDER BY id), \
+                 dense_rank() OVER (ORDER BY id) FROM {tbl}"
+            )
+        )
+        .await,
+        vec![Type::INT8, Type::INT8, Type::INT8]
+    );
+
+    drop_table(&client, &tbl).await;
+}
+
+#[tokio::test]
+#[ignore = "gap (F3, analytical suite): pg_typeof must name a ranking function bigint, as Describe already does"]
+async fn test_pg_typeof_reports_a_ranking_function_as_bigint() {
+    let client = ready_client().await;
+    let tbl = setup_window_table(&client, "expr_rank_typeof_gap").await;
+
+    assert_eq!(
+        rendered_rows(&client, &ranking_typeof_sql(&tbl)).await,
+        rows_of(&[&["bigint", "bigint", "bigint", "integer"]])
+    );
+
+    drop_table(&client, &tbl).await;
+}
+
+/// F4: the latest row of each group, beside a window and beside an aggregate.
+fn distinct_on_beside_a_window_sql(tbl: &str) -> String {
+    format!(
+        "SELECT DISTINCT ON (g) g, id, count(*) OVER (PARTITION BY g) FROM {tbl} \
+         ORDER BY g, id DESC"
+    )
+}
+
+fn distinct_on_beside_an_aggregate_sql(tbl: &str) -> String {
+    format!(
+        "SELECT DISTINCT ON (g) g, id, count(*) FROM {tbl} GROUP BY g, id \
+         ORDER BY g, id DESC"
+    )
+}
+
+// F4, ❌ — block P05. `DISTINCT ON` beside a window function or an aggregate is valid PostgreSQL
+// and is refused by datafusion-sql's planner before VaireDB sees a plan. Gap-analysis § 4 lists
+// `DISTINCT ON` as working; it does, alone, and the `row_number` spelling of the same question
+// (Q23 of the analytical suite) answers too, so the refusal is scoped to the combination.
+#[tokio::test]
+async fn test_distinct_on_beside_a_window_or_an_aggregate_is_refused() {
+    let client = ready_client().await;
+    let tbl = setup_window_table(&client, "expr_distinct_on").await;
+
+    for sql in [
+        distinct_on_beside_a_window_sql(&tbl),
+        distinct_on_beside_an_aggregate_sql(&tbl),
+    ] {
+        let err = assert_sqlstate(&client, &sql, SQLSTATE_FEATURE_NOT_SUPPORTED).await;
+        assert!(
+            err.message().contains("DISTINCT ON"),
+            "the refusal names the clause: {}",
+            err.message()
+        );
+    }
+
+    // OVER-REACH. `DISTINCT ON` alone: the highest id of each group.
+    assert_eq!(
+        rendered_rows(
+            &client,
+            &format!("SELECT DISTINCT ON (g) g, id FROM {tbl} ORDER BY g, id DESC")
+        )
+        .await,
+        rows_of(&[&["1", "3"], &["2", "6"]])
+    );
+    // And the spelling that answers the refused question today.
+    assert_eq!(
+        rendered_rows(
+            &client,
+            &format!(
+                "SELECT g, id, c FROM (SELECT g, id, count(*) OVER (PARTITION BY g) AS c, \
+                 row_number() OVER (PARTITION BY g ORDER BY id DESC) AS rn FROM {tbl}) s \
+                 WHERE rn = 1 ORDER BY g"
+            )
+        )
+        .await,
+        rows_of(&[&["1", "3", "3"], &["2", "6", "3"]])
+    );
+
+    drop_table(&client, &tbl).await;
+}
+
+#[tokio::test]
+#[ignore = "gap (F4, analytical suite): DISTINCT ON beside a window function or an aggregate must answer"]
+async fn test_distinct_on_beside_a_window_or_an_aggregate_answers() {
+    let client = ready_client().await;
+    let tbl = setup_window_table(&client, "expr_distinct_on_gap").await;
+
+    assert_eq!(
+        rendered_rows(&client, &distinct_on_beside_a_window_sql(&tbl)).await,
+        rows_of(&[&["1", "3", "3"], &["2", "6", "3"]])
+    );
+    assert_eq!(
+        rendered_rows(&client, &distinct_on_beside_an_aggregate_sql(&tbl)).await,
+        rows_of(&[&["1", "3", "1"], &["2", "6", "1"]])
+    );
+
+    drop_table(&client, &tbl).await;
+}
+
+// F5, 🟡 — block P11. `round(numeric, n)` has scale `n` in PostgreSQL, so `1.23456` rounded to
+// two places prints `1.23`. VaireDB keeps the argument's scale on the result column and prints
+// `1.230000`: the value is right, only its text is not, and the text is what a client that
+// formats numbers for display reads. A cast to text already answers `1.23`, and `round(x)`
+// without a place count already answers scale 0.
+#[tokio::test]
+async fn test_round_to_n_places_keeps_the_arguments_scale() {
+    let client = ready_client().await;
+
+    assert_eq!(
+        scalar(&client, "SELECT round(1.23456::numeric(18,6), 2)").await,
+        "1.230000"
+    );
+
+    // OVER-REACH. The value under the text, and the form with no place count.
+    assert_eq!(
+        scalar(&client, "SELECT round(1.23456::numeric(18,6), 2)::text").await,
+        "1.23"
+    );
+    assert_eq!(
+        scalar(&client, "SELECT round(2.5::numeric(10,3))").await,
+        "3"
+    );
+}
+
+#[tokio::test]
+#[ignore = "gap (F5, analytical suite): round(numeric, n) must answer a result of scale n"]
+async fn test_round_to_n_places_has_scale_n() {
+    let client = ready_client().await;
+
+    assert_eq!(
+        scalar(&client, "SELECT round(1.23456::numeric(18,6), 2)").await,
+        "1.23"
+    );
+}
+
+/// F6: carry the last non-NULL `n` forward — the running count of non-NULLs is a group id
+/// that only advances on a value, and each group's maximum is that value.
+fn carry_forward_sql(tbl: &str) -> String {
+    format!(
+        "WITH s AS (SELECT id, n, count(n) OVER (ORDER BY id) AS grp FROM {tbl}) \
+         SELECT id, n, max(n) OVER (PARTITION BY grp) FROM s ORDER BY id"
+    )
+}
+
+// F6, ❌ — blocks P06b and P12. The PostgreSQL spelling of carry-forward, which is what a client
+// writes because PostgreSQL has no `IGNORE NULLS`: a window partitioned by a column a running
+// window produced. With a final ORDER BY it fails on an executor with DataFusion's internal
+// assertion that every PARTITION BY column has an ordering — section 12's class, an ordering
+// decision that does not survive the plan being cut into stages, on a shape section 12's repair
+// does not reach.
+#[tokio::test]
+async fn test_partitioning_by_a_running_windows_output_fails_internally() {
+    let client = ready_client().await;
+    let tbl = setup_window_table(&client, "expr_carry_fwd").await;
+
+    let err = assert_sqlstate(&client, &carry_forward_sql(&tbl), SQLSTATE_INTERNAL_ERROR).await;
+    assert!(
+        err.message().to_lowercase().contains("partition by"),
+        "the assertion that failed is the PARTITION BY ordering: {}",
+        err.message()
+    );
+
+    // OVER-REACH. The same windows under an aggregate, with no ORDER BY above them: 10, 10, 30,
+    // 40, 50, 50 sum to 190.
+    assert_eq!(
+        rendered_rows(
+            &client,
+            &format!(
+                "WITH s AS (SELECT id, n, count(n) OVER (ORDER BY id) AS grp FROM {tbl}) \
+                 SELECT count(*), sum(last_n) \
+                 FROM (SELECT max(n) OVER (PARTITION BY grp) AS last_n FROM s) z"
+            )
+        )
+        .await,
+        rows_of(&[&["6", "190"]])
+    );
+    // And a window partitioned by a stored column, under the same final ORDER BY.
+    assert_eq!(
+        rendered_column(
+            &client,
+            &format!("SELECT max(n) OVER (PARTITION BY g) FROM {tbl} ORDER BY id")
+        )
+        .await,
+        vec!["30", "30", "30", "50", "50", "50"]
+    );
+
+    drop_table(&client, &tbl).await;
+}
+
+#[tokio::test]
+#[ignore = "gap (F6, analytical suite): a window partitioned by a running window's output must answer, not fail XX000"]
+async fn test_partitioning_by_a_running_windows_output_answers() {
+    let client = ready_client().await;
+    let tbl = setup_window_table(&client, "expr_carry_fwd_gap").await;
+
+    assert_eq!(
+        rendered_rows(&client, &carry_forward_sql(&tbl)).await,
+        rows_of(&[
+            &["1", "10", "10"],
+            &["2", "NULL", "10"],
+            &["3", "30", "30"],
+            &["4", "40", "40"],
+            &["5", "50", "50"],
+            &["6", "NULL", "50"],
+        ])
+    );
+
+    drop_table(&client, &tbl).await;
+}
+
+/// P01: the four frame exclusions, each over a frame whose answer it visibly changes. Ordered
+/// by `g`, every row has two peers, so GROUP and TIES differ.
+fn frame_exclusion_sqls(tbl: &str) -> [String; 4] {
+    [
+        format!(
+            "SELECT sum(n) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING \
+             EXCLUDE CURRENT ROW) FROM {tbl} ORDER BY id"
+        ),
+        format!(
+            "SELECT count(*) OVER (ORDER BY g RANGE BETWEEN UNBOUNDED PRECEDING \
+             AND UNBOUNDED FOLLOWING EXCLUDE GROUP) FROM {tbl} ORDER BY id"
+        ),
+        format!(
+            "SELECT count(*) OVER (ORDER BY g RANGE BETWEEN UNBOUNDED PRECEDING \
+             AND UNBOUNDED FOLLOWING EXCLUDE TIES) FROM {tbl} ORDER BY id"
+        ),
+        format!(
+            "SELECT count(*) OVER (ORDER BY g RANGE BETWEEN UNBOUNDED PRECEDING \
+             AND UNBOUNDED FOLLOWING EXCLUDE NO OTHERS) FROM {tbl} ORDER BY id"
+        ),
+    ]
+}
+
+// REFUSAL — block P01, gap-analysis § 2.4. A frame exclusion is unparseable: sqlparser's window
+// frame has no slot for it, so every one of the four is a syntax error before anything is
+// planned. The frame without its exclusion answers.
+#[tokio::test]
+async fn test_a_frame_exclusion_is_refused_at_parse() {
+    let client = ready_client().await;
+    let tbl = setup_window_table(&client, "expr_exclude").await;
+
+    for sql in frame_exclusion_sqls(&tbl) {
+        let err = assert_sqlstate(&client, &sql, SQLSTATE_SYNTAX_ERROR).await;
+        assert!(
+            err.message().contains("EXCLUDE"),
+            "the parser stops at the clause: {}",
+            err.message()
+        );
+    }
+
+    // OVER-REACH. The same frame, nothing excluded.
+    assert_eq!(
+        rendered_column(
+            &client,
+            &format!(
+                "SELECT sum(n) OVER (ORDER BY id ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) \
+                 FROM {tbl} ORDER BY id"
+            )
+        )
+        .await,
+        vec!["10", "40", "70", "120", "90", "50"]
+    );
+
+    drop_table(&client, &tbl).await;
+}
+
+#[tokio::test]
+#[ignore = "gap (gap-analysis § 2.4): EXCLUDE CURRENT ROW | GROUP | TIES | NO OTHERS must answer"]
+async fn test_a_frame_exclusion_answers() {
+    let client = ready_client().await;
+    let tbl = setup_window_table(&client, "expr_exclude_gap").await;
+
+    let [current_row, group, ties, no_others] = frame_exclusion_sqls(&tbl);
+    for (sql, want) in [
+        (current_row, vec!["NULL", "40", "40", "80", "40", "50"]),
+        (group, vec!["3"; 6]),
+        (ties, vec!["4"; 6]),
+        (no_others, vec!["6"; 6]),
+    ] {
+        assert_eq!(rendered_column(&client, &sql).await, want, "`{sql}`");
+    }
+
+    drop_table(&client, &tbl).await;
+}
+
+// REFUSAL — block P02, gap-analysis § 2.4. Section 9 pins the windowed `FILTER` refusal on
+// `array_agg`; the analytical suite asked it of `string_agg`, the other collecting aggregate
+// a client reaches for, and the refusal holds there too. The window without its FILTER answers.
+#[tokio::test]
+async fn test_a_windowed_filter_on_string_agg_is_refused() {
+    let client = ready_client().await;
+    let tbl = setup_window_table(&client, "expr_wfilter_sagg").await;
+
+    let err = assert_sqlstate(
+        &client,
+        &format!(
+            "SELECT string_agg(n::text, ',') FILTER (WHERE n > 20) \
+             OVER (PARTITION BY g ORDER BY id) FROM {tbl}"
+        ),
+        SQLSTATE_FEATURE_NOT_SUPPORTED,
+    )
+    .await;
+    assert!(
+        err.message().contains("string_agg"),
+        "the refusal names the aggregate: {}",
+        err.message()
+    );
+
+    // OVER-REACH. The same window, nothing filtered.
+    assert_eq!(
+        rendered_column(
+            &client,
+            &format!(
+                "SELECT string_agg(n::text, ',') OVER (PARTITION BY g ORDER BY id) \
+                 FROM {tbl} ORDER BY id"
+            )
+        )
+        .await,
+        vec!["10", "10", "10,30", "40", "40,50", "40,50"]
+    );
+
+    drop_table(&client, &tbl).await;
+}
+
+#[tokio::test]
+#[ignore = "gap (gap-analysis § 2.4): FILTER on a windowed collecting aggregate must answer"]
+async fn test_a_windowed_filter_on_a_collecting_aggregate_answers() {
+    let client = ready_client().await;
+    let tbl = setup_window_table(&client, "expr_wfilter_coll_gap").await;
+
+    for (aggregate, want) in [
+        (
+            "string_agg(n::text, ',')",
+            vec!["NULL", "NULL", "30", "40", "40,50", "40,50"],
+        ),
+        (
+            "array_agg(n)",
+            vec!["NULL", "NULL", "{30}", "{40}", "{40,50}", "{40,50}"],
+        ),
+    ] {
+        let sql = format!(
+            "SELECT {aggregate} FILTER (WHERE n > 20) OVER (PARTITION BY g ORDER BY id) \
+             FROM {tbl} ORDER BY id"
+        );
+        assert_eq!(rendered_column(&client, &sql).await, want, "`{sql}`");
+    }
+
+    drop_table(&client, &tbl).await;
+}
+
+// REFUSAL — block P03, gap-analysis § 2.3. A hypothetical-set aggregate over two ordering
+// columns: datafusion-sql allows one ordering expression in WITHIN GROUP and refuses the rest
+// before any aggregate is consulted. The one-column form (P03b) answers, and section 14 holds
+// it in full.
+#[tokio::test]
+async fn test_a_multi_column_hypothetical_set_aggregate_is_refused() {
+    let client = ready_client().await;
+    let tbl = setup_window_table(&client, "expr_hyp_multi").await;
+
+    let err = assert_sqlstate(
+        &client,
+        &format!("SELECT rank(2, 30) WITHIN GROUP (ORDER BY g, n) FROM {tbl}"),
+        SQLSTATE_FEATURE_NOT_SUPPORTED,
+    )
+    .await;
+    assert!(
+        err.message().contains("single ordering expression"),
+        "the refusal names the limit: {}",
+        err.message()
+    );
+
+    // OVER-REACH. One column: 30 would rank second among 10, 30, 40, 50.
+    assert_eq!(
+        scalar(
+            &client,
+            &format!("SELECT rank(30) WITHIN GROUP (ORDER BY n) FROM {tbl}")
+        )
+        .await,
+        "2"
+    );
+
+    drop_table(&client, &tbl).await;
+}
+
+#[tokio::test]
+#[ignore = "gap (gap-analysis § 2.3): rank(a, b) WITHIN GROUP (ORDER BY x, y) must answer"]
+async fn test_a_multi_column_hypothetical_set_aggregate_answers() {
+    let client = ready_client().await;
+    let tbl = setup_window_table(&client, "expr_hyp_multi_gap").await;
+
+    // (2, 30) sorts after the three rows of group 1 and ahead of (2, 40): fourth.
+    assert_eq!(
+        scalar(
+            &client,
+            &format!("SELECT rank(2, 30) WITHIN GROUP (ORDER BY g, n) FROM {tbl}")
+        )
+        .await,
+        "4"
+    );
+
+    drop_table(&client, &tbl).await;
+}
+
+// Block P04, gap-analysis § 2.3. Section 19 pins the refusal of a repeated empty grouping set; this is
+// its other half, PostgreSQL's answer, which is the grand total once per empty set.
+#[tokio::test]
+#[ignore = "gap (gap-analysis § 2.3): GROUPING SETS ((), ()) must answer the grand total once per empty set"]
+async fn test_a_repeated_empty_grouping_set_answers_once_per_set() {
+    let client = ready_client().await;
+    let tbl = setup_window_table(&client, "expr_empty_gs_gap").await;
+
+    assert_eq!(
+        rendered_column(
+            &client,
+            &format!("SELECT count(*) FROM {tbl} GROUP BY GROUPING SETS ((), ())")
+        )
+        .await,
+        vec!["6", "6"]
+    );
+
+    drop_table(&client, &tbl).await;
+}
