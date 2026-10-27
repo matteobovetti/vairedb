@@ -23,6 +23,7 @@ jobs:
           toolchain: 1.95
       - uses: Swatinem/rust-cache@v2
       - uses: mozilla-actions/sccache-action@v0.0.11
+      - run: sudo apt-get update
       - run: sudo apt-get install -y protobuf-compiler
       - run: cargo check --all
   test:
@@ -36,5 +37,6 @@ jobs:
           toolchain: 1.95
       - uses: Swatinem/rust-cache@v2
       - uses: mozilla-actions/sccache-action@v0.0.11
+      - run: sudo apt-get update
       - run: sudo apt-get install -y protobuf-compiler
       - run: cargo test --all
